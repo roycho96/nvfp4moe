@@ -536,6 +536,45 @@ def dispatch_gate():
               det and imm, f"det {det} imm {imm}")
 
 
+def qwen_adapter_gate():
+    from nvfp4moe import Qwen3Nvfp4Experts
+
+    class GroupedExperts(torch.nn.Module):
+        def __init__(self, E, d, I):
+            super().__init__()
+            self.gate_up_proj = torch.nn.Parameter(
+                torch.randn(E, 2 * I, d, device="cuda", dtype=torch.bfloat16)
+            )
+            self.down_proj = torch.nn.Parameter(
+                torch.randn(E, d, I, device="cuda", dtype=torch.bfloat16)
+            )
+
+    torch.manual_seed(41)
+    T, d, I, E, k = 256, 256, 128, 8, 2
+    source = GroupedExperts(E, d, I)
+    adapter = Qwen3Nvfp4Experts.from_hf(source, T, k)
+    gate, up = source.gate_up_proj.chunk(2, dim=1)
+    copied = (
+        torch.equal(adapter.layer.w1[:, 0::2], gate)
+        and torch.equal(adapter.layer.w1[:, 1::2], up)
+        and torch.equal(adapter.layer.w2, source.down_proj)
+    )
+    check("Qwen adapter copies grouped checkpoint weights", copied)
+
+    x = torch.randn(T, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    logits = torch.randn(T, E, device="cuda", requires_grad=True)
+    topv, topi = torch.topk(torch.softmax(logits, dim=-1), k, dim=-1)
+    topv = topv / topv.sum(dim=-1, keepdim=True)
+    y = adapter(x, topi, topv)
+    y.backward(torch.randn_like(y))
+    grads = (x.grad, logits.grad, adapter.layer.w1.grad, adapter.layer.w2.grad)
+    grad_ok = all(
+        grad is not None and torch.isfinite(grad).all() and grad.abs().max() > 0
+        for grad in grads
+    )
+    check("Qwen adapter backward reaches router and expert masters", grad_ok)
+
+
 def main():
     if torch.cuda.get_device_capability(0)[0] != 10:
         print("SKIP: requires SM100")
@@ -543,6 +582,7 @@ def main():
     from nvfp4moe import MoEExpertLayer, moe_finalize_bwd
 
     dispatch_gate()
+    qwen_adapter_gate()
     grouped_wgrad_gate()
     sr_gate()
     rht_gate()

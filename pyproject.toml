@@ -32,6 +32,7 @@ test = [
     "ruff>=0.12",
 ]
 benchmark = [
+    "accelerate>=1.10",
     "datasets>=4.0",
     "huggingface-hub>=0.34",
     "modal>=1.5",

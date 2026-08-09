@@ -2,6 +2,7 @@ include LICENSE
 include README.md
 include BENCHMARKS.md
 include NOTICE
+include examples/train_qwen.py
 include third_party/quack/LICENSE
 include third_party/quack/SOURCE
 recursive-include third_party/quack/quack *.py

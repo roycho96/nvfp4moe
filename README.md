@@ -71,51 +71,35 @@ The patched QuACK sources required by the kernels are included in the package.
 
 ## 🔧 Training example
 
-Routing selection remains in BF16/FP32. Dispatch receives detached routing
-weights for its index path, while `differentiable_probs()` preserves the
-values on the router's autograd graph.
+The runnable example loads Qwen3-30B-A3B and a streamed FineWeb-Edu sample,
+replaces the final MoE expert group, and optimizes the model's causal-language
+modeling loss. The rest of the model is frozen so a single B200 can run it.
 
-```python
-import torch
-from nvfp4moe import MoEDispatch, MoEExpertLayer
+```bash
+python examples/train_qwen.py
 
-T, d, I, E, k = 8192, 2048, 768, 128, 8
-
-layer = MoEExpertLayer(
-    d, I, E, k,
-    rht=True,
-    delayed_col_amax=True,
-).cuda()
-dispatch = MoEDispatch(T, E, k)
-
-# BF16 master weights become resident NVFP4 formats.
-layer.refresh_weights()
-
-x = torch.randn(T, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-logits = torch.randn(T, E, device="cuda", dtype=torch.float32, requires_grad=True)
-topv, topi = torch.topk(torch.softmax(logits, dim=-1), k, dim=-1)
-topv = topv / topv.sum(dim=-1, keepdim=True)
-
-gather_idx, cu, probs, slots = dispatch(topi.to(torch.int32), topv.detach())
-probs_diff = dispatch.differentiable_probs(topv)
-
-# Calibrate once for a representative shape before training.
-layer.calibrate(x.detach(), gather_idx, cu, probs)
-layer.sr_seed = 1234
-
-y = layer(
-    x, gather_idx, cu, probs_diff, slots,
-    off_pad=dispatch.off_pad,
-)
-y.float().square().mean().backward()
-
-# Requantize after the optimizer updates the BF16 master weights.
-# optimizer.step()
-# layer.refresh_weights()
+# The benchmark sequence length is supported when memory and runtime allow it.
+python examples/train_qwen.py --tokens 8192 --steps 1
 ```
 
-`examples/train_toy_moe.py` includes router training, deterministic stochastic
-rounding, and fused microbatch wgrad accumulation.
+The official BF16/FP32 router and top-k selection stay intact. The adapter
+copies the checkpoint's grouped expert weights into BF16 masters, preserves
+the routing-weight autograd path, and refreshes resident NVFP4 weights after
+each optimizer step.
+
+### Using it with Transformer Engine
+
+Use `nvfp4moe` as the expert backend, not as a patch inside TE. Keep TE for
+attention, normalization, dense layers, FP8 state, and any surrounding model
+code. At the MoE boundary, pass the existing router's top-k indices and
+weights to `MoEDispatch` and `MoEExpertLayer` in place of TE permutation,
+`GroupedLinear` FC1/FC2, activation, and unpermutation. This is also the
+boundary used for the TE comparisons in [BENCHMARKS.md](BENCHMARKS.md).
+
+Directly replacing TE's internal `GroupedLinear` kernels is not a stable
+integration point and would leave most dispatch and launch overhead in place.
+For now this package is single-GPU, so TE/Megatron expert-parallel wiring must
+remain outside the replacement.
 
 ## ⚠️ Scope
 
