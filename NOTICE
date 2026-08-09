@@ -1,0 +1,31 @@
+nvfp4moe third-party notices
+============================
+
+nvfp4moe contains modified and adapted Apache-2.0 software. These notices and
+license terms must remain with source and binary redistributions.
+
+QuACK
+-----
+
+third_party/quack is a modified snapshot of Dao-AILab/QuACK v0.6.3. Its
+Apache-2.0 license is preserved at third_party/quack/LICENSE, original source
+copyright notices remain in place, and exact provenance is recorded in
+third_party/quack/SOURCE.
+
+Upstream: https://github.com/Dao-AILab/quack
+
+NVIDIA grouped weight-gradient kernel
+--------------------------------------
+
+nvfp4moe/cwgrad contains an adapted grouped block-scaled GEMM weight-gradient
+implementation originating from NVIDIA cuDNN Frontend examples. The files
+retain NVIDIA copyright and SPDX Apache-2.0 headers.
+
+Upstream: https://github.com/NVIDIA/cudnn-frontend
+
+External runtime and benchmark dependencies
+-------------------------------------------
+
+PyTorch, NVIDIA CUTLASS DSL, Transformer Engine, DeepGEMM, Modal, and the model
+or dataset artifacts used by the benchmarks are not redistributed by this
+project. They remain governed by their respective licenses and terms.

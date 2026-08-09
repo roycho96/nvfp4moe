@@ -1,0 +1,21 @@
+QuACK source snapshot
+=====================
+
+This directory contains a modified source snapshot of Dao-AILab/quack,
+distributed under Apache License 2.0. Original copyright notices remain in
+the source files and the license text is in LICENSE.
+
+Upstream: https://github.com/Dao-AILab/quack
+Upstream release: v0.6.3
+Upstream base commit: 050387b
+Local snapshot commit: 9013a17
+Snapshot date: 2026-08-09
+
+Local changes add the NVFP4 MoE gather path, fused epilogues, quantization,
+dispatch and finalize kernels, tuning controls, and experimental default-off
+GEMM paths. Development history is intentionally excluded from the release
+artifact.
+
+Files carrying QuACK, Tri Dao, Han Guo, or other upstream copyright notices
+remain attributed to those copyright holders. Later changes are tracked by
+this repository's Git history.

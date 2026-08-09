@@ -1,0 +1,16 @@
+# Reference clones, re-obtainable from upstream (672 MB)
+refs/
+
+# The patched quack fork carries its own git history
+work/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+*.log
+*_out*.txt
+.DS_Store
