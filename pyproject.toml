@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nvfp4moe"
+dynamic = ["version"]
+description = "Training-capable NVFP4 MoE expert kernels for NVIDIA Blackwell"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "apache-tvm-ffi>=0.1.6,<0.2",
+    "cuda-python>=13,<14",
+    "einops>=0.8",
+    "nvidia-cutlass-dsl~=4.6.0",
+    "torch>=2.11",
+    "torch-c-dlpack-ext",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "ruff>=0.12",
+]
+benchmark = [
+    "accelerate>=1.10",
+    "datasets>=4.0",
+    "huggingface-hub>=0.34",
+    "modal>=1.5",
+    "safetensors>=0.5",
+    "transformers>=5.5,<5.8",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "nvfp4moe.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nvfp4moe*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+exclude = ["third_party"]
+
+[tool.ruff.lint]
+ignore = [
+    "E731",
+    "E741",
+    "F841",
+]

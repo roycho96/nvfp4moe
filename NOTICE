@@ -1,0 +1,30 @@
+nvfp4moe third-party notices
+============================
+
+nvfp4moe contains modified and adapted NVIDIA Apache-2.0 and BSD-3-Clause software.
+These notices and license terms must remain with source and binary redistributions.
+
+NVIDIA grouped weight-gradient kernel
+--------------------------------------
+
+nvfp4moe/kernels/wgrad contains an adapted grouped block-scaled GEMM
+weight-gradient implementation originating from NVIDIA cuDNN Frontend
+examples. The files retain NVIDIA copyright and SPDX Apache-2.0 headers.
+
+Upstream: https://github.com/NVIDIA/cudnn-frontend
+
+NVIDIA grouped forward GEMM
+---------------------------
+
+nvfp4moe/kernels/grouped_gemm.py derives from NVIDIA CUTLASS's Blackwell
+grouped block-scaled CuTe DSL example. The file retains NVIDIA's BSD-3-Clause
+copyright notice and license text.
+
+Upstream: https://github.com/NVIDIA/cutlass
+
+External runtime and benchmark dependencies
+-------------------------------------------
+
+PyTorch, NVIDIA CUTLASS DSL, Transformer Engine, DeepGEMM, Modal, and the model
+or dataset artifacts used by the benchmarks are not redistributed by this
+project. They remain governed by their respective licenses and terms.
