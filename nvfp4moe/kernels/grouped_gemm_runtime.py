@@ -84,18 +84,10 @@ def _compile_grouped(
             cluster,
             activation=activation,
             dactivation=dactivation,
+            mma_inst_tile_k=2 if dactivation is not None and k >= 4096 else 4,
         )
-        maps_per_expert = 2 if dactivation is not None else 1
         hardware = cutlass.utils.HardwareInfo()
         max_active = hardware.get_max_active_clusters(cluster[0] * cluster[1])
-        tensormaps = torch.empty(
-            experts,
-            maps_per_expert,
-            kernel.tensormap_words,
-            dtype=torch.int64,
-            device="cuda",
-        )
-        tensormaps_cute = from_dlpack(tensormaps, assumed_align=16, enable_tvm_ffi=True)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         compiled = cute.compile(
             kernel,
@@ -108,12 +100,11 @@ def _compile_grouped(
             output_sf_fake,
             output_scale_fake,
             max_active,
-            tensormaps_cute,
             max_active,
             stream,
             options="--enable-tvm-ffi --opt-level 2",
         )
-        keepalive = tuple(seed[1] for seed in seeds) + (tensormaps,)
+        keepalive = tuple(seed[1] for seed in seeds)
         stages = (kernel.num_acc_stage, kernel.num_ab_stage, kernel.num_c_stage)
         return compiled, tuple(seed[0] for seed in seeds), max_active, keepalive, stages
 
@@ -175,7 +166,6 @@ class GroupedNvfp4Gemm:
         if activation is not None:
             self.output_n = n // 2
         self.device = torch.cuda.current_device()
-        self.tensormaps = None
         self._compiled = None
         self._stream_handle = None
         self._stream = None
@@ -333,24 +323,6 @@ class GroupedNvfp4Gemm:
                 self.activation,
                 self.dactivation,
             )
-            kernel = Sm100GroupedBlockScaledGemmKernel(
-                16,
-                (self.tile_m, self.tile_n),
-                (2, 1) if self.tile_m == 256 else (1, 1),
-                activation=self.activation,
-                dactivation=self.dactivation,
-            )
-            self.tensormaps = torch.empty(
-                self.experts,
-                2 if self.dactivation is not None else 1,
-                kernel.tensormap_words,
-                dtype=torch.int64,
-                device="cuda",
-            )
-            self.tensormaps_cute = from_dlpack(
-                self.tensormaps, assumed_align=16, enable_tvm_ffi=True
-            )
-
         stream_handle = torch.cuda.current_stream().cuda_stream
         if stream_handle != self._stream_handle:
             self._stream_handle = stream_handle
@@ -361,7 +333,6 @@ class GroupedNvfp4Gemm:
             self._alpha,
             self._output_sf,
             self._output_scale,
-            self.tensormaps_cute,
             self._stream,
         )
 

@@ -37,7 +37,9 @@ import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass import cute, pipeline, utils
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from .quantize import _cvt_e2m1_pair_rn
@@ -46,6 +48,7 @@ from .sm100.gated_epilogue import (
     gated_postact_fragment,
     gated_sf_u32_word_count,
     quantize_postact_fragment,
+    swiglu_backward_pair,
     validate_gated_activation,
 )
 from .wgrad.moe_persistent_scheduler import (
@@ -53,6 +56,40 @@ from .wgrad.moe_persistent_scheduler import (
     MoESchedulerParams,
     MoEWorkTileInfo,
 )
+
+
+@dsl_user_op
+def _tma_evict_first_policy(*, loc=None, ip=None) -> cutlass.Int64:
+    return cutlass.Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _tma_evict_last_policy(*, loc=None, ip=None) -> cutlass.Int64:
+    return cutlass.Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "createpolicy.fractional.L2::evict_last.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 class Sm100GroupedBlockScaledGemmKernel:
@@ -96,6 +133,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         cluster_shape_mn: tuple[int, int],
         activation: str | None = None,
         dactivation: str | None = None,
+        mma_inst_tile_k: int = 4,
     ):
         """Initializes the configuration for a Blackwell grouped blockscaled GEMM kernel.
 
@@ -110,11 +148,14 @@ class Sm100GroupedBlockScaledGemmKernel:
         """
         if activation is not None and dactivation is not None:
             raise ValueError("activation and dactivation are mutually exclusive")
+        if mma_inst_tile_k not in (2, 4):
+            raise ValueError("mma_inst_tile_k must be 2 or 4")
         self.acc_dtype = cutlass.Float32
         self.activation = None if activation is None else validate_gated_activation(activation)
         self.dactivation = None if dactivation is None else validate_gated_activation(dactivation)
         self.gated = self.activation is not None
         self.dgrad = self.dactivation is not None
+        self.mma_inst_tile_k = mma_inst_tile_k
         self.sf_vec_size = sf_vec_size
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -122,9 +163,6 @@ class Sm100GroupedBlockScaledGemmKernel:
         self.mma_tiler = (*mma_tiler_mn, 1)
 
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
-
-        self.tensormap_update_mode = utils.TensorMapUpdateMode.SMEM
-        self.descriptor_warps = 4
 
         self.occupancy = 1
         # Set specialized warp ids
@@ -202,7 +240,7 @@ class Sm100GroupedBlockScaledGemmKernel:
 
         # Compute mma/cluster/tile shapes
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
-        mma_inst_tile_k = 4
+        mma_inst_tile_k = self.mma_inst_tile_k
         self.mma_tiler = (
             self.mma_inst_shape_mn[0],
             self.mma_inst_shape_mn[1],
@@ -283,10 +321,30 @@ class Sm100GroupedBlockScaledGemmKernel:
             ab_stage_reduction = (
                 2 if self.use_2cta_instrs and self.mma_inst_shape_mn[1] == 256 else 1
             )
+            if self.mma_inst_tile_k == 2:
+                ab_stage_reduction += 1
+                if self.use_2cta_instrs and self.mma_inst_shape_mn[1] == 128:
+                    ab_stage_reduction += 1
             self.num_ab_stage = max(2, self.num_ab_stage - ab_stage_reduction)
             self.num_c_stage = 2
             self.num_preact_stage = 2
             self.num_aux_stage = 2
+
+        # A one-stage accumulator normally serializes MMA with the epilogue.
+        # For the fused gated tile, alternate two TMEM banks: one holds the
+        # accumulator while the other temporarily holds its scale factors.
+        self.interleave_scale_tmem = self.gated and self.num_acc_stage == 1
+        self.tmem_release_subtile = -1
+        if self.interleave_scale_tmem:
+            scale_columns = (
+                (
+                    cute.ceil_div(self.cta_tile_shape_mnk[0], 128)
+                    + cute.ceil_div(self.cta_tile_shape_mnk[1], 128)
+                )
+                * 4
+                * (mma_inst_shape_k // self.sf_vec_size)
+            )
+            self.tmem_release_subtile = scale_columns // cute.size(self.epi_tile[1])
 
         # Compute A/B/SFA/SFB/C shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -367,7 +425,6 @@ class Sm100GroupedBlockScaledGemmKernel:
         output_sf: cute.Tensor,
         output_scale: cute.Tensor,
         total_num_clusters: cutlass.Constexpr[int],
-        tensormaps: cute.Tensor,
         max_active_clusters: cutlass.Constexpr[int],
         stream: cuda.CUstream,
     ):
@@ -419,8 +476,8 @@ class Sm100GroupedBlockScaledGemmKernel:
             store_n = problem_n // 2
 
         # A and SFA use global descriptors with expert-local offsets. B and SFB
-        # use batched descriptors. Output descriptors are built per expert so
-        # TMA suppresses stores outside each routed segment.
+        # use batched descriptors. The output layout encodes an expert-local
+        # logical window so one static TMA descriptor can suppress tail stores.
         total_rows = data_a.shape[0]
         c1 = cutlass.Int32(1)
         c0 = cutlass.Int32(0)
@@ -457,10 +514,10 @@ class Sm100GroupedBlockScaledGemmKernel:
             assumed_align=16,
         )
         initial_c = cute.make_tensor(
-            runtime_c_ptr,
+            runtime_c_ptr - total_rows * store_n,
             cute.make_layout(
-                (total_rows, store_n, c1),
-                stride=(store_n, c1, c0),
+                (total_rows, store_n, (c1, total_rows + c1)),
+                stride=(store_n, c1, (c0, store_n)),
             ),
         )
 
@@ -484,10 +541,10 @@ class Sm100GroupedBlockScaledGemmKernel:
             assumed_align=16,
         )
         aux = cute.make_tensor(
-            runtime_aux_ptr,
+            runtime_aux_ptr - total_rows * problem_n,
             cute.make_layout(
-                (total_rows, problem_n, c1),
-                stride=(problem_n, c1, c0),
+                (total_rows, problem_n, (c1, total_rows + c1)),
+                stride=(problem_n, c1, (c0, problem_n)),
             ),
         )
 
@@ -718,48 +775,6 @@ class Sm100GroupedBlockScaledGemmKernel:
 
         self.shared_storage = SharedStorage
 
-        @cute.struct
-        class TensorMapStorage:
-            buffer: cute.struct.Align[
-                cute.struct.MemRange[
-                    cutlass.Int64,
-                    self.tensormap_words * self.descriptor_warps,
-                ],
-                self.bytes_per_tensormap,
-            ]
-
-        self.tensormap_storage = TensorMapStorage
-
-        self.build_output_tensormaps(
-            tma_atom_c,
-            data_c,
-            cu_seqlens_m,
-            group_count,
-            store_n,
-            tensormaps,
-            0,
-        ).launch(
-            grid=(cute.ceil_div(group_count, self.descriptor_warps), 1, 1),
-            block=(32 * self.descriptor_warps, 1, 1),
-            smem=self.tensormap_storage.size_in_bytes(),
-            stream=stream,
-        )
-        if cutlass.const_expr(self.dgrad):
-            self.build_output_tensormaps(
-                tma_atom_aux,
-                data_aux,
-                cu_seqlens_m,
-                group_count,
-                problem_n,
-                tensormaps,
-                1,
-            ).launch(
-                grid=(cute.ceil_div(group_count, self.descriptor_warps), 1, 1),
-                block=(32 * self.descriptor_warps, 1, 1),
-                smem=self.tensormap_storage.size_in_bytes(),
-                stream=stream,
-            )
-
         self.kernel(
             tiled_mma,
             tiled_mma_sfb,
@@ -793,7 +808,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             alpha,
             output_sf,
             output_scale,
-            tensormaps,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -802,62 +816,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             stream=stream,
             min_blocks_per_mp=1,
         )
-
-    @cute.kernel
-    def build_output_tensormaps(
-        self,
-        tma_atom: cute.CopyAtom,
-        data: cute.Tensor,
-        cu_seqlens_m: cute.Tensor,
-        group_count: cutlass.Constexpr,
-        problem_n: cutlass.Constexpr,
-        tensormaps: cute.Tensor,
-        descriptor_slot: cutlass.Constexpr[int],
-    ):
-        """Build the tail-predicated output descriptor for each expert."""
-        block_idx, _, _ = cute.arch.block_idx()
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        group_idx = block_idx * self.descriptor_warps + warp_idx
-        if group_idx < group_count:
-            row = cutlass.Int64(cu_seqlens_m[group_idx])
-            problem_m = cu_seqlens_m[group_idx + 1] - cu_seqlens_m[group_idx]
-            if problem_m > 0:
-                smem = utils.SmemAllocator()
-                storage = smem.allocate(self.tensormap_storage)
-                smem_c = cute.make_ptr(
-                    cutlass.Int64,
-                    (storage.buffer.data_ptr() + warp_idx * self.tensormap_words).toint(),
-                    cute.AddressSpace.smem,
-                    assumed_align=self.bytes_per_tensormap,
-                )
-                manager = utils.TensorMapManager(
-                    utils.TensorMapUpdateMode.SMEM,
-                    self.bytes_per_tensormap,
-                )
-                gmem_c = manager.get_tensormap_ptr(
-                    tensormaps[(group_idx, descriptor_slot, None)].iterator
-                )
-                manager.init_tensormap_from_atom(tma_atom, smem_c, warp_idx)
-
-                c0 = cutlass.Int32(0)
-                c1 = cutlass.Int32(1)
-                ptr_c = cute.make_ptr(
-                    data.element_type,
-                    data.iterator.toint() + row * ((problem_n * data.element_type.width) // 8),
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                )
-                real_c = cute.make_tensor(
-                    ptr_c,
-                    cute.make_layout((problem_m, problem_n, c1), stride=(problem_n, c1, c0)),
-                )
-                manager.update_tensormap(
-                    (real_c,),
-                    (tma_atom,),
-                    (gmem_c,),
-                    warp_idx,
-                    (smem_c,),
-                )
 
     @cute.kernel
     def kernel(
@@ -894,7 +852,6 @@ class Sm100GroupedBlockScaledGemmKernel:
         alpha: cute.Tensor,
         output_sf: cute.Tensor,
         output_scale: cute.Tensor,
-        tensormaps: cute.Tensor,
     ):
         """
         GPU device kernel performing the grouped GEMM computation.
@@ -1070,13 +1027,8 @@ class Sm100GroupedBlockScaledGemmKernel:
         gSFB_nkl = cute.local_tile(
             mSFB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
         )
-        c_tile = (
-            (self.mma_tiler[0], self.mma_tiler[1] // 2, 1)
-            if cutlass.const_expr(self.gated)
-            else cute.slice_(self.mma_tiler, (None, None, 0))
-        )
         #
-        # Partition global tensor for TiledMMA_A/B/C
+        # Partition global tensors for TiledMMA A/B
         #
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
         thr_mma_sfb = tiled_mma_sfb.get_slice(mma_tile_coord_v)
@@ -1084,19 +1036,6 @@ class Sm100GroupedBlockScaledGemmKernel:
         tCgB = thr_mma.partition_B(gB_nkl)
         # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
-        # (bM, bN, RestM, RestN, RestL)
-        gC_mnl = cute.local_tile(mC_mnl, c_tile, (None, None, None))
-        # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
-        tCgC = thr_mma.partition_C(gC_mnl)
-        tCgAux = tCgC
-        if cutlass.const_expr(self.dgrad):
-            gAux_mnl = cute.local_tile(
-                mAux_mnl,
-                cute.slice_(self.mma_tiler, (None, None, 0)),
-                (None, None, None),
-            )
-            tCgAux = thr_mma.partition_C(gAux_mnl)
-
         #
         # Partition global/shared tensor for TMA load A/B
         #
@@ -1138,7 +1077,8 @@ class Sm100GroupedBlockScaledGemmKernel:
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         # (MMA, MMA_M, MMA_N, STAGE)
-        tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
+        physical_acc_stages = 2 if self.interleave_scale_tmem else self.num_acc_stage
+        tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, physical_acc_stages))
 
         #
         # Cluster wait before tensor memory alloc
@@ -1146,10 +1086,6 @@ class Sm100GroupedBlockScaledGemmKernel:
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         grid_dim = cute.arch.grid_dim()
-        tensormap_manager = utils.TensorMapManager(
-            self.tensormap_update_mode,
-            self.bytes_per_tensormap,
-        )
         #
         # Persistent tile scheduling loop
         #
@@ -1233,6 +1169,13 @@ class Sm100GroupedBlockScaledGemmKernel:
                     pipeline.PipelineUserType.Producer,
                     self.num_preact_stage,
                 )
+            reuse_cache_policy = None
+            stream_cache_policy = None
+            if cutlass.const_expr(self.mma_inst_tile_k == 2):
+                # Small shards reuse A across output tiles; B remains streaming.
+                if cutlass.const_expr(group_count <= 128):
+                    reuse_cache_policy = _tma_evict_last_policy()
+                stream_cache_policy = _tma_evict_first_policy()
 
             while work_tile.is_valid_tile:
                 cur_k_tile_cnt = k_tile_count
@@ -1335,6 +1278,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                                 "use_2cta_mma_inst": use_2cta_instrs,
                             },
                             tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                            cache_policy=reuse_cache_policy,
                         )
                         cute.copy(
                             tma_atom_b,
@@ -1342,6 +1286,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                             tBsB[(None, ab_producer_state.index)],
                             tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                             mcast_mask=b_full_mcast_mask,
+                            cache_policy=stream_cache_policy,
                         )
                         utils.block_copy(
                             tma_atom_sfa,
@@ -1353,6 +1298,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                                 "use_2cta_mma_inst": use_2cta_instrs,
                             },
                             tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                            cache_policy=reuse_cache_policy,
                         )
                         cute.copy(
                             tma_atom_sfb,
@@ -1360,6 +1306,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                             tBsSFB[(None, ab_producer_state.index)],
                             tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                             mcast_mask=sfb_full_mcast_mask,
+                            cache_policy=stream_cache_policy,
                         )
 
                         # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
@@ -1442,7 +1389,12 @@ class Sm100GroupedBlockScaledGemmKernel:
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
 
             # Make SFA tmem tensor
-            acc_tmem_col_offset = tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
+            acc_bank = (
+                tCtAcc_base[(None, None, None, 0)]
+                if cutlass.const_expr(self.interleave_scale_tmem)
+                else tCtAcc_base
+            )
+            acc_tmem_col_offset = tcgen05.find_tmem_tensor_col_offset(acc_bank)
             sfa_tmem_ptr = cute.recast_ptr(
                 acc_tmem_ptr + acc_tmem_col_offset,
                 dtype=self.sf_dtype,
@@ -1454,11 +1406,13 @@ class Sm100GroupedBlockScaledGemmKernel:
                 self.sf_vec_size,
                 cute.slice_(sfa_smem_layout_staged, (None, None, None, 0)),
             )
-            tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
+            tCtSFA_base = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
 
             # Make SFB tmem tensor
             sfb_tmem_ptr = cute.recast_ptr(
-                acc_tmem_ptr + acc_tmem_col_offset + tcgen05.find_tmem_tensor_col_offset(tCtSFA),
+                acc_tmem_ptr
+                + acc_tmem_col_offset
+                + tcgen05.find_tmem_tensor_col_offset(tCtSFA_base),
                 dtype=self.sf_dtype,
             )
             # (MMA, MMA_N, MMA_K)
@@ -1468,15 +1422,15 @@ class Sm100GroupedBlockScaledGemmKernel:
                 self.sf_vec_size,
                 cute.slice_(sfb_smem_layout_staged, (None, None, None, 0)),
             )
-            tCtSFB = cute.make_tensor(sfb_tmem_ptr, tCtSFB_layout)
+            tCtSFB_base = cute.make_tensor(sfb_tmem_ptr, tCtSFB_layout)
             #
             # Partition for S2T copy of SFA/SFB
             #
-            tiled_copy_s2t_sfa, tCsSFA_compact_s2t, tCtSFA_compact_s2t = (
-                self.mainloop_s2t_copy_and_partition(sSFA, tCtSFA)
+            tiled_copy_s2t_sfa, tCsSFA_compact_s2t, tCtSFA_compact_s2t_base = (
+                self.mainloop_s2t_copy_and_partition(sSFA, tCtSFA_base)
             )
-            tiled_copy_s2t_sfb, tCsSFB_compact_s2t, tCtSFB_compact_s2t = (
-                self.mainloop_s2t_copy_and_partition(sSFB, tCtSFB)
+            tiled_copy_s2t_sfb, tCsSFB_compact_s2t, tCtSFB_compact_s2t_base = (
+                self.mainloop_s2t_copy_and_partition(sSFB, tCtSFB_base)
             )
 
             #
@@ -1518,8 +1472,59 @@ class Sm100GroupedBlockScaledGemmKernel:
                 sched_pipeline.consumer_release(sched_consumer_state)
                 sched_consumer_state.advance()
 
+                if cutlass.const_expr(self.interleave_scale_tmem):
+                    scale_bank_delta = cute.assume(
+                        acc_tmem_col_offset * (acc_producer_state.phase - 1),
+                        divby=acc_tmem_col_offset,
+                    )
+                    tCtSFA = cute.make_tensor(
+                        cute.recast_ptr(
+                            cute.recast_ptr(tCtSFA_base.iterator, dtype=self.acc_dtype)
+                            + scale_bank_delta,
+                            dtype=self.sf_dtype,
+                        ),
+                        tCtSFA_base.layout,
+                    )
+                    tCtSFB = cute.make_tensor(
+                        cute.recast_ptr(
+                            cute.recast_ptr(tCtSFB_base.iterator, dtype=self.acc_dtype)
+                            + scale_bank_delta,
+                            dtype=self.sf_dtype,
+                        ),
+                        tCtSFB_base.layout,
+                    )
+                    tCtSFA_compact_s2t = cute.make_tensor(
+                        cute.recast_ptr(
+                            cute.recast_ptr(
+                                tCtSFA_compact_s2t_base.iterator,
+                                dtype=self.acc_dtype,
+                            )
+                            + scale_bank_delta,
+                            dtype=self.sf_dtype,
+                        ),
+                        tCtSFA_compact_s2t_base.layout,
+                    )
+                    tCtSFB_compact_s2t = cute.make_tensor(
+                        cute.recast_ptr(
+                            cute.recast_ptr(
+                                tCtSFB_compact_s2t_base.iterator,
+                                dtype=self.acc_dtype,
+                            )
+                            + scale_bank_delta,
+                            dtype=self.sf_dtype,
+                        ),
+                        tCtSFB_compact_s2t_base.layout,
+                    )
+                    acc_stage = acc_producer_state.phase ^ 1
+                else:
+                    tCtSFA = tCtSFA_base
+                    tCtSFB = tCtSFB_base
+                    tCtSFA_compact_s2t = tCtSFA_compact_s2t_base
+                    tCtSFB_compact_s2t = tCtSFB_compact_s2t_base
+                    acc_stage = acc_producer_state.index
+
                 # (MMA, MMA_M, MMA_N)
-                tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
+                tCtAcc = tCtAcc_base[(None, None, None, acc_stage)]
 
                 # Peek (try_wait) AB buffer full for k_tile = 0
                 ab_consumer_state.reset_count()
@@ -1667,13 +1672,12 @@ class Sm100GroupedBlockScaledGemmKernel:
             tiled_copy_r2s = None
             tRS_rC = None
             tRS_sC = None
-            bSG_sC = None
-            bSG_gC_partitioned = None
-            bSG_sAux = None
-            bSG_gAux_partitioned = None
             aux_tiled_copy_r2s = None
             tRS_rAux = None
             tRS_sAux = None
+            tiled_copy_s2r = None
+            tSR_rP = None
+            tSR_sP = None
             if cutlass.const_expr(self.gated):
                 copy_atom_r2s = sm100_utils.get_smem_store_op(
                     self.c_layout,
@@ -1690,26 +1694,23 @@ class Sm100GroupedBlockScaledGemmKernel:
                     full_tiled_copy_r2s,
                 )
                 tRS_sC = tiled_copy_r2s.get_slice(epi_tidx).partition_D(sC)
-                tma_atom_c, bSG_sC, bSG_gC_partitioned = self.epilog_gmem_copy_and_partition(
-                    epi_tidx,
-                    tma_atom_c,
-                    tCgC,
-                    store_epi_tile,
-                    sC,
-                )
             else:
                 tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
                 tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                     tiled_copy_t2r, tTR_rC, epi_tidx, sC
                 )
-                tma_atom_c, bSG_sC, bSG_gC_partitioned = self.epilog_gmem_copy_and_partition(
-                    epi_tidx,
-                    tma_atom_c,
-                    tCgC,
-                    epi_tile,
-                    sC,
-                )
                 if cutlass.const_expr(self.dgrad):
+                    copy_atom_s2r = cute.make_copy_atom(
+                        cute.nvgpu.CopyUniversalOp(),
+                        self.c_dtype,
+                    )
+                    tiled_copy_s2r = cute.make_tiled_copy_D(
+                        copy_atom_s2r,
+                        tiled_copy_t2r,
+                    )
+                    thr_copy_s2r = tiled_copy_s2r.get_slice(epi_tidx)
+                    tSR_sP = thr_copy_s2r.partition_D(sP)
+                    tSR_rP = tiled_copy_s2r.retile(tTR_rC)
                     aux_copy_atom_r2s = sm100_utils.get_smem_store_op(
                         self.c_layout,
                         cutlass.BFloat16,
@@ -1723,15 +1724,10 @@ class Sm100GroupedBlockScaledGemmKernel:
                     tTR_rAux = cute.make_rmem_tensor(tTR_rAcc.shape, cutlass.BFloat16)
                     tRS_rAux = aux_tiled_copy_r2s.retile(tTR_rAux)
                     tRS_sAux = aux_tiled_copy_r2s.get_slice(epi_tidx).partition_D(sAux)
-                    tma_atom_aux, bSG_sAux, bSG_gAux_partitioned = (
-                        self.epilog_gmem_copy_and_partition(
-                            epi_tidx,
-                            tma_atom_aux,
-                            tCgAux,
-                            epi_tile,
-                            sAux,
-                        )
-                    )
+            c_tma_smem = cute.group_modes(sC, 0, cute.rank(sC) - 1)
+            aux_tma_smem = None
+            if cutlass.const_expr(self.dgrad):
+                aux_tma_smem = cute.group_modes(sAux, 0, cute.rank(sAux) - 1)
 
             #
             # Persistent tile scheduling loop
@@ -1774,7 +1770,6 @@ class Sm100GroupedBlockScaledGemmKernel:
                 num_stages=c_store_stages,
                 producer_group=c_producer_group,
             )
-            last_group_idx = cutlass.Int32(-1)
             num_tiles_executed = cutlass.Int32(0)
             output_inv_pts = cutlass.Float32(1.0)
             if cutlass.const_expr(self.is_nvfp4_output):
@@ -1785,7 +1780,6 @@ class Sm100GroupedBlockScaledGemmKernel:
                 cur_group_idx = work_tile.expert_idx
                 cur_k_tile_cnt = k_tile_count
                 is_k_tile_cnt_zero = cur_k_tile_cnt == 0
-                is_group_changed = cur_group_idx != last_group_idx
                 sched_pipeline.consumer_wait(sched_consumer_state)
                 cute.copy(
                     sched_copy_atom,
@@ -1798,41 +1792,58 @@ class Sm100GroupedBlockScaledGemmKernel:
                 sched_consumer_state.advance()
                 expert_row = cutlass.Int64(cu_seqlens_m[cur_group_idx])
                 expert_rows = cu_seqlens_m[cur_group_idx + 1] - cu_seqlens_m[cur_group_idx]
-                tensormap_c_gmem_ptr = tensormap_manager.get_tensormap_ptr(
-                    tensormaps[(cur_group_idx, 0, None)].iterator
-                )
-                tensormap_aux_gmem_ptr = tensormap_c_gmem_ptr
-                if cutlass.const_expr(self.dgrad):
-                    tensormap_aux_gmem_ptr = tensormap_manager.get_tensormap_ptr(
-                        tensormaps[(cur_group_idx, 1, None)].iterator
-                    )
-
-                mma_tile_coord_mnl = (
-                    work_tile.tile_m_idx // cute.size(tiled_mma.thr_id.shape),
-                    work_tile.tile_n_idx,
-                    0,
-                )
-                bSG_gC = bSG_gC_partitioned[
+                c_window = cute.domain_offset(
                     (
-                        None,
-                        None,
-                        None,
-                        *mma_tile_coord_mnl,
-                    )
-                ]
+                        mC_mnl.shape[0] - expert_rows,
+                        0,
+                        (0, expert_row + expert_rows),
+                    ),
+                    mC_mnl,
+                )
+                output_cta_n = self.cta_tile_shape_mnk[1]
+                if cutlass.const_expr(self.gated):
+                    output_cta_n //= 2
+                c_tile = cute.local_tile(
+                    c_window,
+                    (self.cta_tile_shape_mnk[0], output_cta_n, 1),
+                    (work_tile.tile_m_idx, work_tile.tile_n_idx, (0, 0)),
+                )
+                c_subtiles = cute.zipped_divide(c_tile, (*store_epi_tile, 1))
+                c_tma_gmem = cute.group_modes(
+                    c_subtiles,
+                    0,
+                    cute.rank(c_subtiles) - 1,
+                )
+                aux_tma_gmem = None
                 if cutlass.const_expr(self.dgrad):
-                    bSG_gAux = bSG_gAux_partitioned[
+                    aux_window = cute.domain_offset(
                         (
-                            None,
-                            None,
-                            None,
-                            *mma_tile_coord_mnl,
-                        )
-                    ]
+                            mAux_mnl.shape[0] - expert_rows,
+                            0,
+                            (0, expert_row + expert_rows),
+                        ),
+                        mAux_mnl,
+                    )
+                    aux_tile = cute.local_tile(
+                        aux_window,
+                        (*self.cta_tile_shape_mnk[:2], 1),
+                        (work_tile.tile_m_idx, work_tile.tile_n_idx, (0, 0)),
+                    )
+                    aux_subtiles = cute.zipped_divide(aux_tile, (*epi_tile, 1))
+                    aux_tma_gmem = cute.group_modes(
+                        aux_subtiles,
+                        0,
+                        cute.rank(aux_subtiles) - 1,
+                    )
 
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
-                tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
+                acc_stage = (
+                    acc_consumer_state.phase
+                    if cutlass.const_expr(self.interleave_scale_tmem)
+                    else acc_consumer_state.index
+                )
+                tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage)]
 
                 #
                 # Wait for accumulator buffer full
@@ -1842,14 +1853,6 @@ class Sm100GroupedBlockScaledGemmKernel:
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 tTR_cAcc_subtiles = cute.group_modes(tTR_cAcc, 3, cute.rank(tTR_cAcc))
-                bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
-                if cutlass.const_expr(self.dgrad):
-                    bSG_gAux = cute.group_modes(bSG_gAux, 1, cute.rank(bSG_gAux))
-
-                if is_group_changed and warp_idx == self.epilog_warp_id[0]:
-                    tensormap_manager.fence_tensormap_update(tensormap_c_gmem_ptr)
-                    if cutlass.const_expr(self.dgrad):
-                        tensormap_manager.fence_tensormap_update(tensormap_aux_gmem_ptr)
 
                 #
                 # Store accumulator to global memory in subtiles
@@ -1916,6 +1919,11 @@ class Sm100GroupedBlockScaledGemmKernel:
                         #
                         tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                         cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+                        if cutlass.const_expr(self.interleave_scale_tmem):  # noqa: SIM102
+                            if subtile_idx == self.tmem_release_subtile:
+                                cute.arch.fence_view_async_tmem_load()
+                                with cute.arch.elect_one():
+                                    acc_pipeline.consumer_release(acc_consumer_state)
 
                     elif cutlass.const_expr(self.gated or self.dgrad):
                         tTR_rAcc.fill(0)
@@ -2038,78 +2046,106 @@ class Sm100GroupedBlockScaledGemmKernel:
                         cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier.arrive_and_wait()
                         if warp_idx == self.epilog_warp_id[0]:
-                            cute.copy(
+                            utils.block_copy(
                                 tma_atom_c,
-                                bSG_sC[(None, c_buffer)],
-                                bSG_gC[(None, subtile_idx)],
-                                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                                    tensormap_c_gmem_ptr,
-                                    cute.AddressSpace.generic,
-                                ),
+                                c_tma_smem[(None, c_buffer)],
+                                c_tma_gmem[(None, subtile_idx)],
                             )
                             c_pipeline.producer_commit()
                     elif cutlass.const_expr(self.dgrad):
-                        coords = tTR_cAcc_subtiles[(None, None, None, subtile_idx)]
-                        retiled_coords = tiled_copy_r2s.retile(coords)
                         retiled_acc = tiled_copy_r2s.retile(tTR_rAcc)
-                        flat_coords = cute.group_modes(
-                            retiled_coords,
-                            0,
-                            cute.rank(retiled_coords),
-                        )
                         flat_acc = cute.group_modes(retiled_acc, 0, cute.rank(retiled_acc))
                         flat_out = cute.group_modes(tRS_rC, 0, cute.rank(tRS_rC))
                         flat_aux = cute.group_modes(tRS_rAux, 0, cute.rank(tRS_rAux))
                         preact_pipeline.consumer_wait(preact_consumer_state)
-                        assert cute.size(flat_coords) == cute.size(flat_acc)
+                        cute.copy(
+                            tiled_copy_s2r,
+                            tSR_sP[(None, None, None, preact_consumer_state.index)],
+                            tSR_rP,
+                        )
+                        flat_preact = cute.group_modes(tSR_rP, 0, cute.rank(tSR_rP))
+                        assert cute.size(flat_preact) == cute.size(flat_acc)
                         assert cute.size(flat_out) == cute.size(flat_acc)
                         assert cute.size(flat_aux) == cute.size(flat_acc)
-                        gates = cute.make_rmem_tensor(flat_acc.shape, cutlass.Float32)
-                        ups = cute.make_rmem_tensor(flat_acc.shape, cutlass.Float32)
+                        self.epilog_sync_barrier.arrive_and_wait()
+                        preact_pipeline.consumer_release(preact_consumer_state)
+                        preact_consumer_state.advance()
                         preact_pair = cute.make_rmem_tensor(
                             cute.make_layout(1),
                             cutlass.Int32,
                         )
-                        for value_idx in cutlass.range_constexpr(cute.size(flat_acc)):
-                            coord = flat_coords[value_idx]
-                            preact_pair[0] = sP[
-                                (
-                                    coord[0] % cute.size(epi_tile[0]),
-                                    coord[1] % cute.size(epi_tile[1]),
-                                    preact_consumer_state.index,
-                                )
-                            ]
-                            bf16_pair = cute.make_tensor(
-                                cute.recast_ptr(
-                                    preact_pair.iterator,
-                                    dtype=cutlass.BFloat16,
-                                ),
+                        if cutlass.const_expr(
+                            self.dactivation == "swiglu" and self.mma_inst_tile_k == 4
+                        ):
+                            preact_pairs = cute.make_rmem_tensor(
                                 cute.make_layout(2),
-                            )
-                            gates[value_idx] = bf16_pair[0].to(cutlass.Float32)
-                            ups[value_idx] = bf16_pair[1].to(cutlass.Float32)
-                        self.epilog_sync_barrier.arrive_and_wait()
-                        preact_pipeline.consumer_release(preact_consumer_state)
-                        preact_consumer_state.advance()
-                        for value_idx in cutlass.range_constexpr(cute.size(flat_acc)):
-                            dgate, dup, postact = gated_backward_values(
-                                gates[value_idx],
-                                ups[value_idx],
-                                flat_acc[value_idx] * alpha_value,
-                                self.dactivation,
-                            )
-                            gates[value_idx] = dgate
-                            ups[value_idx] = dup
-                            flat_acc[value_idx] = postact
-                        grad_pair = cute.make_rmem_tensor(cute.make_layout(2), cutlass.BFloat16)
-                        for value_idx in cutlass.range_constexpr(cute.size(flat_acc)):
-                            grad_pair[0] = gates[value_idx].to(cutlass.BFloat16)
-                            grad_pair[1] = ups[value_idx].to(cutlass.BFloat16)
-                            flat_out[value_idx] = cute.recast_tensor(
-                                grad_pair,
                                 cutlass.Int32,
-                            )[0]
-                            flat_aux[value_idx] = flat_acc[value_idx].to(cutlass.BFloat16)
+                            )
+                            grad_pairs = cute.make_rmem_tensor(
+                                cute.make_layout(4),
+                                cutlass.BFloat16,
+                            )
+                            for pair_idx in cutlass.range_constexpr(cute.size(flat_acc) // 2):
+                                value_idx = pair_idx * 2
+                                preact_pairs[0] = flat_preact[value_idx]
+                                preact_pairs[1] = flat_preact[value_idx + 1]
+                                bf16_pairs = cute.make_tensor(
+                                    cute.recast_ptr(
+                                        preact_pairs.iterator,
+                                        dtype=cutlass.BFloat16,
+                                    ),
+                                    cute.make_layout(4),
+                                )
+                                dgate, dup, postact = swiglu_backward_pair(
+                                    (
+                                        bf16_pairs[0].to(cutlass.Float32),
+                                        bf16_pairs[2].to(cutlass.Float32),
+                                    ),
+                                    (
+                                        bf16_pairs[1].to(cutlass.Float32),
+                                        bf16_pairs[3].to(cutlass.Float32),
+                                    ),
+                                    (
+                                        flat_acc[value_idx] * alpha_value,
+                                        flat_acc[value_idx + 1] * alpha_value,
+                                    ),
+                                )
+                                grad_pairs[0] = dgate[0].to(cutlass.BFloat16)
+                                grad_pairs[1] = dup[0].to(cutlass.BFloat16)
+                                grad_pairs[2] = dgate[1].to(cutlass.BFloat16)
+                                grad_pairs[3] = dup[1].to(cutlass.BFloat16)
+                                packed_grads = cute.recast_tensor(grad_pairs, cutlass.Int32)
+                                flat_out[value_idx] = packed_grads[0]
+                                flat_out[value_idx + 1] = packed_grads[1]
+                                flat_aux[value_idx] = postact[0].to(cutlass.BFloat16)
+                                flat_aux[value_idx + 1] = postact[1].to(cutlass.BFloat16)
+                        else:
+                            grad_pair = cute.make_rmem_tensor(
+                                cute.make_layout(2),
+                                cutlass.BFloat16,
+                            )
+                            for value_idx in cutlass.range_constexpr(cute.size(flat_acc)):
+                                preact_pair[0] = flat_preact[value_idx]
+                                bf16_pair = cute.make_tensor(
+                                    cute.recast_ptr(
+                                        preact_pair.iterator,
+                                        dtype=cutlass.BFloat16,
+                                    ),
+                                    cute.make_layout(2),
+                                )
+                                dgate, dup, postact = gated_backward_values(
+                                    bf16_pair[0].to(cutlass.Float32),
+                                    bf16_pair[1].to(cutlass.Float32),
+                                    flat_acc[value_idx] * alpha_value,
+                                    self.dactivation,
+                                )
+                                grad_pair[0] = dgate.to(cutlass.BFloat16)
+                                grad_pair[1] = dup.to(cutlass.BFloat16)
+                                flat_out[value_idx] = cute.recast_tensor(
+                                    grad_pair,
+                                    cutlass.Int32,
+                                )[0]
+                                flat_aux[value_idx] = postact.to(cutlass.BFloat16)
                         c_buffer = (num_prev_subtiles + subtile_idx) % c_store_stages
                         aux_buffer = (num_prev_subtiles + subtile_idx) % self.num_aux_stage
                         if warp_idx == self.epilog_warp_id[0]:
@@ -2128,23 +2164,15 @@ class Sm100GroupedBlockScaledGemmKernel:
                         cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier.arrive_and_wait()
                         if warp_idx == self.epilog_warp_id[0]:
-                            cute.copy(
+                            utils.block_copy(
                                 tma_atom_c,
-                                bSG_sC[(None, c_buffer)],
-                                bSG_gC[(None, subtile_idx)],
-                                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                                    tensormap_c_gmem_ptr,
-                                    cute.AddressSpace.generic,
-                                ),
+                                c_tma_smem[(None, c_buffer)],
+                                c_tma_gmem[(None, subtile_idx)],
                             )
-                            cute.copy(
+                            utils.block_copy(
                                 tma_atom_aux,
-                                bSG_sAux[(None, aux_buffer)],
-                                bSG_gAux[(None, subtile_idx)],
-                                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                                    tensormap_aux_gmem_ptr,
-                                    cute.AddressSpace.generic,
-                                ),
+                                aux_tma_smem[(None, aux_buffer)],
+                                aux_tma_gmem[(None, subtile_idx)],
                             )
                             c_pipeline.producer_commit()
                     else:
@@ -2177,14 +2205,10 @@ class Sm100GroupedBlockScaledGemmKernel:
                         cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier.arrive_and_wait()
                         if warp_idx == self.epilog_warp_id[0]:
-                            cute.copy(
+                            utils.block_copy(
                                 tma_atom_c,
-                                bSG_sC[(None, c_buffer)],
-                                bSG_gC[(None, subtile_idx)],
-                                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                                    tensormap_c_gmem_ptr,
-                                    cute.AddressSpace.generic,
-                                ),
+                                c_tma_smem[(None, c_buffer)],
+                                c_tma_gmem[(None, subtile_idx)],
                             )
                             c_pipeline.producer_commit()
                 if cutlass.const_expr(self.gated_sf_u32_words > 0):
@@ -2237,7 +2261,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                 #
                 # Async arrive accumulator buffer empty
                 #
-                if not is_k_tile_cnt_zero:
+                if not is_k_tile_cnt_zero and not cutlass.const_expr(self.interleave_scale_tmem):
                     with cute.arch.elect_one():
                         acc_pipeline.consumer_release(acc_consumer_state)
                 if not is_k_tile_cnt_zero:
@@ -2248,7 +2272,6 @@ class Sm100GroupedBlockScaledGemmKernel:
                 #
                 num_tiles_executed += 1
                 work_tile = next_work_tile
-                last_group_idx = cur_group_idx
 
             #
             # Dealloc the tensor memory buffer
@@ -2401,58 +2424,6 @@ class Sm100GroupedBlockScaledGemmKernel:
         # (R2S, R2S_M, R2S_N)
         tRS_rC = tiled_copy_r2s.retile(tTR_rC)
         return tiled_copy_r2s, tRS_rC, tRS_sC
-
-    def epilog_gmem_copy_and_partition(
-        self,
-        tidx: cutlass.Int32,
-        atom: cute.CopyAtom | cute.TiledCopy,
-        gC_mnl: cute.Tensor,
-        epi_tile: cute.Tile,
-        sC: cute.Tensor,
-    ) -> tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]:
-        """Make tiledCopy for global memory store, then use it to:
-        partition shared memory (source) and global memory (destination) for TMA store version.
-
-        :param tidx: The thread index in epilogue warp groups
-        :type tidx: cutlass.Int32
-        :param atom: The copy_atom_c to be used for TMA store version, or tiled_copy_t2r for none TMA store version
-        :type atom: cute.CopyAtom or cute.TiledCopy
-        :param gC_mnl: The global tensor C
-        :type gC_mnl: cute.Tensor
-        :param epi_tile: The epilogue tiler
-        :type epi_tile: cute.Tile
-        :param sC: The shared memory tensor to be copied and partitioned
-        :type sC: cute.Tensor
-
-        :return: A tuple containing (tma_atom_c, bSG_sC, bSG_gC) where:
-            - tma_atom_c: The TMA copy atom
-            - bSG_sC: The partitioned shared memory tensor C
-            - bSG_gC: The partitioned global tensor C
-        :rtype: Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]
-        """
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
-        # Slice away the MMA value modes before dividing so the TMA atom sees
-        # a compile-time transfer shape even when the expert row extent is
-        # dynamic. Gated outputs already use a half-width global tile.
-        if cutlass.const_expr(self.gated):
-            gC_tile = gC_mnl[((None, None), 0, 0, 0, None, None, None)]
-        else:
-            gC_tile = gC_mnl[((None, None), 0, 0, None, None, None)]
-        gC_epi = cute.flat_divide(gC_tile, epi_tile)
-
-        tma_atom_c = atom
-        sC_for_tma_partition = cute.group_modes(sC, 0, 2)
-        gC_for_tma_partition = cute.group_modes(gC_epi, 0, 2)
-        # ((ATOM_V, REST_V), EPI_M, EPI_N)
-        # ((ATOM_V, REST_V), EPI_M, EPI_N, RestM, RestN, RestL)
-        bSG_sC, bSG_gC = cpasync.tma_partition(
-            tma_atom_c,
-            0,
-            cute.make_layout(1),
-            sC_for_tma_partition,
-            gC_for_tma_partition,
-        )
-        return tma_atom_c, bSG_sC, bSG_gC
 
     @staticmethod
     def _compute_stages(
@@ -2865,9 +2836,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             can_implement = False
         return can_implement
 
-    # Size of smem we reserved for mbarrier, tensor memory management and tensormap update
+    # Size of smem reserved for barriers and tensor-memory management.
     reserved_smem_bytes = 1024
-    bytes_per_tensormap = 128
-    tensormap_words = bytes_per_tensormap // 8
     # size of smem used for tensor memory management
     tensor_memory_management_bytes = 12

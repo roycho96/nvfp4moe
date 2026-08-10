@@ -76,11 +76,63 @@ def run(
     return ok
 
 
+@app.function(gpu="B200", image=img, timeout=3600, volumes={"/vol": vol})
+def profile(case="dgrad2-qwen"):
+    import os
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = "/root/proj"
+    command = [
+        "ncu",
+        "--target-processes",
+        "all",
+        "--kernel-name",
+        "regex:.*Sm100GroupedBlockScaledGemmKernel.*",
+        "--launch-count",
+        "1",
+        "--section",
+        "SpeedOfLight",
+        "--section",
+        "LaunchStats",
+        "--section",
+        "Occupancy",
+        "--section",
+        "SchedulerStats",
+        "--section",
+        "WarpStateStats",
+        "--section",
+        "InstructionStats",
+        "--section",
+        "MemoryWorkloadAnalysis",
+        sys.executable,
+        "/root/proj/benchmarks/native_grouped_gemm_smoke.py",
+        "--profile-case",
+        case,
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=3000,
+        env=env,
+        check=False,
+    )
+    print(result.stdout[-80_000:])
+    if result.stderr:
+        print(result.stderr[-8000:])
+    if result.returncode != 0:
+        raise RuntimeError(f"NCU exited with {result.returncode}")
+
+
 @app.local_entrypoint()
 def main(
     smoke_only: bool = False,
     native_fp32: bool = False,
     dgrad_matrix: bool = False,
     frontier_matrix: bool = False,
+    profile_case: str = "",
 ):
-    run.remote(smoke_only, native_fp32, dgrad_matrix, frontier_matrix)
+    if profile_case:
+        profile.remote(profile_case)
+    else:
+        run.remote(smoke_only, native_fp32, dgrad_matrix, frontier_matrix)

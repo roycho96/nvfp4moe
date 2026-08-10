@@ -202,6 +202,7 @@ def run_dgrad2_case(
     activation="swiglu",
     tile_m=256,
     tile_n=128,
+    profile_only=False,
 ):
     torch.manual_seed(2027)
     device = "cuda"
@@ -287,6 +288,13 @@ def run_dgrad2_case(
     torch.cuda.synchronize()
     if not torch.equal(native_dh, first_dh) or not torch.equal(native_aux, first_aux):
         raise AssertionError("native dgrad2 is not deterministic")
+    if profile_only:
+        native_prepare()
+        torch.cuda.nvtx.range_push("nvfp4moe_profile")
+        native.launch()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.synchronize()
+        return None
     native_ms = _time(native_call)
     prepare_ms = _time(native_prepare)
     native_prepare()
@@ -314,9 +322,39 @@ def main():
     parser.add_argument("--scheduler-edge", action="store_true")
     parser.add_argument("--dgrad-matrix", action="store_true")
     parser.add_argument("--frontier-matrix", action="store_true")
+    parser.add_argument(
+        "--profile-case",
+        choices=("dgrad2-qwen", "dgrad2-kimi", "dgrad2-deepseek"),
+    )
     parser.add_argument("--output-dtype", choices=("bf16", "fp32"), default="bf16")
     args = parser.parse_args()
     output_dtype = torch.float32 if args.output_dtype == "fp32" else torch.bfloat16
+
+    if args.profile_case == "dgrad2-qwen":
+        run_dgrad2_case(profile_only=True)
+        return
+    if args.profile_case == "dgrad2-kimi":
+        run_dgrad2_case(
+            experts=128,
+            n=2048,
+            k=7168,
+            rows=21_846,
+            tile_m=256,
+            tile_n=256,
+            profile_only=True,
+        )
+        return
+    if args.profile_case == "dgrad2-deepseek":
+        run_dgrad2_case(
+            experts=256,
+            n=2048,
+            k=7168,
+            rows=65_536,
+            tile_m=256,
+            tile_n=256,
+            profile_only=True,
+        )
+        return
 
     if args.frontier_matrix:
         cases = [
@@ -327,8 +365,6 @@ def main():
         results = []
         for model, experts, n, k, rows in cases:
             tiles = ((128, 128), (128, 256), (256, 128), (256, 256))
-            if model == "kimi_k2_7_ep3":
-                tiles = ((128, 128), (256, 256))
             for tile_m, tile_n in tiles:
                 result = run_dgrad2_case(
                     experts,
@@ -355,8 +391,6 @@ def main():
         results = []
         for model, experts, n, k, rows, activation in cases:
             tiles = ((128, 128), (128, 256), (256, 128), (256, 256))
-            if model != "qwen3_30b":
-                tiles = ((128, 256), (256, 256))
             for tile_m, tile_n in tiles:
                 result = run_dgrad2_case(
                     experts,

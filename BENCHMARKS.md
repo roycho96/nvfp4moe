@@ -49,6 +49,19 @@ In this session, `nvfp4moe` was 17.55×/10.01× faster than TE NVFP4 and
 forward-only DeepGEMM FP8 × FP4 adapter was 6.19× slower. The before/after
 canary drift was 2.19%, within the 5% acceptance threshold.
 
+A final native-only regression run after the SM100 scheduler and L2-policy
+changes measured 0.552 ms forward and 3.492 ms forward + backward. The summed
+GPU-kernel time was 0.439 ms and 2.275 ms, respectively; canary drift was
+0.57%. In the full Qwen block with SDPA, the same run measured:
+
+| expert path | compile mode | block forward | block forward + backward |
+|---|---:|---:|---:|
+| TE BF16 | eager | 9.479 ms | 22.385 ms |
+| TE dispatch + DeepGEMM BF16 | eager | 4.243 ms | 17.826 ms |
+| `nvfp4moe` | eager | **2.646 ms** | **10.012 ms** |
+| TE dispatch + DeepGEMM BF16 | reduce-overhead | 3.425 ms | 14.575 ms |
+| `nvfp4moe` | reduce-overhead | **1.706 ms** | **5.956 ms** |
+
 TE 2.17 accepts at most 64 tensors in one grouped NVFP4 RHT call, so the
 128-expert TE case uses two groups of 64. DeepGEMM BF16 uses M-grouped kernels
 for forward and input gradients and K-grouped kernels for weight gradients.
@@ -110,22 +123,26 @@ expert counts, top-k, dimensions, and routed-row distributions.
 ## 🔁 Fused dgrad2 matrix
 
 Each row includes the FC2 input-gradient GEMM, gated derivative, packed BF16
-gradient output, and saved post-activation output. The table reports the best
-tested CTA tile for each geometry.
+gradient output, and saved post-activation output. CUDA-event results are the
+median isolated kernel time from the final four-tile sweep. NCU duration is
+shown separately for the long-K profiles; values from the two methods are not
+mixed into ratios.
 
-| model geometry | tile | median latency |
-|---|---:|---:|
-| Qwen3-30B-A3B | 256 × 128 | **0.169 ms** |
-| Gemma 4 26B A4B, padded | 256 × 256 | **0.196 ms** |
-| OLMoE-1B-7B | 256 × 256 | **0.208 ms** |
-| Kimi K2.7 EP3 local shard | 256 × 256 | **0.372 ms** |
-| MiniMax M2 | 256 × 256 | **0.356 ms** |
-| DeepSeek V3.2 | 256 × 256 | **0.749 ms** |
-| ReGLU synthetic | 128 × 256 | **0.037 ms** |
+| model geometry | best tile | CUDA-event kernel | NCU duration |
+|---|---:|---:|---:|
+| Qwen3-30B-A3B | 256 × 128 | **0.146 ms** | — |
+| Gemma 4 26B A4B, padded | 256 × 128 | **0.175 ms** | — |
+| OLMoE-1B-7B | 256 × 128 | **0.181 ms** | — |
+| Kimi K2.7 EP3 local shard | 256 × 256 | **0.316 ms** | **0.305 ms** |
+| MiniMax M2 | 256 × 128 | **0.326 ms** | — |
+| DeepSeek V3.2 | 256 × 256 | **0.681 ms** | **0.656 ms** |
+| ReGLU synthetic | 128 × 128 | **0.019 ms** | — |
 
 All rows passed sampled PyTorch activation-backward checks and repeated-launch
-determinism. All four tile combinations were exercised for Qwen, MiniMax, and
-DeepSeek; Kimi, Gemma, OLMoE, and ReGLU used two representative tiles.
+determinism. Every geometry exercised all four combinations of
+`tile_M={128,256}` and `tile_N={128,256}`. The long-K kernels use 128-wide MMA
+K tiles and operand-specific L2 eviction hints; shorter K shapes retain the
+lower-overhead default path.
 
 ## ✅ Release validation
 

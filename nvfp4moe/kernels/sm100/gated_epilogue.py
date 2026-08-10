@@ -131,6 +131,42 @@ def gated_backward_values(
 
 
 @cute.jit
+def swiglu_backward_pair(
+    gates: tuple[Float32, Float32],
+    ups: tuple[Float32, Float32],
+    douts: tuple[Float32, Float32],
+) -> tuple[
+    tuple[Float32, Float32],
+    tuple[Float32, Float32],
+    tuple[Float32, Float32],
+]:
+    """Evaluate two independent SwiGLU derivatives with packed FP32 ALU ops."""
+    sigmoids = (
+        cute.arch.rcp_approx(Float32(1.0) + cute.math.exp(-gates[0], fastmath=True)),
+        cute.arch.rcp_approx(Float32(1.0) + cute.math.exp(-gates[1], fastmath=True)),
+    )
+    activated = cute.arch.mul_packed_f32x2(gates, sigmoids, ftz=False, rnd="rn")
+    one_minus = cute.arch.add_packed_f32x2(
+        (Float32(1.0), Float32(1.0)),
+        (-sigmoids[0], -sigmoids[1]),
+        ftz=False,
+        rnd="rn",
+    )
+    derivative = cute.arch.fma_packed_f32x2(
+        activated,
+        one_minus,
+        sigmoids,
+        ftz=False,
+        rnd="rn",
+    )
+    dout_up = cute.arch.mul_packed_f32x2(douts, ups, ftz=False, rnd="rn")
+    dgate = cute.arch.mul_packed_f32x2(dout_up, derivative, ftz=False, rnd="rn")
+    dup = cute.arch.mul_packed_f32x2(douts, activated, ftz=False, rnd="rn")
+    postact = cute.arch.mul_packed_f32x2(activated, ups, ftz=False, rnd="rn")
+    return dgate, dup, postact
+
+
+@cute.jit
 def quantize_postact_fragment(
     postact: cute.Tensor,
     inv_pts: Float32,
@@ -175,6 +211,7 @@ __all__ = [
     "gated_postact_shape",
     "gated_sf_u32_word_count",
     "quantize_postact_fragment",
+    "swiglu_backward_pair",
     "validate_gated_activation",
     "validate_gated_tile_n",
 ]
