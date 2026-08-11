@@ -2,4 +2,5 @@ include LICENSE
 include README.md
 include BENCHMARKS.md
 include NOTICE
-include examples/train_qwen.py
+recursive-include benchmarks *.py
+recursive-include tests *.py

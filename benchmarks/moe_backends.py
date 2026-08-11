@@ -1,4 +1,4 @@
-"""Expert implementations used by the real-model benchmark.
+"""Expert implementations used by the MoE benchmark.
 
 The DeepGEMM training path follows Megatron-LM's public grouped-GEMM contract:
 M-grouped kernels for forward and dgrad, and K-grouped TN kernels for wgrad.
@@ -63,6 +63,13 @@ def _dactivation(gate: torch.Tensor, up: torch.Tensor, dout: torch.Tensor, kind:
     else:
         raise ValueError(kind)
     return (dy * u * dact).to(torch.bfloat16), (dy * act).to(torch.bfloat16)
+
+
+def _te_autocast(te, recipe):
+    autocast = getattr(te, "autocast", None)
+    if callable(autocast):
+        return autocast(enabled=True, recipe=recipe)
+    return te.fp8_autocast(enabled=True, fp8_recipe=recipe)
 
 
 @dataclass
@@ -211,11 +218,7 @@ class TEExpert(nn.Module):
             x, probs, mask, counts, self.align
         )
         splits = target_counts.tolist()
-        autocast = (
-            self.te.fp8_autocast(enabled=True, fp8_recipe=self.recipe)
-            if self.nvfp4
-            else contextlib.nullcontext()
-        )
+        autocast = _te_autocast(self.te, self.recipe) if self.nvfp4 else contextlib.nullcontext()
         with autocast:
             h = self._grouped(self.gl1, xp, splits)
             hh = _activation(h[:, 0::2], h[:, 1::2], self.activation)
@@ -446,18 +449,10 @@ class TEDeepGEMMFP8FP4Expert(nn.Module):
         ).to(torch.bfloat16)
 
 
-def make_backend(name: str, spec, trace):
-    if name == "nvfp4moe":
-        return Nvfp4MoeExpert(spec, trace)
-    if name == "te_bf16":
-        return TEExpert(spec, trace, nvfp4=False)
-    if name == "te_nvfp4":
-        return TEExpert(spec, trace, nvfp4=True)
-    if name == "te_deepgemm_bf16":
-        return TEDeepGEMMTrainExpert(spec, trace)
-    if name == "te_deepgemm_fp8_fp4":
-        return TEDeepGEMMFP8FP4Expert(spec, trace)
-    raise ValueError(name)
-
-
-__all__ = ["BackendInfo", "make_backend"]
+__all__ = [
+    "BackendInfo",
+    "Nvfp4MoeExpert",
+    "TEDeepGEMMFP8FP4Expert",
+    "TEDeepGEMMTrainExpert",
+    "TEExpert",
+]

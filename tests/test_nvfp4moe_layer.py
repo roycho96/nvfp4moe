@@ -89,6 +89,11 @@ def cosrel(a, b):
     )
 
 
+def padded_offsets(cu):
+    counts = cu[1:] - cu[:-1]
+    return (((counts + 127) // 128) * 128).cumsum(0).to(torch.int32)
+
+
 def check_grouped_wgrad():
     """Compare grouped wgrad with the per-expert GEMM reference."""
     from nvfp4moe.kernels.quantize import nvfp4_quantize_colwise
@@ -402,6 +407,7 @@ def check_delayed_amax():
     x0 = torch.randn(T, d, device="cuda", dtype=torch.bfloat16) * d**-0.5
     dY0 = torch.randn(T, d, device="cuda", dtype=torch.bfloat16)
     gi, cu, ps, slots = route(T, E, k, 3)
+    off_pad = padded_offsets(cu)
     base.calibrate(x0, gi, cu, ps)
 
     def clone_arm(**kw):
@@ -419,7 +425,7 @@ def check_delayed_amax():
             xs = xs.clone().requires_grad_(True)
             m.w1.grad = None
             m.w2.grad = None
-            y = m(xs, gi, cu, ps, slots)
+            y = m(xs, gi, cu, ps, slots, off_pad=off_pad)
             y.backward(dys)
             outs.append((y.detach().clone(), xs.grad.clone(), m.w1.grad.clone(), m.w2.grad.clone()))
         return outs
@@ -540,52 +546,13 @@ def check_dispatch():
         )
 
 
-def check_qwen_adapter():
-    from nvfp4moe import Qwen3Nvfp4Experts
-
-    class GroupedExperts(torch.nn.Module):
-        def __init__(self, E, d, I):
-            super().__init__()
-            self.gate_up_proj = torch.nn.Parameter(
-                torch.randn(E, 2 * I, d, device="cuda", dtype=torch.bfloat16)
-            )
-            self.down_proj = torch.nn.Parameter(
-                torch.randn(E, d, I, device="cuda", dtype=torch.bfloat16)
-            )
-
-    torch.manual_seed(41)
-    T, d, I, E, k = 256, 256, 128, 8, 2
-    source = GroupedExperts(E, d, I)
-    adapter = Qwen3Nvfp4Experts.from_hf(source, T, k)
-    gate, up = source.gate_up_proj.chunk(2, dim=1)
-    copied = (
-        torch.equal(adapter.layer.w1[:, 0::2], gate)
-        and torch.equal(adapter.layer.w1[:, 1::2], up)
-        and torch.equal(adapter.layer.w2, source.down_proj)
-    )
-    check("Qwen adapter copies grouped checkpoint weights", copied)
-
-    x = torch.randn(T, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    logits = torch.randn(T, E, device="cuda", requires_grad=True)
-    topv, topi = torch.topk(torch.softmax(logits, dim=-1), k, dim=-1)
-    topv = topv / topv.sum(dim=-1, keepdim=True)
-    y = adapter(x, topi, topv)
-    y.backward(torch.randn_like(y))
-    grads = (x.grad, logits.grad, adapter.layer.w1.grad, adapter.layer.w2.grad)
-    grad_ok = all(
-        grad is not None and torch.isfinite(grad).all() and grad.abs().max() > 0 for grad in grads
-    )
-    check("Qwen adapter backward reaches router and expert masters", grad_ok)
-
-
 def main():
     if torch.cuda.get_device_capability(0)[0] != 10:
         print("SKIP: requires SM100")
         return 0
-    from nvfp4moe import MoEExpertLayer, moe_finalize, moe_finalize_bwd
+    from nvfp4moe import MoEExpertLayer, NVFP4ExpertCore, moe_finalize, moe_finalize_bwd
 
     check_dispatch()
-    check_qwen_adapter()
     check_grouped_wgrad()
     check_stochastic_rounding()
     check_rht()
@@ -597,6 +564,7 @@ def main():
     layer.refresh_weights()
     x = (torch.randn(T, d, device="cuda", dtype=torch.bfloat16) * d**-0.5).requires_grad_(True)
     gi, cu, ps, slots = route(T, E, k, 0)
+    op_ref = padded_offsets(cu)
     layer.calibrate(x.detach(), gi, cu, ps)
 
     # finalize-bwd kernel oracle (bitwise: same op sequence as torch)
@@ -625,17 +593,17 @@ def main():
     )
 
     # fwd closure + determinism
-    y = layer(x, gi, cu, ps, slots)
+    y = layer(x, gi, cu, ps, slots, off_pad=op_ref)
     y_ref = ref_layer(x.detach(), layer.w1, layer.w2, gi, cu, ps, T, E, k)
     c, r = cosrel(y, y_ref)
     # Each quantized operand contributes to the expected FP4 error band.
     check("fwd closure vs fp32 master ref", c > 0.95, f"cos {c:.5f} rel {r:.4f} (fp4 band)")
-    det = all(torch.equal(y, layer(x, gi, cu, ps, slots)) for _ in range(5))
+    det = all(torch.equal(y, layer(x, gi, cu, ps, slots, off_pad=op_ref)) for _ in range(5))
     check("fwd deterministic 5x", det)
 
     # bwd closure + determinism
     dY = torch.randn(T, d, device="cuda", dtype=torch.bfloat16)
-    y = layer(x, gi, cu, ps, slots)
+    y = layer(x, gi, cu, ps, slots, off_pad=op_ref)
     y.backward(dY)
     gx1, gw1a, gw2a = x.grad.clone(), layer.w1.grad.clone(), layer.w2.grad.clone()
     dXr, dW1r, dW2r = ref_bwd(x.detach(), layer.w1, layer.w2, dY, gi, cu, ps, T, E)
@@ -649,7 +617,7 @@ def main():
     x.grad = None
     layer.w1.grad = None
     layer.w2.grad = None
-    y = layer(x, gi, cu, ps, slots)
+    y = layer(x, gi, cu, ps, slots, off_pad=op_ref)
     y.backward(dY)
     check(
         "bwd deterministic (grads bitwise)",
@@ -664,7 +632,7 @@ def main():
     x.grad = None
     layer.w1.grad = None
     layer.w2.grad = None
-    y = layer(x, gi, cu, ps, slots)
+    y = layer(x, gi, cu, ps, slots, off_pad=op_ref)
     y.backward(dY)
     g1 = (x.grad.clone(), layer.w1.grad.clone(), layer.w2.grad.clone())
     c, _ = cosrel(g1[0], dXr)
@@ -672,7 +640,7 @@ def main():
     x.grad = None
     layer.w1.grad = None
     layer.w2.grad = None
-    y = layer(x, gi, cu, ps, slots)
+    y = layer(x, gi, cu, ps, slots, off_pad=op_ref)
     y.backward(dY)
     check(
         "SR bwd deterministic (fixed seed, grads bitwise)",
@@ -682,76 +650,21 @@ def main():
     )
     layer.sr_seed = None
 
-    # pre-permute FC1 path (coarse-shape config): same quantized row values
-    # through the plain varlen loader must reproduce the gather-fused path -
-    # Compare forward output, gradients, and path determinism.
-    layer_pp = MoEExpertLayer(
-        d,
-        I,
-        E,
-        k,
-        pre_permute=True,
-    ).cuda()
-    with torch.no_grad():
-        layer_pp.w1.copy_(layer.w1)
-        layer_pp.w2.copy_(layer.w2)
-    layer_pp.refresh_weights()
-    layer_pp.calibrate(x.detach(), gi, cu, ps)
-    x.grad = None
-    layer.w1.grad = None
-    layer.w2.grad = None
-    y_g = layer(x, gi, cu, ps, slots)
-    y_g.backward(dY)
-    ref_g = (x.grad.clone(), layer.w1.grad.clone(), layer.w2.grad.clone())
-    x.grad = None
-    y_p = layer_pp(x, gi, cu, ps, slots)
-    y_p.backward(dY)
-    c, r = cosrel(y_p, y_g)
-    check(
-        "pre_permute fwd bitwise vs gather path", torch.equal(y_p, y_g), f"cos {c:.7f} rel {r:.2e}"
-    )
-    gp = (x.grad, layer_pp.w1.grad, layer_pp.w2.grad)
-    okg = all(torch.equal(a, b) for a, b in zip(gp, ref_g))
-    cds = " ".join(
-        f"{n} cos {cosrel(a, b)[0]:.7f}" for n, a, b in zip(("dX", "dW1", "dW2"), gp, ref_g)
-    )
-    check("pre_permute bwd bitwise vs gather path", okg, cds)
-    gp1 = tuple(t.clone() for t in gp)
-    x.grad = None
-    layer_pp.w1.grad = None
-    layer_pp.w2.grad = None
-    y_p2 = layer_pp(x, gi, cu, ps, slots)
-    y_p2.backward(dY)
-    check(
-        "pre_permute deterministic (y + grads bitwise)",
-        torch.equal(y_p2, y_p)
-        and torch.equal(x.grad, gp1[0])
-        and torch.equal(layer_pp.w1.grad, gp1[1])
-        and torch.equal(layer_pp.w2.grad, gp1[2]),
-    )
-
-    # off_pad argument (the dispatch-emitted padded wgrad offsets) vs the
-    # in-layer torch fallback: y and all grads bitwise
-    seg = cu[1:] - cu[:-1]
-    op_ref = (((seg + 127) // 128) * 128).cumsum(0).to(torch.int32)
+    # Routed training requires the dispatch-emitted padded wgrad offsets.
     x.grad = None
     layer.w1.grad = None
     layer.w2.grad = None
     y_fg = layer(x, gi, cu, ps, slots, off_pad=op_ref)
     y_fg.backward(dY)
-    gfg = (x.grad.clone(), layer.w1.grad.clone(), layer.w2.grad.clone())
     x.grad = None
     layer.w1.grad = None
     layer.w2.grad = None
-    y_fg2 = layer(x, gi, cu, ps, slots)  # off_pad=None -> torch fallback
-    y_fg2.backward(dY)
-    check(
-        "off_pad arg vs torch fallback (y + grads bitwise)",
-        torch.equal(y_fg2, y_fg)
-        and torch.equal(x.grad, gfg[0])
-        and torch.equal(layer.w1.grad, gfg[1])
-        and torch.equal(layer.w2.grad, gfg[2]),
-    )
+    try:
+        layer(x, gi, cu, ps, slots, off_pad=None)
+        rejected_missing_offsets = False
+    except ValueError:
+        rejected_missing_offsets = True
+    check("missing off_pad is rejected", rejected_missing_offsets)
 
     # Reuse buffers grown by the large routed batch with a smaller batch.
     T_small = 257
@@ -759,10 +672,11 @@ def main():
         torch.randn(T_small, d, device="cuda", dtype=torch.bfloat16) * d**-0.5
     ).requires_grad_(True)
     gi_s, cu_s, ps_s, slots_s = route(T_small, E, k, 17)
+    off_s = padded_offsets(cu_s)
     dy_s = torch.randn(T_small, d, device="cuda", dtype=torch.bfloat16)
     layer.w1.grad = None
     layer.w2.grad = None
-    y_s = layer(x_small, gi_s, cu_s, ps_s, slots_s)
+    y_s = layer(x_small, gi_s, cu_s, ps_s, slots_s, off_pad=off_s)
     y_s.backward(dy_s)
     small_grads = (x_small.grad, layer.w1.grad, layer.w2.grad)
     check(
@@ -770,6 +684,41 @@ def main():
         y_s.shape == (T_small, d)
         and torch.isfinite(y_s).all()
         and all(g is not None and torch.isfinite(g).all() for g in small_grads),
+    )
+
+    # Framework adapters enter after routing, with separate gate/up masters.
+    T_core, k_core = 257, 2
+    x_core_base = torch.randn(T_core, d, device="cuda", dtype=torch.bfloat16) * d**-0.5
+    gi_c, cu_c, _, _ = route(T_core, E, k_core, 23)
+    x_core = x_core_base[gi_c.long()].contiguous().requires_grad_(True)
+    w_gate = layer.w1[:, 0::2].detach().clone().requires_grad_(True)
+    w_up = layer.w1[:, 1::2].detach().clone().requires_grad_(True)
+    w_down = layer.w2.detach().clone().requires_grad_(True)
+    seg_c = cu_c[1:] - cu_c[:-1]
+    off_c = (((seg_c + 127) // 128) * 128).cumsum(0).to(torch.int32)
+    core = NVFP4ExpertCore(d, I, E).cuda()
+    core.refresh_weights(w_gate, w_up, w_down)
+    core.calibrate(x_core.detach(), cu_c, off_pad=off_c)
+    y_core = core(x_core, w_gate, w_up, w_down, cu_c, off_pad=off_c)
+    y_core_ref = torch.empty_like(y_core, dtype=torch.float32)
+    cu_l = cu_c.tolist()
+    for expert in range(E):
+        lo, hi = cu_l[expert], cu_l[expert + 1]
+        if lo == hi:
+            continue
+        h = (
+            x_core[lo:hi].float()
+            @ torch.stack((w_gate[expert].float(), w_up[expert].float()), dim=1).reshape(2 * I, d).T
+        )
+        hh = torch.nn.functional.silu(h[:, 0::2]) * h[:, 1::2]
+        y_core_ref[lo:hi] = hh @ w_down[expert].float().T
+    c, r = cosrel(y_core, y_core_ref)
+    check("routed expert core fwd closure", c > 0.95, f"cos {c:.5f} rel {r:.4f}")
+    y_core.backward(torch.randn_like(y_core))
+    routed_grads = (x_core.grad, w_gate.grad, w_up.grad, w_down.grad)
+    check(
+        "routed expert core backward gradients",
+        all(grad is not None and torch.isfinite(grad).all() for grad in routed_grads),
     )
 
     print(f"\n{'ALL PASS' if not FAILURES else f'{len(FAILURES)} FAILURES: {FAILURES}'}")

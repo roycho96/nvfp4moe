@@ -1,103 +1,112 @@
 # nvfp4moe
 
 Training-capable NVFP4 Mixture-of-Experts kernels for NVIDIA Blackwell B200
-(`sm100`). The package implements dispatch, fused gated FC1, FC2,
-deterministic combine, input gradients, weight gradients, and router gradients.
+(`sm100`). The package covers grouped GEMM, fused gated epilogues, dispatch,
+combine, input gradients, weight gradients, and router gradients.
 
-This is an alpha release for single-GPU kernel research and model integration.
+This is an alpha release for single-GPU kernel work and expert-parallel
+integration. Communication and routing policy stay with the host framework.
 
-## ⚡ Highlights
+## ⚡ What is included
 
-- Native CuTe DSL kernels for routed NVFP4 expert computation
-- Fused SwiGLU and GeGLU FC1 with NVFP4 output quantization
-- Fused FC2 input gradient and gated-activation backward
-- Grouped NVFP4 weight gradients with optional accumulation
-- Direct gather-and-quantize input path; no BF16 expert buffer is required
-- Hugging Face adapter and real-model training example for Qwen3 MoE
+- Native CuTe DSL grouped NVFP4 GEMM for forward and input gradients
+- Fused SwiGLU, GeGLU, and quantized FC1 epilogues
+- Grouped NVFP4 weight-gradient kernel
+- Full training expert layer with deterministic dispatch/combine
+- Parameter-free expert core for framework-owned BF16 master weights
+- `torch.compile`-visible custom op for prepacked grouped GEMM
+- Small adapters for Transformer Engine and TorchTitan expert boundaries
 
-Fresh B200 measurements, precision checks, model shapes, and reproduction
-commands are in [BENCHMARKS.md](BENCHMARKS.md).
-
-The release benchmark uses one 8,192-token FineWeb-Edu sequence with real
-Qwen3-30B-A3B layer-0 weights, activations, and routing. Times are same-session
-CUDA-event medians on one B200; JIT compilation is excluded.
-
-| expert backend | precision | forward | forward + backward |
-|---|---:|---:|---:|
-| Transformer Engine | BF16 | 5.256 ms | 16.488 ms |
-| Transformer Engine 2 × 64 | NVFP4 | 12.900 ms | 33.306 ms |
-| TE dispatch + DeepGEMM | BF16 | 2.244 ms | 11.536 ms |
-| TE dispatch + DeepGEMM | FP8 × FP4 | 4.549 ms | — |
-| `nvfp4moe` | NVFP4 × NVFP4 | **0.735 ms** | **3.328 ms** |
-
-Against BF16 PyTorch, the Qwen layer output measured 0.996526 cosine
-similarity and 0.08444 relative L2 error. The input, router, gate/up-weight,
-and down-weight gradients measured cosine similarities of 0.975384, 0.992358,
-0.968857, and 0.986734. These are one-layer checks, not a convergence claim.
+Current B200 results, model shapes, precision checks, and exact commands are in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ## 🚀 Install
 
-Tested configuration:
-
-- NVIDIA B200 (`sm100`)
-- Linux and Python 3.12
-- CUDA 13
-- PyTorch 2.11 or newer
-- NVIDIA CUTLASS DSL 4.6.x
-
-The reference container is `nvcr.io/nvidia/pytorch:26.07-py3`.
+Tested with NVIDIA B200, Python 3.12, CUDA 13, PyTorch 2.11 or newer, and
+CUTLASS DSL 4.6.x. The reference image is
+`nvcr.io/nvidia/pytorch:26.07-py3`.
 
 ```bash
 python -m pip install .
 
-# Tests and benchmark dependencies
+# Development and benchmark tools
 python -m pip install '.[test,benchmark]'
 ```
 
-## 🔧 Use
+The first call compiles kernels for the selected geometry. Keep the JIT cache
+between runs.
 
-`MoEExpertLayer` accepts expert-major routing metadata from `MoEDispatch`.
-Weights are kept in BF16 for optimization and refreshed into resident NVFP4
-buffers after an optimizer step.
+## 🔧 Framework-owned experts
+
+`NVFP4ExpertCore` starts after token permutation. Inputs are contiguous
+expert-major rows; `w1` and `w3` are `[E, I, D]`, and `w2` is `[E, D, I]`.
+The caller retains ownership of parameters, checkpoints, optimizer state, and
+expert-parallel communication.
+
+```python
+import torch
+from nvfp4moe import NVFP4ExpertCore
+
+core = NVFP4ExpertCore(D, I, E, activation="swiglu").cuda()
+
+counts = num_tokens_per_local_expert.to(torch.int32)
+cu = torch.cat((counts.new_zeros(1), counts.cumsum(0, dtype=torch.int32)))
+off_pad = (((counts + 127) // 128) * 128).cumsum(0, dtype=torch.int32)
+
+core.refresh_weights(w1, w3, w2)
+core.calibrate(expert_input, cu, off_pad)
+output = core(expert_input, w1, w3, w2, cu, off_pad)
+```
+
+The core notices in-place optimizer updates and refreshes its resident NVFP4
+weights on the next call. Calling `refresh_weights()` immediately after
+`optimizer.step()` keeps that work outside the following forward measurement.
+`off_pad` is required; there is no backward-time Torch fallback.
+
+## 🧱 Complete routed layer
+
+Use `MoEDispatch` when the package also owns permutation and combine.
 
 ```python
 from nvfp4moe import MoEDispatch, MoEExpertLayer
 
 dispatch = MoEDispatch(T=8192, E=128, k=8)
-experts = MoEExpertLayer(
-    d=2048,
-    I=768,
-    E=128,
-    topk=8,
-    activation="swiglu",
-).cuda()
-
+experts = MoEExpertLayer(d=2048, I=768, E=128, topk=8).cuda()
 experts.refresh_weights()
+
+gather, cu, probs, slots = dispatch(topk_index, topk_weight)
+experts.calibrate(x, gather, cu, probs, off_pad=dispatch.off_pad)
+probs = dispatch.differentiable_probs(topk_weight)
+y = experts(x, gather, cu, probs, slots, off_pad=dispatch.off_pad)
 ```
 
-The short training example loads Qwen3-30B-A3B, replaces one real MoE expert
-group, streams a FineWeb-Edu batch, and runs optimizer steps on the model's
-causal-language-modeling loss. The rest of the model is frozen.
+Call `experts.refresh_weights()` after each optimizer step. The router remains
+BF16 and receives gradients through `differentiable_probs()`.
 
-```bash
-python examples/train_qwen.py --tokens 256 --steps 2
-python examples/train_qwen.py --tokens 8192 --steps 1
-```
+## 🧩 Standalone GEMM and `torch.compile`
 
-The adapter preserves the model's BF16 router and differentiable top-k routing
-weights. Call `refresh_weights()` after every optimizer step.
-
-### Kernel API
-
-The grouped GEMM can be used without the expert-layer wrapper. Epilogues are
-compile-time policies, so selecting one does not add a separate launch.
+The functional op accepts packed E2M1 operands and E4M3 scale factors. It
+allocates the output, keeps the kernel opaque to Dynamo, and supports a dynamic
+total routed-row count.
 
 ```python
 import torch
+from nvfp4moe import grouped_nvfp4_gemm
+
+compiled_gemm = torch.compile(grouped_nvfp4_gemm)
+y = compiled_gemm(qa, qb, sfa, sfb, cu, alpha)
+```
+
+Packed operands are deliberately non-differentiable. Use `NVFP4ExpertCore` or
+`MoEExpertLayer` for training.
+
+For launch control or custom epilogues, use the lower-level classes directly:
+
+```python
 from nvfp4moe import GatedEpilogue, GroupedNvfp4Gemm
 
 gemm = GroupedNvfp4Gemm(
-    experts=128,
+    experts=8,
     n=1536,
     k=2048,
     tile_m=256,
@@ -107,47 +116,77 @@ gemm = GroupedNvfp4Gemm(
 )
 ```
 
-`GroupedNvfp4Gemm` without an epilogue is the plain grouped GEMM. CuTe DSL
-fragment helpers such as `gated_postact_fragment`, `gated_backward_values`,
-and `quantize_postact_fragment` are exported from `nvfp4moe.kernels` for use in
-custom kernels.
+`nvfp4moe.kernels` also exports the quantizers, grouped wgrad, gated fragment
+helpers, scheduler kernel, and finalize kernels independently.
 
-### Transformer Engine integration
+## 🔌 Transformer Engine
 
-Use `nvfp4moe` at the complete expert boundary. Keep Transformer Engine for
-attention, normalization, dense layers, and FP8 state, while replacing expert
-permutation, FC1/activation, FC2, and unpermutation together. Replacing only a
-single GEMM leaves intermediate buffers and launches in the critical path.
+`TEExpertAdapter` follows the common `forward(inp, m_splits,
+is_first_microbatch=None)` convention without importing or patching
+Transformer Engine. TE can continue to own attention, normalization, dense
+layers, and token transport.
 
-## 🧩 Layout
+```python
+from nvfp4moe import NVFP4ExpertCore, TEExpertAdapter
+
+core = NVFP4ExpertCore(D, I, E).cuda()
+experts = TEExpertAdapter(core, w1, w3, w2)
+y = experts(expert_input, num_tokens_per_local_expert, is_first_microbatch=True)
+```
+
+Pass `is_first_microbatch=True` after an optimizer update to refresh the
+resident weights before the first microbatch.
+
+## 🔌 TorchTitan
+
+The converter keeps `GroupedExperts` parameters and DTensor local shards in
+place and changes only expert computation.
+
+```python
+from nvfp4moe import TorchTitanExpertsConfig
+
+config = TorchTitanExpertsConfig(fqns=["layers.*.experts"])
+converter = config.build(parallel_dims=parallel_dims)
+converter.convert(model)
+
+# after optimizer.step()
+converter.post_optimizer_hook(model)
+```
+
+Conversion is lazy, so meta-device model construction and sharding can finish
+before the native core is created.
+
+## 📁 Layout
 
 ```text
 nvfp4moe/
-├── hf.py                         Hugging Face adapter
-├── layer.py                      training expert layer
-├── reference.py                  readable PyTorch format reference
+├── layer.py          full expert layer and framework-owned core
+├── ops.py            PyTorch custom operators
+├── te.py             Transformer Engine calling adapter
+├── torchtitan.py     TorchTitan GroupedExperts converter
+├── recipe.py         tensor-scale state
+├── reference.py      readable format reference
 └── kernels/
-    ├── dispatch.py               expert-major routing
-    ├── epilogue.py               reusable gated and quantized epilogues
-    ├── finalize.py               deterministic combine and gather
-    ├── gemm.py                   public validation, JIT, and launch API
-    ├── gemm_kernel.py            persistent SM100 grouped GEMM
-    ├── quantize.py               NVFP4 quantization and RHT
-    ├── scheduler.py              shared persistent tile scheduler
-    └── wgrad/                    weight-gradient kernel implementation
+    ├── gemm.py       validation, JIT cache, and launch API
+    ├── gemm_kernel.py
+    ├── epilogue.py
+    ├── scheduler.py
+    ├── quantize.py
+    ├── dispatch.py
+    ├── finalize.py
+    └── wgrad/
 ```
 
-## ⚠️ Scope
+## ⚠️ Limits
 
-- Single GPU; expert/data/tensor parallel communication is not included.
-- `d` must be divisible by 256 and `I` by 128.
-- At most 256 local experts and 131,072 routed rows are supported.
-- Larger global expert counts require an external expert-parallel shard.
-- Router computation remains BF16.
-- The first call compiles shape-specialized kernels.
-- Precision results are one-layer checks, not a convergence claim.
+- B200 `sm100` only for the native kernels
+- `D` divisible by 256 and `I` divisible by 128
+- At most 256 local experts and 131,072 routed rows
+- Global expert counts above 256 require external expert parallelism
+- Single-GPU kernels; no all-to-all or distributed router is included
+- Precision tables are layer checks, not a convergence claim
 
 ## 📄 License
 
-Apache-2.0. NVIDIA-derived grouped GEMM files retain their upstream copyright,
+Apache-2.0. NVIDIA-derived kernel files retain their upstream copyright,
 license, and modification notices. See `LICENSE` and `NOTICE`.
