@@ -146,9 +146,11 @@ lower-overhead default path.
 
 ## ✅ Release validation
 
-- 42 local pytest checks
+- 44 local pytest checks
 - Ruff lint and format checks
 - B200 forward/backward layer suite
+- Same-session package-refactor A/B: Qwen GEMMs were 0.9–2.5% faster and
+  fused dgrad2 was 1.6% faster than the preceding commit
 - B200 scheduler edges with one through four tiles and empty experts
 - TE row/column NVFP4 data and scale factors bitwise equal
 - Qwen adapter gradients reach router and BF16 expert masters

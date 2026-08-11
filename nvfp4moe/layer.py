@@ -3,8 +3,9 @@
 import torch
 from torch import nn
 
+from .kernels.epilogue import GatedBackwardEpilogue, GatedEpilogue
 from .kernels.finalize import moe_finalize, moe_finalize_bwd
-from .kernels.grouped_gemm_runtime import GroupedNvfp4Gemm
+from .kernels.gemm import GroupedNvfp4Gemm
 from .kernels.quantize import (
     nvfp4_quantize_colwise,
     nvfp4_quantize_rowwise,
@@ -502,6 +503,11 @@ class MoEExpertLayer(nn.Module):
         )
         runtime = self._native_gemms.get(key)
         if runtime is None:
+            epilogue = None
+            if activation is not None:
+                epilogue = GatedEpilogue(activation)
+            elif dactivation is not None:
+                epilogue = GatedBackwardEpilogue(dactivation)
             runtime = GroupedNvfp4Gemm(
                 self.E,
                 n,
@@ -509,8 +515,7 @@ class MoEExpertLayer(nn.Module):
                 config["tile_M"],
                 config["tile_N"],
                 output_dtype=output_dtype,
-                activation=activation,
-                dactivation=dactivation,
+                epilogue=epilogue,
             )
             self._native_gemms[key] = runtime
         return runtime

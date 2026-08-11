@@ -1,12 +1,29 @@
 import pytest
 
-from nvfp4moe.kernels.sm100.gated_epilogue import (
+from nvfp4moe.kernels.epilogue import (
+    GatedBackwardEpilogue,
+    GatedEpilogue,
     gated_output_n,
     gated_postact_fragment,
     gated_sf_u32_word_count,
+    resolve_gemm_epilogue,
     validate_gated_activation,
     validate_gated_tile_n,
 )
+
+
+def test_epilogue_policies_validate_activation():
+    assert GatedEpilogue("swiglu").activation == "swiglu"
+    assert GatedBackwardEpilogue("geglu").activation == "geglu"
+    with pytest.raises(ValueError, match="activation must be one of"):
+        GatedEpilogue("gelu")
+
+
+def test_epilogue_policy_resolves_compile_mode():
+    assert resolve_gemm_epilogue(GatedEpilogue("geglu"), None, None) == ("geglu", None)
+    assert resolve_gemm_epilogue(GatedBackwardEpilogue("reglu"), None, None) == (None, "reglu")
+    with pytest.raises(ValueError, match="cannot be combined"):
+        resolve_gemm_epilogue(GatedEpilogue(), "swiglu", None)
 
 
 @pytest.mark.parametrize(("accumulator_n", "output_n"), [(2, 1), (256, 128), (1536, 768)])

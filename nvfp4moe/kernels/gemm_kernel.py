@@ -42,8 +42,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from .quantize import _cvt_e2m1_pair_rn
-from .sm100.gated_epilogue import (
+from .epilogue import (
     gated_backward_values,
     gated_postact_fragment,
     gated_sf_u32_word_count,
@@ -51,7 +50,8 @@ from .sm100.gated_epilogue import (
     swiglu_backward_pair,
     validate_gated_activation,
 )
-from .wgrad.moe_persistent_scheduler import (
+from .quantize import _cvt_e2m1_pair_rn
+from .scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
     MoEWorkTileInfo,
@@ -2840,3 +2840,8 @@ class Sm100GroupedBlockScaledGemmKernel:
     reserved_smem_bytes = 1024
     # size of smem used for tensor memory management
     tensor_memory_management_bytes = 12
+
+
+GroupedGemmKernel = Sm100GroupedBlockScaledGemmKernel
+
+__all__ = ["GroupedGemmKernel"]

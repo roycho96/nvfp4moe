@@ -4,12 +4,13 @@
 """Fused gated activation and NVFP4 output helpers for SM100."""
 
 import math
+from dataclasses import dataclass
 
 import cutlass
 from cutlass import Boolean, Float32, const_expr, cute
 from cutlass._mlir.dialects import arith
 
-from ..quantize import F4_MAX, _cvt_e4m3_rn
+from .quantize import F4_MAX, _cvt_e4m3_rn
 
 _ACTIVATIONS = ("swiglu", "geglu", "reglu")
 FLT_MAX = 3.4028234663852886e38
@@ -34,6 +35,42 @@ def validate_gated_activation(activation: str) -> str:
         choices = ", ".join(_ACTIVATIONS)
         raise ValueError(f"activation must be one of: {choices}")
     return activation
+
+
+@dataclass(frozen=True, slots=True)
+class GatedEpilogue:
+    """Forward gated activation selected at GEMM compile time."""
+
+    activation: str = "swiglu"
+
+    def __post_init__(self):
+        object.__setattr__(self, "activation", validate_gated_activation(self.activation))
+
+
+@dataclass(frozen=True, slots=True)
+class GatedBackwardEpilogue:
+    """Fused gated derivative selected at GEMM compile time."""
+
+    activation: str = "swiglu"
+
+    def __post_init__(self):
+        object.__setattr__(self, "activation", validate_gated_activation(self.activation))
+
+
+def resolve_gemm_epilogue(
+    epilogue: GatedEpilogue | GatedBackwardEpilogue | None,
+    activation: str | None,
+    dactivation: str | None,
+) -> tuple[str | None, str | None]:
+    if epilogue is not None and (activation is not None or dactivation is not None):
+        raise ValueError("epilogue cannot be combined with activation or dactivation")
+    if isinstance(epilogue, GatedEpilogue):
+        return epilogue.activation, None
+    if isinstance(epilogue, GatedBackwardEpilogue):
+        return None, epilogue.activation
+    if epilogue is not None:
+        raise TypeError("epilogue must be GatedEpilogue or GatedBackwardEpilogue")
+    return activation, dactivation
 
 
 def gated_sf_u32_word_count(
@@ -205,12 +242,15 @@ def quantize_postact_fragment(
 
 
 __all__ = [
+    "GatedBackwardEpilogue",
+    "GatedEpilogue",
     "gated_backward_values",
     "gated_output_n",
     "gated_postact_fragment",
     "gated_postact_shape",
     "gated_sf_u32_word_count",
     "quantize_postact_fragment",
+    "resolve_gemm_epilogue",
     "swiglu_backward_pair",
     "validate_gated_activation",
     "validate_gated_tile_n",

@@ -3,14 +3,14 @@
 import torch
 
 from .._common import jit_cache
-from .moe_blockscaled_grouped_gemm_wgrad import (
+from .kernel import (
     BlockScaledMoEGroupedGemmWgradKernel,
 )
-from .moe_utils import MoEWeightMode, WGradInputOrder
+from .utils import MoEWeightMode, WGradInputOrder
 
 
 def _kernel_and_ws(m, n, E, mma_m, mma_n, accumulate=False):
-    from .moe_utils import WgradSfTensormapConstructor
+    from .utils import WgradSfTensormapConstructor
 
     kernel = BlockScaledMoEGroupedGemmWgradKernel(
         sf_vec_size=16,

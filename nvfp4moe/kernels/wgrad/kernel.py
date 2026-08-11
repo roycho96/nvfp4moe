@@ -17,9 +17,8 @@ Supports:
     - NVFP4 global_scale support
     - k_tile_cnt == 0 handling (zero output for empty experts)
 
-This module contains only the kernel class.
-Scheduler: moe_persistent_scheduler.py (CLC mode, scenario="2Dx2D")
-Extension: moe_sched_extension.py (WgradDense / WgradDiscrete)
+This module contains only the kernel class. Shared tile scheduling lives in
+``kernels.scheduler`` and weight-gradient tensor mapping in ``extensions``.
 """
 
 from importlib.metadata import PackageNotFoundError, version
@@ -37,18 +36,18 @@ from cutlass.utils.gemm.sm100 import (
     transform_partitioned_tensor_layout,
 )
 
-from .moe_kernel_helpers import (
-    compute_stages_wgrad,
-)
-from .moe_persistent_scheduler import (
+from ..scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
     MoEWorkTileInfo,
 )
-from .moe_sched_extension import (
+from .extensions import (
     WgradScaledGemmSchedExtension,
 )
-from .moe_utils import (
+from .helpers import (
+    compute_stages_wgrad,
+)
+from .utils import (
     MoEWeightMode,
     WGradInputOrder,
     WgradSfTensormapConstructor,
@@ -667,7 +666,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         Launched with grid=(expert_cnt, 1, 1).
         Each block builds TMA descriptors for one expert.
         """
-        from .moe_utils import WgradSfTensormapConstructor
+        from .utils import WgradSfTensormapConstructor
 
         # Rubin requires C's TMA operation and static layout to be built in
         # the helper-kernel IR context. Blackwell receives host-built values
@@ -927,7 +926,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         )
 
         # Build extension
-        from .moe_utils import TensormapWorkspace, WgradSfTensormapConstructor
+        from .utils import TensormapWorkspace, WgradSfTensormapConstructor
 
         slot_names = WgradSfTensormapConstructor.slot_names(self.input_order, self.weight_mode)
         desc_workspace = TensormapWorkspace(workspace_ptr, slot_names)

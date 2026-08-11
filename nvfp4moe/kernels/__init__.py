@@ -3,27 +3,45 @@
 from importlib import import_module
 
 __all__ = [
+    "GatedBackwardEpilogue",
+    "GatedEpilogue",
+    "GroupedGemmKernel",
+    "GroupedNvfp4Gemm",
     "GroupedWgrad",
     "MoEDispatch",
+    "gated_backward_values",
+    "gated_postact_fragment",
+    "grouped_nvfp4_gemm",
     "moe_dispatch",
     "moe_finalize",
     "moe_finalize_bwd",
     "nvfp4_quantize_colwise",
     "nvfp4_quantize_rowwise",
     "nvfp4_rht_amax",
+    "quantize_postact_fragment",
     "rht_matrix",
+    "swiglu_backward_pair",
 ]
 
 _EXPORTS = {
+    "GatedBackwardEpilogue": (".epilogue", "GatedBackwardEpilogue"),
+    "GatedEpilogue": (".epilogue", "GatedEpilogue"),
+    "GroupedGemmKernel": (".gemm_kernel", "GroupedGemmKernel"),
+    "GroupedNvfp4Gemm": (".gemm", "GroupedNvfp4Gemm"),
     "GroupedWgrad": (".wgrad", "GroupedWgrad"),
     "MoEDispatch": (".dispatch", "MoEDispatch"),
+    "gated_backward_values": (".epilogue", "gated_backward_values"),
+    "gated_postact_fragment": (".epilogue", "gated_postact_fragment"),
+    "grouped_nvfp4_gemm": (".gemm", "grouped_nvfp4_gemm"),
     "moe_dispatch": (".dispatch", "moe_dispatch"),
     "moe_finalize": (".finalize", "moe_finalize"),
     "moe_finalize_bwd": (".finalize", "moe_finalize_bwd"),
     "nvfp4_quantize_colwise": (".quantize", "nvfp4_quantize_colwise"),
     "nvfp4_quantize_rowwise": (".quantize", "nvfp4_quantize_rowwise"),
     "nvfp4_rht_amax": (".quantize", "nvfp4_rht_amax"),
+    "quantize_postact_fragment": (".epilogue", "quantize_postact_fragment"),
     "rht_matrix": (".quantize", "rht_matrix"),
+    "swiglu_backward_pair": (".epilogue", "swiglu_backward_pair"),
 }
 
 

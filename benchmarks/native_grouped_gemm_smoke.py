@@ -6,7 +6,8 @@ import statistics
 import torch
 
 import nvfp4moe.reference as ref
-from nvfp4moe.kernels.grouped_gemm_runtime import grouped_nvfp4_gemm
+from nvfp4moe.kernels.epilogue import GatedBackwardEpilogue
+from nvfp4moe.kernels.gemm import grouped_nvfp4_gemm
 from nvfp4moe.kernels.quantize import nvfp4_quantize_rowwise
 from nvfp4moe.layer import _quant_expert_stack
 from nvfp4moe.recipe import _DEN
@@ -238,7 +239,7 @@ def run_dgrad2_case(
         tile_m,
         tile_n,
         output_dtype=torch.int32,
-        dactivation=activation,
+        epilogue=GatedBackwardEpilogue(activation),
     )
 
     def native_call():

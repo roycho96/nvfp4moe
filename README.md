@@ -87,6 +87,31 @@ python examples/train_qwen.py --tokens 8192 --steps 1
 The adapter preserves the model's BF16 router and differentiable top-k routing
 weights. Call `refresh_weights()` after every optimizer step.
 
+### Kernel API
+
+The grouped GEMM can be used without the expert-layer wrapper. Epilogues are
+compile-time policies, so selecting one does not add a separate launch.
+
+```python
+import torch
+from nvfp4moe import GatedEpilogue, GroupedNvfp4Gemm
+
+gemm = GroupedNvfp4Gemm(
+    experts=128,
+    n=1536,
+    k=2048,
+    tile_m=256,
+    tile_n=128,
+    output_dtype=torch.float4_e2m1fn_x2,
+    epilogue=GatedEpilogue("swiglu"),
+)
+```
+
+`GroupedNvfp4Gemm` without an epilogue is the plain grouped GEMM. CuTe DSL
+fragment helpers such as `gated_postact_fragment`, `gated_backward_values`,
+and `quantize_postact_fragment` are exported from `nvfp4moe.kernels` for use in
+custom kernels.
+
 ### Transformer Engine integration
 
 Use `nvfp4moe` at the complete expert boundary. Keep Transformer Engine for
@@ -103,12 +128,13 @@ nvfp4moe/
 ├── reference.py                  readable PyTorch format reference
 └── kernels/
     ├── dispatch.py               expert-major routing
+    ├── epilogue.py               reusable gated and quantized epilogues
     ├── finalize.py               deterministic combine and gather
-    ├── grouped_gemm.py           persistent SM100 grouped GEMM
-    ├── grouped_gemm_runtime.py   validation, JIT, and launch
+    ├── gemm.py                   public validation, JIT, and launch API
+    ├── gemm_kernel.py            persistent SM100 grouped GEMM
     ├── quantize.py               NVFP4 quantization and RHT
-    ├── sm100/                    fused activation and epilogue helpers
-    └── wgrad/                    grouped weight-gradient kernel
+    ├── scheduler.py              shared persistent tile scheduler
+    └── wgrad/                    weight-gradient kernel implementation
 ```
 
 ## ⚠️ Scope

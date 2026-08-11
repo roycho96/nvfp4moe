@@ -10,7 +10,8 @@ from cutlass import Float32, Int32, cute
 from cutlass.cute.runtime import from_dlpack
 
 from ._common import fake_tensor, torch2cute_dtype_map
-from .grouped_gemm import Sm100GroupedBlockScaledGemmKernel
+from .epilogue import GatedBackwardEpilogue, GatedEpilogue, resolve_gemm_epilogue
+from .gemm_kernel import GroupedGemmKernel
 
 
 def _seed_tensor(dtype, mode0: int, mode1: int):
@@ -78,7 +79,7 @@ def _compile_grouped(
         output_scale_fake = fake_tensor(Float32, (2,), 1)
 
         cluster = (2, 1) if tile_m == 256 else (1, 1)
-        kernel = Sm100GroupedBlockScaledGemmKernel(
+        kernel = GroupedGemmKernel(
             16,
             (tile_m, tile_n),
             cluster,
@@ -122,7 +123,14 @@ class GroupedNvfp4Gemm:
         output_dtype: torch.dtype = torch.bfloat16,
         activation: str | None = None,
         dactivation: str | None = None,
+        epilogue: GatedEpilogue | GatedBackwardEpilogue | None = None,
     ):
+        activation, dactivation = resolve_gemm_epilogue(epilogue, activation, dactivation)
+        if epilogue is None:
+            if activation is not None:
+                epilogue = GatedEpilogue(activation)
+            elif dactivation is not None:
+                epilogue = GatedBackwardEpilogue(dactivation)
         if experts <= 0 or n <= 0 or k <= 0:
             raise ValueError("experts, N, and K must be positive")
         if experts > 256:
@@ -162,6 +170,7 @@ class GroupedNvfp4Gemm:
         self.output_dtype = output_dtype
         self.activation = activation
         self.dactivation = dactivation
+        self.epilogue = epilogue
         self.output_n = n
         if activation is not None:
             self.output_n = n // 2
@@ -375,6 +384,7 @@ def grouped_nvfp4_gemm(
     output_dtype: torch.dtype = torch.bfloat16,
     activation: str | None = None,
     dactivation: str | None = None,
+    epilogue: GatedEpilogue | GatedBackwardEpilogue | None = None,
 ):
     return GroupedNvfp4Gemm(
         experts,
@@ -385,6 +395,7 @@ def grouped_nvfp4_gemm(
         output_dtype,
         activation,
         dactivation,
+        epilogue,
     )
 
 

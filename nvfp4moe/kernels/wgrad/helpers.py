@@ -24,7 +24,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import AddressSpace, BFloat16, Float32, Int32
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from .moe_persistent_scheduler import MoESchedulerParams
+from ..scheduler import MoESchedulerParams
 
 # ---------------------------------------------------------------------------
 # Constants

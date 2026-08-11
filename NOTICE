@@ -16,7 +16,7 @@ Upstream: https://github.com/NVIDIA/cudnn-frontend
 NVIDIA grouped forward GEMM
 ---------------------------
 
-nvfp4moe/kernels/grouped_gemm.py derives from NVIDIA CUTLASS's Blackwell
+nvfp4moe/kernels/gemm_kernel.py derives from NVIDIA CUTLASS's Blackwell
 grouped block-scaled CuTe DSL example. The file retains NVIDIA's BSD-3-Clause
 copyright notice and license text.
 

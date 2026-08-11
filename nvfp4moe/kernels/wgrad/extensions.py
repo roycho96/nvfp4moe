@@ -46,8 +46,8 @@ from cutlass.cute.typing import Pointer
 from cutlass.cutlass_dsl import extract_mlir_values, new_from_mlir_values
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
-from .moe_persistent_scheduler import MoEWorkTileInfo
-from .moe_utils import (
+from ..scheduler import MoEWorkTileInfo
+from .utils import (
     MoEWeightMode,
     OnlineTensormapDescCreator,
     WGradInputOrder,
