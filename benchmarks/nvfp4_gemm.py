@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.metadata
 import importlib.util
 import json
 import random
@@ -55,6 +56,8 @@ BACKEND_NAMES = (
 DENSE_BACKEND_NAMES = ("native", "native_grouped", "cublaslt")
 DIRECTIONS = ("fwd", "dgrad", "wgrad")
 MODES = ("prepacked", "dynamic")
+B200_DENSE_FP4_PEAK_TFLOPS = 9_000.0
+B200_PEAK_SOURCE = "NVIDIA DGX B200: 72 dense FP4 PFLOP/s per 8-GPU system"
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,73 @@ class DenseCase:
     @property
     def flops(self) -> int:
         return 2 * self.m * self.n * self.k
+
+
+def _runtime_metadata(peak_override: float | None) -> dict[str, object]:
+    import torch
+
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    device_name = properties.name
+    if peak_override is not None:
+        peak_tflops = peak_override
+        peak_source = "--theoretical-peak-tflops override"
+    elif "B200" in device_name.upper():
+        peak_tflops = B200_DENSE_FP4_PEAK_TFLOPS
+        peak_source = B200_PEAK_SOURCE
+    else:
+        peak_tflops = None
+        peak_source = "unknown GPU; pass --theoretical-peak-tflops"
+
+    package_versions = {}
+    for package in ("nvidia-cutlass-dsl", "flashinfer-python", "transformer-engine"):
+        try:
+            package_versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    return {
+        "gpu_name": device_name,
+        "compute_capability": list(torch.cuda.get_device_capability()),
+        "sm_count": properties.multi_processor_count,
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "packages": package_versions,
+        "theoretical_peak_tflops": peak_tflops,
+        "theoretical_peak_basis": peak_source,
+        "peak_uses_structured_sparsity": False,
+        "flop_convention": "one multiply-add is two FLOPs",
+    }
+
+
+def _annotate_throughput(
+    timing: dict[str, object],
+    logical_flops: int,
+    theoretical_peak_tflops: float | None,
+    *,
+    gemm_only: bool,
+) -> None:
+    tflops = logical_flops / (float(timing["event_ms_p50"]) * 1e9)
+    timing["logical_flops"] = logical_flops
+    if gemm_only:
+        timing["logical_tflops"] = tflops
+        if theoretical_peak_tflops is not None:
+            timing["theoretical_peak_tflops"] = theoretical_peak_tflops
+            timing["dense_fp4_spec_peak_pct"] = 100.0 * tflops / theoretical_peak_tflops
+    else:
+        timing["equivalent_logical_tflops"] = tflops
+
+
+def _tile_rounded_flops(
+    counts: tuple[int, ...],
+    n: int,
+    k: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int = 256,
+) -> int:
+    padded_m = sum(-(-rows // tile_m) * tile_m for rows in counts)
+    padded_n = -(-n // tile_n) * tile_n
+    padded_k = -(-k // tile_k) * tile_k
+    return 2 * padded_m * padded_n * padded_k
 
 
 def _module_exists(name: str) -> bool:
@@ -455,8 +525,6 @@ def _native_case(
             return out
 
         timing = _measure_cuda(prepacked if mode == "prepacked" else dynamic, warmup, iterations)
-        p50 = float(timing["event_ms_p50"])
-        timing["effective_tflops"] = case.flops / (p50 * 1e9)
         return {
             "status": "ok",
             "timing": timing,
@@ -528,8 +596,6 @@ def _native_case(
         return out
 
     timing = _measure_cuda(prepacked if mode == "prepacked" else dynamic, warmup, iterations)
-    p50 = float(timing["event_ms_p50"])
-    timing["effective_tflops"] = 2 * case.routed_rows * gemm_n * gemm_k / (p50 * 1e9)
     return {
         "status": "ok",
         "timing": timing,
@@ -544,7 +610,7 @@ class _GroupedArm:
     result: dict[str, object]
 
 
-def _grouped_accuracy(output, a_groups, weights) -> dict[str, float | bool]:
+def _grouped_accuracy(output, a_groups, weights) -> dict[str, object]:
     import torch
 
     actual_rows = []
@@ -564,6 +630,8 @@ def _grouped_accuracy(output, a_groups, weights) -> dict[str, float | bool]:
         "finite": bool(torch.isfinite(output).all()),
         "sample_cosine": float(cosine),
         "sample_rmse": float(rmse),
+        "accuracy_sample_rows": sum(rows.shape[0] for rows in actual_rows),
+        "accuracy_reference": "FP32 GEMM from the same BF16 source operands",
     }
 
 
@@ -662,11 +730,27 @@ def _prepare_grouped_frontier(
             key=lambda value: float(candidate_timings[f"{value[0]}x{value[1]}"]["event_ms_p50"]),
         )
         runtime = runtimes[(tile_m, tile_n)]
+        tile_flops = _tile_rounded_flops(
+            counts_cpu,
+            case.n,
+            case.k,
+            tile_m,
+            tile_n,
+        )
         arms["native"] = _GroupedArm(
             lambda: native_call(runtime),
             {
                 "status": "ok",
-                "config": {"tile_m": tile_m, "tile_n": tile_n},
+                "config": {
+                    "tile_m": tile_m,
+                    "tile_n": tile_n,
+                    "output_contract": "preallocated",
+                },
+                "work": {
+                    "logical_flops": case.flops,
+                    "tile_rounded_flops": tile_flops,
+                    "tile_padding_overhead_pct": 100.0 * (tile_flops / case.flops - 1.0),
+                },
                 **_grouped_accuracy(native_call(runtime), a_groups, weights),
             },
         )
@@ -725,7 +809,10 @@ def _prepare_grouped_frontier(
                     flashinfer_call,
                     {
                         "status": "ok",
-                        "config": {"mma_tiler_mn": [128, 128]},
+                        "config": {
+                            "mma_tiler_mn": [128, 128],
+                            "output_contract": "preallocated",
+                        },
                         **_grouped_accuracy(fi_concat, a_groups, weights),
                     },
                 )
@@ -772,7 +859,10 @@ def _prepare_grouped_frontier(
                         torch_call,
                         {
                             "status": "ok",
-                            "config": {"input_packing": "flashinfer_nvfp4"},
+                            "config": {
+                                "input_packing": "flashinfer_nvfp4",
+                                "output_contract": "allocating_api",
+                            },
                             **_grouped_accuracy(torch_out, a_groups, weights),
                         },
                     )
@@ -789,9 +879,11 @@ def _run_grouped_frontier_case(
     selected: tuple[str, ...],
     statuses: dict[str, BackendStatus],
     args: argparse.Namespace,
-) -> None:
+    theoretical_peak_tflops: float | None,
+) -> bool:
     runnable = tuple(name for name in selected if statuses[name].runnable)
     arms, failures = _prepare_grouped_frontier(case, runnable, args)
+    no_backend_errors = all(result.get("status") != "error" for result in failures.values())
     functions = {name: arm.call for name, arm in arms.items()}
     timings = (
         _measure_cuda_interleaved(
@@ -820,7 +912,12 @@ def _run_grouped_frontier_case(
         else:
             result = arms[backend].result
             timing = timings[backend]
-            timing["effective_tflops"] = case.flops / (float(timing["event_ms_p50"]) * 1e9)
+            _annotate_throughput(
+                timing,
+                case.flops,
+                theoretical_peak_tflops,
+                gemm_only=True,
+            )
             result["timing"] = timing
         print(json.dumps({**base, **result}), flush=True)
 
@@ -832,6 +929,12 @@ def _run_grouped_frontier_case(
             args.stabilize_ms,
         )["native"]
         first = timings["native"]
+        _annotate_throughput(
+            canary,
+            case.flops,
+            theoretical_peak_tflops,
+            gemm_only=True,
+        )
         drift = float(canary["event_ms_p50"]) / float(first["event_ms_p50"]) - 1.0
         print(
             json.dumps(
@@ -850,6 +953,13 @@ def _run_grouped_frontier_case(
             ),
             flush=True,
         )
+        return (
+            no_backend_errors
+            and bool(canary["health_valid"])
+            and abs(drift) <= 0.05
+            and all(bool(timing["health_valid"]) for timing in timings.values())
+        )
+    return no_backend_errors and all(bool(timing["health_valid"]) for timing in timings.values())
 
 
 def _te_case(
@@ -927,9 +1037,7 @@ def _te_case(
             return torch.cat(outputs, dim=0)
 
     timing = _measure_cuda(call, warmup, iterations)
-    p50 = float(timing["event_ms_p50"])
-    timing["effective_tflops"] = case.flops / (p50 * 1e9)
-    timing["executed_tflops"] = 2 * padded_rows * case.n * case.k / (p50 * 1e9)
+    timing["padded_logical_flops"] = 2 * padded_rows * case.n * case.k
     return {
         "status": "ok",
         "timing": timing,
@@ -968,7 +1076,7 @@ def _dense_inputs(case: DenseCase):
     return a, b, qa, qb, sfa, sfb, one
 
 
-def _dense_accuracy(output, a, b) -> dict[str, float | bool]:
+def _dense_accuracy(output, a, b) -> dict[str, object]:
     import torch
 
     sample_rows = min(16, a.shape[0])
@@ -980,6 +1088,8 @@ def _dense_accuracy(output, a, b) -> dict[str, float | bool]:
         "finite": bool(torch.isfinite(output).all()),
         "sample_cosine": float(cosine),
         "sample_rmse": float(rmse),
+        "accuracy_sample_rows": sample_rows,
+        "accuracy_reference": "FP32 GEMM from the same BF16 source operands",
     }
 
 
@@ -1050,7 +1160,15 @@ def _prepare_dense_native(
     call = prepacked if mode == "prepacked" else dynamic
     result: dict[str, object] = {
         "status": "ok",
-        "config": {"tile_m": tile_m, "tile_n": tile_n},
+        "config": {
+            "tile_m": tile_m,
+            "tile_n": tile_n,
+            "output_contract": "allocating_api",
+        },
+        "work": {
+            "logical_flops": case.flops,
+            "tile_rounded_flops": _tile_rounded_flops((case.m,), case.n, case.k, tile_m, tile_n),
+        },
         "autotune": [
             {"event_ms_p50": trial, "tile_m": tm, "tile_n": tn} for trial, tm, tn in trials
         ],
@@ -1138,7 +1256,15 @@ def _prepare_dense_grouped(
     benchmark_call = (lambda: call(runtime)) if mode == "prepacked" else dynamic
     result = {
         "status": "ok",
-        "config": {"tile_m": tile_m, "tile_n": tile_n},
+        "config": {
+            "tile_m": tile_m,
+            "tile_n": tile_n,
+            "output_contract": "preallocated",
+        },
+        "work": {
+            "logical_flops": case.flops,
+            "tile_rounded_flops": _tile_rounded_flops((case.m,), case.n, case.k, tile_m, tile_n),
+        },
         **_dense_accuracy(benchmark_call(), a, b),
     }
     return _DenseArm(benchmark_call, result, {})
@@ -1167,7 +1293,11 @@ def _prepare_dense_cublas(case: DenseCase, mode: str, inputs) -> _DenseArm | Non
             output_dtype=torch.bfloat16,
         )
 
-    result = {"status": "ok", **_dense_accuracy(call(), a, b)}
+    result = {
+        "status": "ok",
+        "config": {"output_contract": "allocating_api"},
+        **_dense_accuracy(call(), a, b),
+    }
     return _DenseArm(call, result, {})
 
 
@@ -1201,6 +1331,8 @@ def _dense_main(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         parser.error(str(exc))
     if args.max_cases:
         cases = cases[: args.max_cases]
+    runtime = None if args.list else _runtime_metadata(args.theoretical_peak_tflops)
+    theoretical_peak_tflops = None if runtime is None else runtime["theoretical_peak_tflops"]
     available = {
         "native": _module_exists("nvfp4moe"),
         "native_grouped": _module_exists("nvfp4moe"),
@@ -1213,18 +1345,27 @@ def _dense_main(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
             "operation": "C = A @ B.T",
             "prepacked": "NVFP4 operands and scale factors are resident",
             "dynamic": "BF16 A quantization plus GEMM; B stays resident",
-            "timing": "backend calls are interleaved in alternating order after stabilization",
+            "logical_flops": "2*M*N*K; one multiply-add is two FLOPs",
+            "throughput": "logical FLOPs divided by CUDA-event median latency",
+            "peak": "single-GPU dense FP4 specification; structured sparsity is excluded",
+            "timing": "backend calls are deterministically shuffled per iteration after stabilization",
         },
         "backends": {name: {"available": available[name]} for name in selected},
         "case_count": len(cases),
-        "cases": [asdict(case) | {"label": case.label, "flops": case.flops} for case in cases],
+        "cases": [
+            asdict(case) | {"label": case.label, "logical_flops": case.flops} for case in cases
+        ],
     }
     if args.list:
         print(json.dumps(payload, indent=2))
         return 0
     modes = MODES if args.mode == "both" else (args.mode,)
-    print(json.dumps({"event": "start", **payload, "cases": None}), flush=True)
+    print(
+        json.dumps({"event": "start", **payload, "cases": None, "runtime": runtime}),
+        flush=True,
+    )
     started = time.time()
+    run_valid = True
     for case in cases:
         for mode in modes:
             inputs = _dense_inputs(case)
@@ -1268,28 +1409,38 @@ def _dense_main(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
                 if functions
                 else {}
             )
+            run_valid &= all(bool(timing["health_valid"]) for timing in timings.values())
 
             for backend in selected:
                 base = {
                     "event": "result",
                     "backend": backend,
                     "mode": mode,
-                    "case": asdict(case) | {"label": case.label, "flops": case.flops},
+                    "case": asdict(case) | {"label": case.label, "logical_flops": case.flops},
                 }
                 if backend in failures:
                     result = failures[backend]
                 else:
                     result = prepared[backend].result
                     timing = timings[backend]
-                    timing["effective_tflops"] = case.flops / (float(timing["event_ms_p50"]) * 1e9)
+                    _annotate_throughput(
+                        timing,
+                        case.flops,
+                        theoretical_peak_tflops,
+                        gemm_only=mode == "prepacked",
+                    )
                     result["timing"] = timing
                     if backend == "native":
                         for name in native.auxiliary:
                             auxiliary_timing = timings[f"native_{name}"]
-                            auxiliary_timing["effective_tflops"] = case.flops / (
-                                float(auxiliary_timing["event_ms_p50"]) * 1e9
+                            _annotate_throughput(
+                                auxiliary_timing,
+                                case.flops,
+                                theoretical_peak_tflops,
+                                gemm_only=True,
                             )
                             result[f"{name}_timing"] = auxiliary_timing
+                run_valid &= result.get("status") != "error"
                 print(json.dumps({**base, **result}), flush=True)
 
             if native is not None:
@@ -1300,20 +1451,25 @@ def _dense_main(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
                     0.0,
                 )
                 canary_timing = canary_timings["native"]
-                canary_timing["effective_tflops"] = case.flops / (
-                    float(canary_timing["event_ms_p50"]) * 1e9
+                _annotate_throughput(
+                    canary_timing,
+                    case.flops,
+                    theoretical_peak_tflops,
+                    gemm_only=mode == "prepacked",
                 )
                 first_timing = timings["native"]
                 drift = (
                     float(canary_timing["event_ms_p50"]) / float(first_timing["event_ms_p50"]) - 1.0
                 )
+                run_valid &= bool(canary_timing["health_valid"]) and abs(drift) <= 0.05
                 print(
                     json.dumps(
                         {
                             "event": "canary",
                             "backend": "native",
                             "mode": mode,
-                            "case": asdict(case) | {"label": case.label, "flops": case.flops},
+                            "case": asdict(case)
+                            | {"label": case.label, "logical_flops": case.flops},
                             "drift": drift,
                             "drift_valid": abs(drift) <= 0.05,
                             "status": "ok",
@@ -1323,14 +1479,28 @@ def _dense_main(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
                     ),
                     flush=True,
                 )
-    print(json.dumps({"event": "done", "wall_seconds": time.time() - started}), flush=True)
-    return 0
+    print(
+        json.dumps({"event": "done", "wall_seconds": time.time() - started, "valid": run_valid}),
+        flush=True,
+    )
+    return 0 if run_valid else 2
 
 
 def _case_dict(case: GemmCase) -> dict[str, object]:
     row = asdict(case)
     row["label"] = case.label
-    row["flops"] = case.flops
+    row["logical_flops"] = case.flops
+    counts = routing_counts(case.routed_rows, case.local_experts, case.routing)
+    mean = statistics.mean(counts)
+    row["expert_row_counts"] = counts
+    row["routing_statistics"] = {
+        "min_rows": min(counts),
+        "max_rows": max(counts),
+        "mean_rows": mean,
+        "coefficient_of_variation": statistics.pstdev(counts) / mean if mean else 0.0,
+        "empty_experts": sum(count == 0 for count in counts),
+        "aligned_128_experts": sum(count % 128 == 0 for count in counts),
+    }
     return row
 
 
@@ -1352,7 +1522,18 @@ def listing_payload(args: argparse.Namespace) -> dict[str, object]:
             "prepacked": "resident NVFP4 operands and scales; grouped GEMM only",
             "dynamic": "BF16 activation quantization plus GEMM; weights stay resident/prepacked",
             "routed_rows": "tokens * top-k before any capacity padding",
-            "timing": "runnable prepacked forward backends are interleaved in one GPU session",
+            "logical_flops": "2*routed_rows*N*K; one multiply-add is two FLOPs",
+            "tile_rounded_flops": "native MMA work after per-expert M and N/K tile rounding",
+            "throughput": "logical FLOPs divided by CUDA-event median latency",
+            "peak": "single-GPU dense FP4 specification; structured sparsity is excluded",
+            "timing": "runnable prepacked forward backends are shuffled per iteration in one session",
+            "routing": {
+                "balanced": "all expert weights are 1",
+                "jagged": "expert e has weight 1 + ((17*e + 11) mod 31)",
+                "hotspot": "expert 0 weight is max(1, E/2); every other weight is 1",
+                "tail": "weights repeat 1,15,16,127,128,129,255,256,257; last is zero",
+                "allocation": "floor(rows*weight/sum(weights)), then largest remainders first",
+            },
         },
         "models": {key: asdict(MODEL_SHAPES[key]) for key in models},
         "backends": {name: asdict(status) for name, status in statuses.items()},
@@ -1376,6 +1557,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--stabilize-ms", type=float, default=200.0)
+    parser.add_argument(
+        "--theoretical-peak-tflops",
+        type=float,
+        default=None,
+        help="dense FP4 specification peak; B200 defaults to 9000 TFLOP/s",
+    )
     parser.add_argument("--tile-m", type=int, choices=(0, 128, 256), default=0)
     parser.add_argument("--tile-n", type=int, choices=(0, 64, 128, 192, 256), default=0)
     parser.add_argument(
@@ -1387,6 +1574,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.theoretical_peak_tflops is not None and args.theoretical_peak_tflops <= 0:
+        parser.error("theoretical-peak-tflops must be positive")
     if args.workload == "dense":
         return _dense_main(args, parser)
     try:
@@ -1405,7 +1594,19 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("warmup/max-cases must be non-negative and iterations must be positive")
 
     cases = [
-        GemmCase(**{key: value for key, value in row.items() if key not in {"label", "flops"}})
+        GemmCase(
+            **{
+                key: value
+                for key, value in row.items()
+                if key
+                not in {
+                    "label",
+                    "logical_flops",
+                    "expert_row_counts",
+                    "routing_statistics",
+                }
+            }
+        )
         for row in payload["cases"]
     ]
     if args.max_cases:
@@ -1415,12 +1616,31 @@ def main(argv: list[str] | None = None) -> int:
     header = {
         key: value for key, value in payload.items() if key not in {"models", "cases", "backends"}
     }
-    print(json.dumps({"event": "start", **header, "selected_backends": selected}), flush=True)
+    runtime = _runtime_metadata(args.theoretical_peak_tflops)
+    theoretical_peak_tflops = runtime["theoretical_peak_tflops"]
+    print(
+        json.dumps(
+            {
+                "event": "start",
+                **header,
+                "selected_backends": selected,
+                "runtime": runtime,
+            }
+        ),
+        flush=True,
+    )
     started = time.time()
+    run_valid = True
     for case in cases:
         for mode in modes:
             if mode == "prepacked" and args.direction == "fwd":
-                _run_grouped_frontier_case(case, selected, statuses, args)
+                run_valid &= _run_grouped_frontier_case(
+                    case,
+                    selected,
+                    statuses,
+                    args,
+                    theoretical_peak_tflops,
+                )
                 continue
             for backend in selected:
                 status = statuses[backend]
@@ -1449,9 +1669,21 @@ def main(argv: list[str] | None = None) -> int:
                             "status": "error",
                             "reason": f"{type(exc).__name__}: {exc}",
                         }
+                if result.get("status") == "ok" and "timing" in result:
+                    _annotate_throughput(
+                        result["timing"],
+                        case.flops,
+                        theoretical_peak_tflops,
+                        gemm_only=mode == "prepacked",
+                    )
+                    run_valid &= bool(result["timing"]["health_valid"])
+                run_valid &= result.get("status") != "error"
                 print(json.dumps({**base, **result}), flush=True)
-    print(json.dumps({"event": "done", "wall_seconds": time.time() - started}), flush=True)
-    return 0
+    print(
+        json.dumps({"event": "done", "wall_seconds": time.time() - started, "valid": run_valid}),
+        flush=True,
+    )
+    return 0 if run_valid else 2
 
 
 if __name__ == "__main__":

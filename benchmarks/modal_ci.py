@@ -523,6 +523,8 @@ def benchmark_dense(preset="smoke"):
             "mode": record["mode"],
             "p50_us": 1000 * record["timing"]["event_ms_p50"],
             "iqr_us": 1000 * record["timing"]["event_ms_iqr"],
+            "logical_tflops": record["timing"].get("logical_tflops"),
+            "dense_fp4_spec_peak_pct": record["timing"].get("dense_fp4_spec_peak_pct"),
             "health_valid": record["timing"]["health_valid"],
         }
         if "out_timing" in record:
@@ -687,6 +689,8 @@ def benchmark_grouped(preset="smoke"):
             "3",
             "--iterations",
             "20",
+            "--stabilize-ms",
+            "1000",
         ]
     elif preset == "recheck":
         command = [
@@ -726,6 +730,7 @@ def benchmark_grouped(preset="smoke"):
     )
     print(result.stdout[-200_000:])
     rows = []
+    canaries = []
     for line in result.stdout.splitlines():
         try:
             record = json.loads(line)
@@ -733,20 +738,81 @@ def benchmark_grouped(preset="smoke"):
             continue
         if not isinstance(record, dict):
             continue
-        if record.get("event") == "result" and record.get("status") == "ok":
+        if record.get("event") == "canary":
+            canaries.append(record)
+        elif record.get("event") == "result" and record.get("status") == "ok":
             rows.append(
                 {
                     "label": record["case"]["label"],
                     "backend": record["backend"],
                     "p50_us": 1000 * record["timing"]["event_ms_p50"],
                     "iqr_us": 1000 * record["timing"].get("event_ms_iqr", 0.0),
+                    "logical_tflops": record["timing"].get("logical_tflops"),
+                    "dense_fp4_spec_peak_pct": record["timing"].get("dense_fp4_spec_peak_pct"),
                     "health_valid": record["timing"].get("health_valid"),
+                    "routing_statistics": record["case"].get("routing_statistics"),
                     "cosine": record.get("sample_cosine"),
                     "config": record.get("config"),
                 }
             )
     if rows:
-        print(json.dumps({"event": "grouped_summary", "rows": rows}), flush=True)
+        by_case = {}
+        for row in rows:
+            by_case.setdefault(row["label"], {})[row["backend"]] = row
+        canary_by_case = {canary["case"]["label"]: canary for canary in canaries}
+        release_rows = []
+        rejected = []
+        for label, backends_by_name in by_case.items():
+            native = backends_by_name.get("native")
+            if native is None:
+                continue
+            canary = canary_by_case.get(label)
+            retained = all(row["health_valid"] for row in backends_by_name.values()) and (
+                canary is None or canary["drift_valid"]
+            )
+            if not retained:
+                rejected.append(
+                    {
+                        "label": label,
+                        "canary_drift": None if canary is None else canary["drift"],
+                        "reason": "health or 5% canary gate failed",
+                    }
+                )
+                continue
+            release_rows.append(
+                {
+                    "label": label,
+                    "native_us": native["p50_us"],
+                    "native_iqr_us": native["iqr_us"],
+                    "native_logical_tflops": native["logical_tflops"],
+                    "native_dense_fp4_spec_peak_pct": native["dense_fp4_spec_peak_pct"],
+                    "flashinfer_us": backends_by_name.get("flashinfer_cutedsl", {}).get("p50_us"),
+                    "pytorch_us": backends_by_name.get("torch_scaled_grouped_mm", {}).get("p50_us"),
+                    "canary_drift": None if canary is None else canary["drift"],
+                    "routing_statistics": native["routing_statistics"],
+                    "config": native["config"],
+                }
+            )
+        print(
+            json.dumps(
+                {
+                    "event": "grouped_release_summary",
+                    "quality": {
+                        "result_rows": len(rows),
+                        "health_failures": sum(not row["health_valid"] for row in rows),
+                        "min_sample_cosine": min(row["cosine"] for row in rows),
+                        "canaries": len(canaries),
+                        "canary_failures": sum(not canary["drift_valid"] for canary in canaries),
+                        "max_abs_canary_drift": max(
+                            (abs(canary["drift"]) for canary in canaries), default=None
+                        ),
+                    },
+                    "rows": release_rows,
+                    "rejected": rejected,
+                }
+            ),
+            flush=True,
+        )
     if result.stderr:
         print(result.stderr[-20_000:])
     if result.returncode != 0:

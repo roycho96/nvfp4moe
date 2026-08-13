@@ -113,7 +113,11 @@ def test_gemm_list_is_cpu_safe(monkeypatch, capsys):
     assert payload["benchmark"] == "standalone_nvfp4_grouped_gemm"
     assert payload["case_count"] == 1
     assert payload["cases"][0]["routed_rows"] == 65536
+    assert payload["cases"][0]["logical_flops"] == 2 * 65536 * 2048 * 768
+    assert payload["cases"][0]["expert_row_counts"] == [8192] * 8
+    assert payload["cases"][0]["routing_statistics"]["coefficient_of_variation"] == 0.0
     assert payload["definitions"]["prepacked"].startswith("resident NVFP4")
+    assert payload["definitions"]["logical_flops"].startswith("2*routed_rows")
 
 
 def test_dense_gemm_list_is_cpu_safe(capsys):
@@ -137,6 +141,66 @@ def test_dense_gemm_list_is_cpu_safe(capsys):
     assert payload["cases"][0]["m"] == 128
     assert payload["cases"][1]["m"] == 8192
     assert payload["definitions"]["operation"] == "C = A @ B.T"
+    assert payload["cases"][1]["logical_flops"] == 2 * 8192 * 2048 * 768
+
+
+def test_jagged_definition_and_statistics_are_reproducible(monkeypatch):
+    monkeypatch.setattr(nvfp4_gemm, "detect_backends", dict)
+    args = nvfp4_gemm.build_parser().parse_args(
+        [
+            "--list",
+            "--models",
+            "deepseek_v3_2",
+            "--tokens",
+            "8192",
+            "--routing",
+            "jagged",
+            "--projections",
+            "fc1",
+        ]
+    )
+    payload = nvfp4_gemm.listing_payload(args)
+    case = payload["cases"][0]
+    assert case["expert_row_counts"] == (7350, 17762, 9187, 613, 11025, 2450, 12862, 4287)
+    assert case["routing_statistics"]["min_rows"] == 613
+    assert case["routing_statistics"]["max_rows"] == 17762
+    assert case["routing_statistics"]["empty_experts"] == 0
+    assert case["routing_statistics"]["coefficient_of_variation"] == pytest.approx(
+        0.6527901966326125
+    )
+
+
+def test_throughput_uses_dense_fp4_peak_only_for_gemm_scope():
+    gemm = {"event_ms_p50": 1.0}
+    nvfp4_gemm._annotate_throughput(
+        gemm,
+        9_000_000_000_000,
+        9_000.0,
+        gemm_only=True,
+    )
+    assert gemm["logical_tflops"] == 9000.0
+    assert gemm["dense_fp4_spec_peak_pct"] == 100.0
+
+    dynamic = {"event_ms_p50": 1.0}
+    nvfp4_gemm._annotate_throughput(
+        dynamic,
+        9_000_000_000_000,
+        9_000.0,
+        gemm_only=False,
+    )
+    assert dynamic["equivalent_logical_tflops"] == 9000.0
+    assert "dense_fp4_spec_peak_pct" not in dynamic
+
+
+def test_tile_rounded_flops_exposes_padding_work():
+    actual = nvfp4_gemm._tile_rounded_flops(
+        (1, 129),
+        n=130,
+        k=257,
+        tile_m=128,
+        tile_n=128,
+    )
+    assert actual == 2 * (128 + 256) * 256 * 512
 
 
 def test_moe_list_is_cpu_safe(monkeypatch, capsys):

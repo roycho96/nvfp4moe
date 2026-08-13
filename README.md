@@ -19,7 +19,11 @@ integration. Communication and routing policy stay with the host framework.
 - Small adapters for Transformer Engine and TorchTitan expert boundaries
 
 Current B200 results, model shapes, precision checks, and exact commands are in
-[BENCHMARKS.md](BENCHMARKS.md).
+[BENCHMARKS.md](BENCHMARKS.md). GEMM results state the timed API boundary,
+exact expert-row distribution, `2*M*N*K` logical FLOPs, TFLOP/s, and utilization
+against the single-GPU 9 PFLOP/s dense FP4 B200 specification. Dynamic
+quantization and full-layer timings are labeled separately and are not presented
+as GEMM peak utilization.
 
 ## 🚀 Install
 
