@@ -3,6 +3,7 @@
 modal run benchmarks/modal_ci.py
 """
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -36,6 +37,31 @@ benchmark_img = (
     .add_local_dir(str(ROOT / "nvfp4moe"), "/root/proj/nvfp4moe")
     .add_local_dir(str(ROOT / "tests"), "/root/proj/tests")
     .add_local_dir(str(ROOT / "benchmarks"), "/root/proj/benchmarks")
+)
+dense_benchmark_img = (
+    modal.Image.from_registry(NGC, add_python=None)
+    .pip_install(
+        "pytest",
+        "apache-tvm-ffi>=0.1.12,<0.2",
+        "torch-c-dlpack-ext",
+        "nvidia-cutlass-dsl[cu13]==4.7.0",
+    )
+    .add_local_dir(str(ROOT / "nvfp4moe"), "/root/proj/nvfp4moe")
+    .add_local_dir(str(ROOT / "benchmarks"), "/root/proj/benchmarks")
+    .add_local_dir(str(ROOT / "tests"), "/root/proj/tests")
+)
+grouped_benchmark_img = (
+    modal.Image.from_registry(NGC, add_python=None)
+    .pip_install(
+        "pytest",
+        "apache-tvm-ffi>=0.1.12,<0.2",
+        "torch-c-dlpack-ext",
+        "nvidia-cutlass-dsl[cu13]==4.7.0",
+        "flashinfer-python==0.6.17",
+    )
+    .add_local_dir(str(ROOT / "nvfp4moe"), "/root/proj/nvfp4moe")
+    .add_local_dir(str(ROOT / "benchmarks"), "/root/proj/benchmarks")
+    .add_local_dir(str(ROOT / "tests"), "/root/proj/tests")
 )
 
 
@@ -171,52 +197,116 @@ def run(
     return ok
 
 
-@app.function(gpu="B200", image=img, timeout=3600, volumes={"/vol": vol})
+@app.function(gpu="B200", image=grouped_benchmark_img, timeout=7200, volumes={"/vol": vol})
 def profile(case="dgrad2-qwen"):
     import os
 
     env = dict(os.environ)
     env["PYTHONPATH"] = "/root/proj"
-    command = [
-        "ncu",
-        "--target-processes",
-        "all",
-        "--kernel-name",
-        "regex:.*Sm100GroupedBlockScaledGemmKernel.*",
-        "--launch-count",
-        "1",
-        "--section",
+    profile_sections = (
         "SpeedOfLight",
-        "--section",
         "LaunchStats",
-        "--section",
         "Occupancy",
-        "--section",
         "SchedulerStats",
-        "--section",
         "WarpStateStats",
-        "--section",
         "InstructionStats",
-        "--section",
+        "SourceCounters",
         "MemoryWorkloadAnalysis",
-        sys.executable,
-        "/root/proj/benchmarks/native_grouped_gemm_smoke.py",
-        "--profile-case",
-        case,
-    ]
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=3000,
-        env=env,
-        check=False,
     )
-    print(result.stdout[-80_000:])
-    if result.stderr:
-        print(result.stderr[-8000:])
-    if result.returncode != 0:
-        raise RuntimeError(f"NCU exited with {result.returncode}")
+    if case in ("training-native", "training-te"):
+        backend = "native" if case == "training-native" else "te_nvfp4_fused"
+        kernel_name = (
+            "regex:.*Sm100GroupedBlockScaledGemmKernel.*"
+            if case == "training-native"
+            else "regex:.*nvjet_sm100.*"
+        )
+        launch_count = "1"
+        nvtx_range = "nvfp4moe_training_profile/"
+        targets = [
+            [
+                sys.executable,
+                "/root/proj/benchmarks/nvfp4_moe.py",
+                "--suite",
+                "quick",
+                "--models",
+                "deepseek_v3_2",
+                "--tokens",
+                "8192",
+                "--backends",
+                backend,
+                "--scope",
+                "full-layer",
+                "--pass",
+                "fwd_bwd",
+                "--routing",
+                "balanced",
+                "--interleave-training",
+                "--max-cases",
+                "1",
+                "--profile-nvtx-arm",
+                backend,
+            ]
+        ]
+    elif case.startswith("dense-"):
+        kernel_name = "regex:.*Sm100BlockScaledPersistentDenseGemmKernel.*"
+        launch_count = "1"
+        nvtx_range = "nvfp4moe_profile/"
+        targets = [
+            [
+                sys.executable,
+                "/root/proj/benchmarks/native_grouped_gemm_smoke.py",
+                "--profile-case",
+                case,
+            ]
+        ]
+    else:
+        kernel_name = "regex:.*Sm100GroupedBlockScaledGemmKernel.*"
+        launch_count = "1"
+        nvtx_range = "nvfp4moe_profile/"
+        targets = [
+            [
+                sys.executable,
+                "/root/proj/benchmarks/native_grouped_gemm_smoke.py",
+                "--profile-case",
+                case,
+            ]
+        ]
+    profile_targets = [(kernel_name, nvtx_range, 0, target) for target in targets]
+    for target_kernel, target_nvtx, launch_skip, target in profile_targets:
+        command = [
+            "ncu",
+            "--clock-control",
+            "none",
+            "--target-processes",
+            "all",
+            "--nvtx",
+            "--nvtx-include",
+            target_nvtx,
+            "--kernel-name",
+            target_kernel,
+            "--launch-count",
+            launch_count,
+        ]
+        command.extend(("--print-details", "all"))
+        for section in profile_sections:
+            command.extend(("--section", section))
+        if launch_skip:
+            command.extend(("--launch-skip", str(launch_skip)))
+        command.extend(target)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=3000,
+            env=env,
+            check=False,
+        )
+        print(f"===== {' '.join(target)} =====")
+        print(result.stdout[-80_000:])
+        if result.stderr:
+            print(result.stderr[-8000:])
+        if result.returncode != 0:
+            raise RuntimeError(f"NCU exited with {result.returncode}")
 
 
 @app.function(gpu="B200", image=benchmark_img, timeout=14400, volumes={"/vol": vol})
@@ -256,7 +346,7 @@ def benchmark_matrix(kind="moe-forward"):
             "--routing",
             "jagged",
             "--backends",
-            "native,te_nvfp4,deepgemm_bf16",
+            "native,te_nvfp4_fused,deepgemm_bf16,torch_bf16",
             "--scope",
             "full-layer",
             "--pass",
@@ -265,6 +355,7 @@ def benchmark_matrix(kind="moe-forward"):
             "2",
             "--iterations",
             "5",
+            "--interleave-training",
         ]
     elif kind == "moe-forward-heavy":
         command = [
@@ -298,7 +389,7 @@ def benchmark_matrix(kind="moe-forward"):
             "--backends",
             "native,te_nvfp4,deepgemm_bf16,deepgemm_fp8_fp4,torch_bf16",
             "--scope",
-            "both",
+            "full-layer",
             "--pass",
             "fwd",
             "--warmup",
@@ -324,6 +415,344 @@ def benchmark_matrix(kind="moe-forward"):
     vol.commit()
 
 
+@app.function(gpu="B200", image=dense_benchmark_img, timeout=14400, volumes={"/vol": vol})
+def benchmark_dense(preset="smoke"):
+    import os
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = "/root/proj"
+    if preset == "test":
+        command = [sys.executable, "-m", "pytest", "-q", "tests/test_ops.py"]
+    elif preset == "smoke":
+        models = "qwen3_30b_a3b"
+        rows = "128,512"
+        projections = "fc2"
+        iterations = "5"
+    elif preset == "full":
+        models = "qwen3_30b_a3b,qwen3_235b_a22b,deepseek_v3_2,llama4_scout"
+        rows = "128,512,2048,8192"
+        projections = "fc1,fc2"
+        iterations = "20"
+        mode = "prepacked"
+        backends = "native,cublaslt"
+    elif preset == "dynamic":
+        models = "qwen3_235b_a22b,deepseek_v3_2,llama4_scout"
+        rows = "512,2048,8192"
+        projections = "fc1,fc2"
+        iterations = "10"
+        mode = "dynamic"
+        backends = "native,cublaslt"
+    elif preset == "focused":
+        models = "qwen3_30b_a3b,deepseek_v3_2"
+        rows = "8192"
+        projections = "fc2"
+        iterations = "20"
+        mode = "prepacked"
+        backends = "native,native_grouped,cublaslt"
+    elif preset == "core-compare":
+        models = "deepseek_v3_2"
+        rows = "8192"
+        projections = "fc1"
+        iterations = "30"
+        mode = "prepacked"
+        backends = "native,native_grouped,cublaslt"
+    elif preset == "recheck":
+        models = "qwen3_30b_a3b"
+        rows = "2048"
+        projections = "fc2"
+        iterations = "20"
+        mode = "prepacked"
+        backends = "native,cublaslt"
+    else:
+        raise ValueError(
+            "dense preset must be test, smoke, focused, core-compare, recheck, full, or dynamic"
+        )
+    if preset != "test":
+        if preset == "smoke":
+            mode = "prepacked"
+            backends = "native,cublaslt"
+        command = [
+            sys.executable,
+            "/root/proj/benchmarks/nvfp4_gemm.py",
+            "--workload",
+            "dense",
+            "--suite",
+            "full",
+            "--models",
+            models,
+            "--tokens",
+            rows,
+            "--projections",
+            projections,
+            "--backends",
+            backends,
+            "--mode",
+            mode,
+            "--warmup",
+            "3",
+            "--iterations",
+            iterations,
+        ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=13800,
+        env=env,
+        cwd="/root/proj",
+        check=False,
+    )
+    print(result.stdout[-200_000:])
+    rows = []
+    canaries = {}
+    for line in result.stdout.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("event") == "canary":
+            canaries[(record["case"]["label"], record["mode"])] = record
+        elif record.get("event") == "result" and record.get("status") == "ok":
+            rows.append(record)
+    summary = []
+    for record in rows:
+        case = record["case"]
+        item = {
+            "label": case["label"],
+            "backend": record["backend"],
+            "mode": record["mode"],
+            "p50_us": 1000 * record["timing"]["event_ms_p50"],
+            "iqr_us": 1000 * record["timing"]["event_ms_iqr"],
+            "health_valid": record["timing"]["health_valid"],
+        }
+        if "out_timing" in record:
+            item["out_p50_us"] = 1000 * record["out_timing"]["event_ms_p50"]
+        if "config" in record:
+            item["config"] = record["config"]
+        canary = canaries.get((case["label"], record["mode"]))
+        if record["backend"] == "native" and canary is not None:
+            item["canary_drift"] = canary["drift"]
+            item["drift_valid"] = canary["drift_valid"]
+        summary.append(item)
+    print(json.dumps({"event": "dense_summary", "rows": summary}), flush=True)
+    if result.stderr:
+        print(result.stderr[-20_000:])
+    if result.returncode != 0:
+        raise RuntimeError(f"dense benchmark exited with {result.returncode}")
+    vol.commit()
+
+
+@app.function(gpu="B200", image=grouped_benchmark_img, timeout=14400, volumes={"/vol": vol})
+def benchmark_grouped(preset="smoke"):
+    import os
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = "/root/proj"
+    if preset == "dual-quant":
+        command = [sys.executable, "-m", "pytest", "-q", "tests/test_dual_quantize.py"]
+    elif preset == "layer-test":
+        command = [sys.executable, "/root/proj/tests/test_nvfp4moe_layer.py"]
+    elif preset == "training-tiles":
+        command = [
+            sys.executable,
+            "/root/proj/benchmarks/native_grouped_gemm_smoke.py",
+            "--training-tile-matrix",
+        ]
+    elif preset in {
+        "training-smoke",
+        "training-qwen",
+        "training-focused",
+        "training-profile",
+    }:
+        if preset == "training-smoke":
+            models = "qwen3_30b_a3b"
+            tokens = "128"
+            routing = "jagged"
+            warmup = "1"
+            iterations = "5"
+            backends = "native,te_nvfp4_fused,torchao_mxfp8,torch_bf16"
+        elif preset == "training-qwen":
+            models = "qwen3_30b_a3b"
+            tokens = "8192"
+            routing = "balanced,jagged"
+            warmup = "3"
+            iterations = "10"
+            backends = "native,te_nvfp4_fused,torch_bf16"
+        elif preset == "training-focused":
+            models = "qwen3_30b_a3b,deepseek_v3_2,kimi_k2_7,minimax_m2"
+            tokens = "8192"
+            routing = "balanced,jagged"
+            warmup = "3"
+            iterations = "10"
+            backends = "native,te_nvfp4_fused,torch_bf16"
+        else:
+            models = "deepseek_v3_2"
+            tokens = "8192"
+            routing = "balanced"
+            warmup = "5"
+            iterations = "20"
+            backends = "native,te_nvfp4_fused"
+        command = [
+            sys.executable,
+            "/root/proj/benchmarks/nvfp4_moe.py",
+            "--models",
+            models,
+            "--tokens",
+            tokens,
+            "--routing",
+            routing,
+            "--backends",
+            backends,
+            "--scope",
+            "full-layer",
+            "--pass",
+            "fwd_bwd",
+            "--warmup",
+            warmup,
+            "--iterations",
+            iterations,
+            "--interleave-training",
+        ]
+        if preset == "training-profile":
+            command.append("--profile-kernels")
+    elif preset == "smoke":
+        command = [
+            sys.executable,
+            "/root/proj/benchmarks/nvfp4_gemm.py",
+            "--models",
+            "qwen3_30b_a3b",
+            "--tokens",
+            "128",
+            "--routing",
+            "balanced,jagged",
+            "--projections",
+            "fc2",
+            "--backends",
+            "native,flashinfer_cutedsl,torch_scaled_grouped_mm",
+            "--warmup",
+            "2",
+            "--iterations",
+            "5",
+        ]
+    elif preset in {"training-dgrad", "training-wgrad"}:
+        command = [
+            sys.executable,
+            "/root/proj/benchmarks/nvfp4_gemm.py",
+            "--models",
+            "qwen3_30b_a3b,deepseek_v3_2,kimi_k2_7,minimax_m2",
+            "--tokens",
+            "8192",
+            "--routing",
+            "balanced,jagged",
+            "--projections",
+            "fc1,fc2",
+            "--backends",
+            "native",
+            "--mode",
+            "both",
+            "--direction",
+            "dgrad" if preset == "training-dgrad" else "wgrad",
+            "--warmup",
+            "3",
+            "--iterations",
+            "10",
+        ]
+    elif preset in {"focused", "full", "long-hidden"}:
+        models = (
+            "deepseek_v3_2,kimi_k2_7"
+            if preset == "long-hidden"
+            else (
+                "qwen3_30b_a3b,deepseek_v3_2,kimi_k2_7,minimax_m2"
+                if preset == "focused"
+                else (
+                    "qwen3_30b_a3b,qwen3_235b_a22b,gemma4_26b_a4b,deepseek_v3_2,"
+                    "kimi_k2_7,minimax_m2,llama4_scout"
+                )
+            )
+        )
+        command = [
+            sys.executable,
+            "/root/proj/benchmarks/nvfp4_gemm.py",
+            "--models",
+            models,
+            "--tokens",
+            "8192",
+            "--routing",
+            "balanced,jagged",
+            "--projections",
+            "fc1,fc2",
+            "--backends",
+            "native,flashinfer_cutedsl,torch_scaled_grouped_mm",
+            "--warmup",
+            "3",
+            "--iterations",
+            "20",
+        ]
+    elif preset == "recheck":
+        command = [
+            sys.executable,
+            "/root/proj/benchmarks/nvfp4_gemm.py",
+            "--models",
+            "qwen3_235b_a22b,deepseek_v3_2,llama4_scout",
+            "--tokens",
+            "8192",
+            "--routing",
+            "balanced,jagged",
+            "--projections",
+            "fc1",
+            "--backends",
+            "native,flashinfer_cutedsl,torch_scaled_grouped_mm",
+            "--warmup",
+            "5",
+            "--iterations",
+            "30",
+        ]
+    else:
+        raise ValueError(
+            "grouped preset must be training-smoke, training-qwen, training-focused, smoke, "
+            "training-tiles, "
+            "training-dgrad, training-wgrad, recheck, "
+            "focused, full, long-hidden, dual-quant, "
+            "or layer-test"
+        )
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=13800,
+        env=env,
+        cwd="/root/proj",
+        check=False,
+    )
+    print(result.stdout[-200_000:])
+    rows = []
+    for line in result.stdout.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("event") == "result" and record.get("status") == "ok":
+            rows.append(
+                {
+                    "label": record["case"]["label"],
+                    "backend": record["backend"],
+                    "p50_us": 1000 * record["timing"]["event_ms_p50"],
+                    "iqr_us": 1000 * record["timing"].get("event_ms_iqr", 0.0),
+                    "health_valid": record["timing"].get("health_valid"),
+                    "cosine": record.get("sample_cosine"),
+                    "config": record.get("config"),
+                }
+            )
+    if rows:
+        print(json.dumps({"event": "grouped_summary", "rows": rows}), flush=True)
+    if result.stderr:
+        print(result.stderr[-20_000:])
+    if result.returncode != 0:
+        raise RuntimeError(f"grouped benchmark exited with {result.returncode}")
+
+
 @app.local_entrypoint()
 def main(
     smoke_only: bool = False,
@@ -332,9 +761,15 @@ def main(
     frontier_matrix: bool = False,
     benchmark_smoke: bool = False,
     matrix: str = "",
+    dense: str = "",
+    grouped: str = "",
     profile_case: str = "",
 ):
-    if matrix:
+    if grouped:
+        benchmark_grouped.remote(grouped)
+    elif dense:
+        benchmark_dense.remote(dense)
+    elif matrix:
         benchmark_matrix.remote(matrix)
     elif profile_case:
         profile.remote(profile_case)

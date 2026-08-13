@@ -10,11 +10,12 @@ integration. Communication and routing policy stay with the host framework.
 ## ⚡ What is included
 
 - Native CuTe DSL grouped NVFP4 GEMM for forward and input gradients
+- Dense 2D NVFP4 GEMM with a conventional `C = A @ B.T` interface
 - Fused SwiGLU, GeGLU, and quantized FC1 epilogues
 - Grouped NVFP4 weight-gradient kernel
 - Full training expert layer with deterministic dispatch/combine
 - Parameter-free expert core for framework-owned BF16 master weights
-- `torch.compile`-visible custom op for prepacked grouped GEMM
+- `torch.compile`-visible custom ops for prepacked dense and grouped GEMM
 - Small adapters for Transformer Engine and TorchTitan expert boundaries
 
 Current B200 results, model shapes, precision checks, and exact commands are in
@@ -23,7 +24,7 @@ Current B200 results, model shapes, precision checks, and exact commands are in
 ## 🚀 Install
 
 Tested with NVIDIA B200, Python 3.12, CUDA 13, PyTorch 2.11 or newer, and
-CUTLASS DSL 4.6.x. The reference image is
+CUTLASS DSL 4.6–4.7. The reference image is
 `nvcr.io/nvidia/pytorch:26.07-py3`.
 
 ```bash
@@ -85,9 +86,28 @@ BF16 and receives gradients through `differentiable_probs()`.
 
 ## 🧩 Standalone GEMM and `torch.compile`
 
-The functional op accepts packed E2M1 operands and E4M3 scale factors. It
-allocates the output, keeps the kernel opaque to Dynamo, and supports a dynamic
-total routed-row count.
+The dense API computes `A @ B.T` from ordinary 2D matrices. Quantization returns
+packed E2M1 data, blocked E4M3 scale factors, and the per-tensor scale.
+
+```python
+import torch
+from nvfp4moe import nvfp4_gemm, nvfp4_gemm_out, nvfp4_quantize
+
+qa, sfa, scale_a = nvfp4_quantize(a)
+qb, sfb, scale_b = nvfp4_quantize(b)
+y = nvfp4_gemm(qa, qb, sfa, sfb, scale_a * scale_b)
+
+# Reuse an output allocation in latency-sensitive loops.
+out = torch.empty((a.shape[0], b.shape[0]), dtype=torch.bfloat16, device=a.device)
+nvfp4_gemm_out(qa, qb, sfa, sfb, scale_a * scale_b, out)
+```
+
+`a` is `[M, K]`, `b` is `[N, K]`, and the result is `[M, N]`. No expert axis or
+offset tensor is required. The eager path calls the native runtime directly;
+`torch.compile` records an opaque custom op and supports a dynamic M dimension.
+
+The grouped functional op uses the same packed types and accepts dynamic total
+routed rows.
 
 ```python
 import torch
@@ -100,10 +120,14 @@ y = compiled_gemm(qa, qb, sfa, sfb, cu, alpha)
 Packed operands are deliberately non-differentiable. Use `NVFP4ExpertCore` or
 `MoEExpertLayer` for training.
 
-For launch control or custom epilogues, use the lower-level classes directly:
+For launch control, use the lower-level dense or grouped classes directly:
 
 ```python
-from nvfp4moe import GatedEpilogue, GroupedNvfp4Gemm
+import torch
+from nvfp4moe import DenseNvfp4Gemm, GatedEpilogue, GroupedNvfp4Gemm
+
+dense = DenseNvfp4Gemm(n=N, k=K, tile_m=256, tile_n=256)
+dense(qa, qb, out, sfa, sfb, scale_a * scale_b)
 
 gemm = GroupedNvfp4Gemm(
     experts=8,
@@ -167,6 +191,8 @@ nvfp4moe/
 ├── recipe.py         tensor-scale state
 ├── reference.py      readable format reference
 └── kernels/
+    ├── dense_gemm.py        host runtime for 2D GEMM
+    ├── dense_gemm_kernel.py
     ├── gemm.py       validation, JIT cache, and launch API
     ├── gemm_kernel.py
     ├── epilogue.py

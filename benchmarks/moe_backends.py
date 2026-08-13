@@ -7,6 +7,8 @@ M-grouped kernels for forward and dgrad, and K-grouped TN kernels for wgrad.
 from __future__ import annotations
 
 import contextlib
+import importlib
+import sys
 from dataclasses import dataclass
 
 import torch
@@ -72,6 +74,20 @@ def _te_autocast(te, recipe):
     return te.fp8_autocast(enabled=True, fp8_recipe=recipe)
 
 
+def _torchao_mxfp8_grouped_mm():
+    try:
+        importlib.import_module("cutlass.base_dsl._mlir_helpers")
+    except ModuleNotFoundError:
+        helpers = importlib.import_module("cutlass._mlir_helpers")
+        sys.modules["cutlass.base_dsl._mlir_helpers"] = helpers
+        sys.modules["cutlass.base_dsl._mlir_helpers.arith"] = importlib.import_module(
+            "cutlass._mlir_helpers.arith"
+        )
+    from torchao.prototype.moe_training import _to_mxfp8_then_scaled_grouped_mm
+
+    return _to_mxfp8_then_scaled_grouped_mm
+
+
 @dataclass
 class BackendInfo:
     name: str
@@ -83,7 +99,13 @@ class BackendInfo:
 class Nvfp4MoeExpert(nn.Module):
     info = BackendInfo("nvfp4moe", "NVFP4 x NVFP4", True)
 
-    def __init__(self, spec, trace):
+    def __init__(
+        self,
+        spec,
+        trace,
+        fused_row_col=True,
+        use_dynamic_sched=True,
+    ):
         super().__init__()
         from nvfp4moe import MoEDispatch, MoEExpertLayer
 
@@ -96,7 +118,9 @@ class Nvfp4MoeExpert(nn.Module):
             spec.topk,
             rht=True,
             delayed_col_amax=True,
+            fused_row_col=fused_row_col,
             activation=spec.activation,
+            use_dynamic_sched=use_dynamic_sched,
         ).cuda()
         with torch.no_grad():
             self.layer.w1.copy_(_interleave_gate_up(gate_up))
@@ -243,6 +267,134 @@ class TEExpert(nn.Module):
         return {
             "gate_up": _deinterleave_gate_up(torch.stack(gate_up)),
             "down": torch.stack(down).contiguous(),
+        }
+
+
+class TEFusedExpert(nn.Module):
+    info = BackendInfo("te_nvfp4_fused", "TE fused NVFP4", True)
+
+    def __init__(self, spec, trace):
+        super().__init__()
+        if spec.activation != "swiglu":
+            raise ValueError("TE fused NVFP4 benchmark currently supports SwiGLU")
+        import transformer_engine.pytorch as te
+        import transformer_engine.pytorch.ops as te_ops
+        from transformer_engine.common.recipe import NVFP4BlockScaling
+
+        gate_up, down = _pad_weights(
+            trace["gate_up_weight"], trace["down_weight"], spec.padded_intermediate
+        )
+        self.te = te
+        self.recipe = NVFP4BlockScaling()
+        self.experts = spec.experts
+        self.align = 128
+        with te.quantized_model_init(enabled=True, recipe=self.recipe):
+            self.fc1 = te_ops.GroupedLinear(
+                spec.experts,
+                spec.hidden,
+                2 * spec.padded_intermediate,
+                bias=False,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            self.fc2 = te_ops.GroupedLinear(
+                spec.experts,
+                spec.padded_intermediate,
+                spec.hidden,
+                bias=False,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            self.layer = te_ops.Sequential(self.fc1, te_ops.ScaledSwiGLU(), self.fc2)
+        with torch.no_grad():
+            for expert in range(spec.experts):
+                getattr(self.fc1, f"weight{expert}").copy_(gate_up[expert])
+                getattr(self.fc2, f"weight{expert}").copy_(down[expert])
+
+    def grouped(self, x, splits, scales):
+        splits = splits.to(dtype=torch.int32, device=x.device)
+        with _te_autocast(self.te, self.recipe):
+            return self.layer(x, splits, scales, splits)
+
+    def forward(self, x, topi, topv, step=0):
+        del step
+        from transformer_engine.pytorch import permutation as te_perm
+
+        t = x.shape[0]
+        mask = torch.zeros(t, self.experts, dtype=torch.int32, device=x.device)
+        mask.scatter_(1, topi.long(), 1)
+        probs = torch.zeros(t, self.experts, dtype=torch.float32, device=x.device)
+        probs.scatter_(1, topi.long(), topv.float())
+        counts = mask.sum(0)
+        xp, pprob, row_map, pad_offsets, target_counts = te_perm.moe_permute_and_pad_with_probs(
+            x, probs, mask, counts, self.align
+        )
+        ym = self.grouped(xp, target_counts, pprob)
+        return te_perm.moe_unpermute(
+            ym,
+            row_map,
+            map_type="mask",
+            restore_shape=x.shape,
+            pad_offsets=pad_offsets,
+        ).to(torch.bfloat16)
+
+    def training_gradients(self):
+        gate_up = [getattr(self.fc1, f"weight{i}").grad for i in range(self.experts)]
+        down = [getattr(self.fc2, f"weight{i}").grad for i in range(self.experts)]
+        return {
+            "gate_up": torch.stack(gate_up).contiguous(),
+            "down": torch.stack(down).contiguous(),
+        }
+
+
+class TorchAOMXFP8Expert(nn.Module):
+    info = BackendInfo("torchao_mxfp8", "TorchAO MXFP8", True)
+
+    def __init__(self, spec, trace):
+        super().__init__()
+        gate_up, down = _pad_weights(
+            trace["gate_up_weight"], trace["down_weight"], spec.padded_intermediate
+        )
+        self.w1 = nn.Parameter(gate_up.detach().clone().contiguous())
+        self.w2 = nn.Parameter(down.detach().clone().contiguous())
+        self.experts = spec.experts
+        self.activation = spec.activation
+        self.align = 128
+        self.grouped_mm = _torchao_mxfp8_grouped_mm()
+
+    def grouped(self, x, offsets):
+        h = self.grouped_mm(x, self.w1.transpose(1, 2), offsets)
+        gate, up = h.chunk(2, dim=-1)
+        hh = _activation(gate, up, self.activation).to(torch.bfloat16)
+        return self.grouped_mm(hh, self.w2.transpose(1, 2), offsets)
+
+    def forward(self, x, topi, topv, step=0):
+        del step
+        from transformer_engine.pytorch import permutation as te_perm
+
+        t = x.shape[0]
+        mask = torch.zeros(t, self.experts, dtype=torch.int32, device=x.device)
+        mask.scatter_(1, topi.long(), 1)
+        probs = torch.zeros(t, self.experts, dtype=torch.float32, device=x.device)
+        probs.scatter_(1, topi.long(), topv.float())
+        counts = mask.sum(0)
+        xp, pprob, row_map, pad_offsets, target_counts = te_perm.moe_permute_and_pad_with_probs(
+            x, probs, mask, counts, self.align
+        )
+        offsets = target_counts.cumsum(0).to(torch.int32)
+        ym = self.grouped(xp, offsets) * pprob[:, None]
+        return te_perm.moe_unpermute(
+            ym,
+            row_map,
+            map_type="mask",
+            restore_shape=x.shape,
+            pad_offsets=pad_offsets,
+        ).to(torch.bfloat16)
+
+    def training_gradients(self):
+        return {
+            "gate_up": self.w1.grad.contiguous(),
+            "down": self.w2.grad.contiguous(),
         }
 
 
@@ -455,4 +607,6 @@ __all__ = [
     "TEDeepGEMMFP8FP4Expert",
     "TEDeepGEMMTrainExpert",
     "TEExpert",
+    "TEFusedExpert",
+    "TorchAOMXFP8Expert",
 ]

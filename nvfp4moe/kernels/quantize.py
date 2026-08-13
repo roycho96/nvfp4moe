@@ -29,6 +29,7 @@ from ._common import (
 F4_MAX = 6.0
 E4M3_MAX = 448.0
 E4M3_EPS = 2.0**-9
+INV6 = 0.1666666716337204
 F_TILE = 256  # Row mode streams directly without an smem transpose.
 F_TILE_C = 128  # Keeps the columnwise kernel at four CTAs per SM.
 SZ_PAD = 8  # Spreads consecutive ldsm/stsm fragments across all bank quads.
@@ -135,10 +136,11 @@ class NVFP4QuantKernel:
         sf_layout: str = "blocked",
         rht: bool = False,
         emit_amax: bool = False,
+        te_row_math: bool = False,
         has_tile_offsets: bool = False,
         experts: int = 0,
     ):
-        assert mode in ("row", "col", "amax")
+        assert mode in ("row", "col", "dual", "amax")
         # emit_amax (col only): the quantizer already computes every group's
         # amax over the values it quantizes (post-RHT when rht=True) - emit
         # the CTA max of those as one f32 partial per CTA (same value the
@@ -146,8 +148,11 @@ class NVFP4QuantKernel:
         # exact). The delayed-col-amax recipe uses it as NEXT step's pts
         # source, deleting the pre-pass read. No atomics: partials buffer +
         # torch.amax, order-independent.
-        assert not emit_amax or mode == "col", "emit_amax is a colwise feature"
+        assert not emit_amax or mode in ("col", "dual"), "emit_amax is a colwise feature"
+        assert not te_row_math or mode == "row", "TE row math requires rowwise mode"
+        assert mode != "dual" or rht, "dual quantization requires RHT"
         self.emit_amax = emit_amax
+        self.te_row_math = te_row_math
         self.has_tile_offsets = has_tile_offsets
         self.experts = experts
         assert not has_tile_offsets or experts > 0
@@ -158,7 +163,7 @@ class NVFP4QuantKernel:
         # (TE columnwise convention); "amax" mode always transforms (its whole
         # point is the post-RHT columnwise amax) and also emits the raw row
         # amax from the staged tile.
-        assert not rht or mode == "col", "rht applies to the colwise quantizer"
+        assert not rht or mode in ("col", "dual"), "rht applies to the colwise quantizer"
         assert in_dtype == cutlass.BFloat16 or (not rht and mode != "amax"), (
             "RHT is bf16-only (TE constraint)"
         )
@@ -193,14 +198,35 @@ class NVFP4QuantKernel:
         mH,  # Optional (16, 16) BFloat16 rht matrix S@H16*0.25 (rht/amax only)
         mPts,  # (2,) Float32 device-resident [pts, 1/pts]; None in amax mode
         mAmaxOut,  # Optional (>= num_seg_tiles * F/128,) Float32 (emit_amax)
+        mRowQ,  # Optional dual-mode rowwise qdata
+        mRowSF,  # Optional dual-mode rowwise scales
+        mRowPts,  # Optional dual-mode rowwise [pts, 1/pts]
         num_seg_tiles: Int32,  # host upper bound: ceil(M/128) + E
         F: Int32,
         seed: Int32,  # Philox key (rounding="sr" only; ignored for RN)
         stream: cuda.CUstream,
     ):
-        f_tile = F_TILE_C if self.mode in ("col", "amax") else F_TILE
-        self.kernel(mZ, mGidx, mCu, mTileEnds, mQ, mSF, mH, mPts, mAmaxOut, F, seed).launch(
-            grid=[cute.ceil_div(F, f_tile), num_seg_tiles, 1],
+        self.kernel(
+            mZ,
+            mGidx,
+            mCu,
+            mTileEnds,
+            mQ,
+            mSF,
+            mH,
+            mPts,
+            mAmaxOut,
+            mRowQ,
+            mRowSF,
+            mRowPts,
+            F,
+            seed,
+        ).launch(
+            grid=[
+                cute.ceil_div(F, F_TILE_C if self.mode in ("col", "dual", "amax") else F_TILE),
+                num_seg_tiles,
+                1,
+            ],
             block=[NUM_THREADS, 1, 1],
             stream=stream,
         )
@@ -217,6 +243,9 @@ class NVFP4QuantKernel:
         mH,
         mPts,
         mAmaxOut,
+        mRowQ,
+        mRowSF,
+        mRowPts,
         F: Int32,
         seed: Int32,
     ):
@@ -226,6 +255,11 @@ class NVFP4QuantKernel:
         if const_expr(self.mode != "amax"):
             pts = Float32(mPts[0])
             inv_pts = Float32(mPts[1])
+        row_pts = Float32(0.0)
+        row_inv_pts = Float32(0.0)
+        if const_expr(self.mode == "dual"):
+            row_pts = Float32(mRowPts[0])
+            row_inv_pts = Float32(mRowPts[1])
         tidx, _, _ = cute.arch.thread_idx()
         E = self.experts if const_expr(self.has_tile_offsets) else mCu.shape[0] - 1
         # all smem lives at kernel scope: the allocator is a compile-time
@@ -236,8 +270,12 @@ class NVFP4QuantKernel:
         smem = cutlass.utils.SmemAllocator()
         cta_amax = Float32(0.0)
         if const_expr(self.emit_amax):
-            sRedE = smem.allocate_tensor(Float32, cute.make_layout(NUM_THREADS), byte_alignment=16)
-        if const_expr(self.mode in ("col", "amax")):
+            sRedE = smem.allocate_tensor(
+                Float32,
+                cute.make_layout(NUM_THREADS // 32),
+                byte_alignment=16,
+            )
+        if const_expr(self.mode in ("col", "dual", "amax")):
             # The columnwise path uses a 47 KB staging footprint. Keep spitch
             # consistent in the layout, load destination, and RHT tile.
             spitch = F_TILE_C + SZ_PAD
@@ -253,16 +291,28 @@ class NVFP4QuantKernel:
                 cute.recast_ptr(sZ.iterator, dtype=cutlass.Uint16),
                 sZ.layout,
             )
-            if const_expr(self.mode == "col"):
+            if const_expr(self.mode in ("col", "dual")):
                 sQ = smem.allocate_tensor(
                     cutlass.Uint8,
                     cute.make_layout((F_TILE_C, 80), stride=(80, 1)),
                     byte_alignment=16,
                 )
+                if const_expr(self.mode == "dual"):
+                    sColSF = smem.allocate_tensor(
+                        cutlass.Uint8,
+                        cute.make_layout(1024),
+                        byte_alignment=16,
+                    )
+                if const_expr(self.mode == "dual"):
+                    sRowQ = smem.allocate_tensor(
+                        cutlass.Uint8,
+                        cute.make_layout((128, 80), stride=(80, 1)),
+                        byte_alignment=16,
+                    )
             else:
                 sRed = smem.allocate_tensor(
                     Float32,
-                    cute.make_layout((NUM_THREADS, 2), stride=(2, 1)),
+                    cute.make_layout((NUM_THREADS // 32, 2), stride=(2, 1)),
                     byte_alignment=16,
                 )
         else:
@@ -311,7 +361,7 @@ class NVFP4QuantKernel:
                     nt_e = nt
                 acc += nt
         if e_found >= 0:
-            f_tile = F_TILE_C if self.mode in ("col", "amax") else F_TILE
+            f_tile = F_TILE_C if self.mode in ("col", "dual", "amax") else F_TILE
             f0 = fi * f_tile
             valid_rows = cutlass.min(len_e - lt * 128, Int32(128))
             elts = 128 // self.in_dtype.width  # per 16-byte chunk
@@ -325,7 +375,7 @@ class NVFP4QuantKernel:
             # helper docstrings)
             row_pk = cutlass.Uint32(0)
             col_pk = cutlass.Uint32(0)
-            if const_expr(self.mode in ("col", "amax")):
+            if const_expr(self.mode in ("col", "dual", "amax")):
                 # staged load: 16B chunks, coalesced; OOB rows/cols -> 0
                 chunks_per_row = F_TILE_C // elts
                 frag = cute.make_rmem_tensor(lay_v, self.in_dtype)
@@ -383,7 +433,7 @@ class NVFP4QuantKernel:
                     tiled_mma,
                 )
                 thr_ld_a = tiled_ld_a.get_slice(lane)
-                if const_expr(self.mode == "col"):
+                if const_expr(self.mode in ("col", "dual")):
                     tiled_st_c = cute.make_tiled_copy_C(
                         cute.make_copy_atom(
                             cute_warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4),
@@ -396,6 +446,19 @@ class NVFP4QuantKernel:
                 tCgB = thr_mma.partition_B(gB)
                 tCrB = tiled_mma.make_fragment_B(tCgB.shape)
                 cute.copy(atom_cp, tCgB, tCrB)
+                if const_expr(self.mode == "dual"):
+                    row_frag = cute.make_rmem_tensor(cute.make_layout(8), self.in_dtype)
+                    row_u32 = cute.make_tensor(
+                        cute.recast_ptr(row_frag.iterator, dtype=cutlass.Uint32),
+                        cute.make_layout(4),
+                    )
+                    row_vals = cute.make_rmem_tensor(cute.make_layout(8), Float32)
+                    row_bytes = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Uint8)
+                    row_sf = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Float8E4M3FN)
+                    row_sfu8 = cute.make_tensor(
+                        cute.recast_ptr(row_sf.iterator, dtype=cutlass.Uint8),
+                        cute.make_layout(1),
+                    )
                 for g in cutlass.range_constexpr(8):
                     # divby=8 halfwords = 16B: the ldsm/stsm atoms need the
                     # provable 128-bit base alignment the dynamic wi*16 term
@@ -410,6 +473,77 @@ class NVFP4QuantKernel:
                     racc = tiled_mma.make_fragment_C(thr_mma.partition_shape_C((16, 16)))
                     racc.fill(0.0)
                     cute.gemm(tiled_mma, racc, tCrA, tCrB, racc)
+                    if const_expr(self.mode == "dual"):
+                        row = lane // 2
+                        half = lane % 2
+                        row_src = cute.make_tensor(
+                            sZ.iterator
+                            + cute.assume(
+                                (g * 16 + row) * spitch + wi * 16 + half * 8,
+                                divby=8,
+                            ),
+                            cute.make_layout(8),
+                        )
+                        cute.copy(atom_ld, row_src, row_frag)
+                        for ii in cutlass.range_constexpr(4):
+                            word = row_u32[ii]
+                            row_vals[2 * ii] = _bits_f32(word << 16)
+                            row_vals[2 * ii + 1] = _bits_f32(word & cutlass.Uint32(_HI16))
+                        p0 = _max_bf16x2(
+                            row_u32[0] & cutlass.Uint32(_ABSP),
+                            row_u32[1] & cutlass.Uint32(_ABSP),
+                        )
+                        p1 = _max_bf16x2(
+                            row_u32[2] & cutlass.Uint32(_ABSP),
+                            row_u32[3] & cutlass.Uint32(_ABSP),
+                        )
+                        row_pk = _max_bf16x2(p0, p1)
+                        peer_pk = cute.arch.shuffle_sync(row_pk, offset=lane ^ 1)
+                        row_pk = _max_bf16x2(row_pk, peer_pk)
+                        row_amax = _bits_f32(_max_u32(row_pk << 16, row_pk & cutlass.Uint32(_HI16)))
+                        row_scaled = row_amax * (row_inv_pts * Float32(INV6))
+                        row_scaled = cutlass.max(
+                            cutlass.min(row_scaled, Float32(E4M3_MAX)),
+                            Float32(E4M3_EPS),
+                        )
+                        row_sfu8[0] = cutlass.Uint8(_cvt_e4m3_rn(row_scaled) & 0xFF)
+                        row_recip = _div_rn(Float32(1.0), row_sf[0].to(Float32) * row_pts)
+                        for ii in cutlass.range_constexpr(0, 8, 2):
+                            row_vals[ii], row_vals[ii + 1] = cute.arch.mul_packed_f32x2(
+                                (row_vals[ii], row_vals[ii + 1]),
+                                (row_recip, row_recip),
+                                rnd="rn",
+                                ftz=False,
+                            )
+                        if const_expr(self.rounding == "sr"):
+                            out_row = row0 + lt * 128 + g * 16 + row
+                            counter = (
+                                cutlass.Uint64(out_row) << cutlass.Uint64(32)
+                            ) | cutlass.Uint64(f0 // 16 + wi)
+                            random_words = philox(counter, cutlass.Uint32(seed))
+                            for j4 in cutlass.range_constexpr(2):
+                                random_word = random_words[j4]
+                                if half != 0:
+                                    random_word = random_words[2 + j4]
+                                packed = cvt_f32x4_e2m1x4_rs(
+                                    row_vals[4 * j4],
+                                    row_vals[4 * j4 + 1],
+                                    row_vals[4 * j4 + 2],
+                                    row_vals[4 * j4 + 3],
+                                    random_word,
+                                )
+                                row_bytes[2 * j4] = cutlass.Uint8(packed & 0xFF)
+                                row_bytes[2 * j4 + 1] = cutlass.Uint8((packed >> 8) & 0xFF)
+                        else:
+                            for bb in cutlass.range_constexpr(4):
+                                row_bytes[bb] = cutlass.Uint8(
+                                    _cvt_e2m1_pair_rn(row_vals[2 * bb + 1], row_vals[2 * bb]) & 0xFF
+                                )
+                        tile_row = g * 16 + row
+                        for bb in cutlass.range_constexpr(4):
+                            sRowQ[tile_row, wi * 8 + half * 4 + bb] = row_bytes[bb]
+                        if half == 0:
+                            sRowQ[tile_row, 64 + wi] = row_sfu8[0]
                     rC = cute.make_fragment_like(racc, cutlass.BFloat16)
                     rC.store(racc.load().to(cutlass.BFloat16))
                     if const_expr(self.mode == "amax"):
@@ -425,7 +559,7 @@ class NVFP4QuantKernel:
                     else:
                         cute.arch.sync_warp()
                         cute.copy(tiled_st_c, tiled_st_c.retile(rC), thr_st_c.partition_D(sA))
-                if const_expr(self.mode == "col"):
+                if const_expr(self.mode in ("col", "dual")):
                     cute.arch.sync_threads()
 
             atom_q = cute.make_copy_atom(
@@ -449,6 +583,49 @@ class NVFP4QuantKernel:
             )
             lay16 = cute.make_layout(16)
             a8u = cute.make_rmem_tensor(lay8, cutlass.Uint32)
+            if const_expr(self.mode == "dual"):
+                row_q_stride = mRowQ.stride[0]
+                row_word = cute.make_rmem_tensor(lay16, cutlass.Uint8)
+                for i in cutlass.range_constexpr(2):
+                    c = tidx + i * NUM_THREADS
+                    r2 = c // 4
+                    c16 = c % 4
+                    if r2 < valid_rows:
+                        row_store_src = cute.make_tensor(
+                            sRowQ.iterator + cute.assume(r2 * 80 + c16 * 16, divby=16),
+                            lay16,
+                        )
+                        cute.copy(atom_q16, row_store_src, row_word)
+                        row_store_dst = cute.make_tensor(
+                            mRowQ.iterator
+                            + cute.assume(
+                                (row0 + lt * 128 + r2) * row_q_stride + f0 // 2 + c16 * 16,
+                                divby=16,
+                            ),
+                            lay16,
+                        )
+                        cute.copy(atom_q16, row_word, row_store_dst)
+                r2 = tidx // 2
+                atom = tidx % 2
+                if r2 < valid_rows:
+                    row_sf4 = cute.make_rmem_tensor(lay4, cutlass.Uint8)
+                    row_sf_src = cute.make_tensor(
+                        sRowQ.iterator + cute.assume(r2 * 80 + 64 + atom * 4, divby=4),
+                        lay4,
+                    )
+                    cute.copy(atom_sf, row_sf_src, row_sf4)
+                    row_sf_tile = row0 // 128 + e_found + lt
+                    row_sf_base = (
+                        row_sf_tile * (F // 64) * 512
+                        + (f0 // 64 + atom) * 512
+                        + (r2 % 32) * 16
+                        + (r2 // 32) * 4
+                    )
+                    row_sf_dst = cute.make_tensor(
+                        mRowSF.iterator + cute.assume(row_sf_base, divby=4),
+                        lay4,
+                    )
+                    cute.copy(atom_sf, row_sf4, row_sf_dst)
             if const_expr(self.mode == "amax"):
                 # CTA tree-reduce (row_amax, col_amax) -> one partial
                 # pair per CTA; the host reduces partials with torch.amax
@@ -458,30 +635,41 @@ class NVFP4QuantKernel:
                 # one integer max merges the halves exactly
                 row_amax = _bits_f32(_max_u32(row_pk << 16, row_pk & cutlass.Uint32(_HI16)))
                 col_amax = _bits_f32(_max_u32(col_pk << 16, col_pk & cutlass.Uint32(_HI16)))
-                sRed[tidx, 0] = row_amax
-                sRed[tidx, 1] = col_amax
+                lane = tidx % 32
+                warp = tidx // 32
+                for off in (16, 8, 4, 2, 1):
+                    row_peer = cute.arch.shuffle_sync(row_amax, offset=lane ^ off)
+                    col_peer = cute.arch.shuffle_sync(col_amax, offset=lane ^ off)
+                    row_amax = cutlass.max(row_amax, row_peer)
+                    col_amax = cutlass.max(col_amax, col_peer)
+                if lane == 0:
+                    sRed[warp, 0] = row_amax
+                    sRed[warp, 1] = col_amax
                 cute.arch.sync_threads()
-                for off in (128, 64, 32, 16, 8, 4, 2, 1):
-                    if tidx < off:
-                        sRed[tidx, 0] = cutlass.max(sRed[tidx, 0], sRed[tidx + off, 0])
-                        sRed[tidx, 1] = cutlass.max(sRed[tidx, 1], sRed[tidx + off, 1])
-                    cute.arch.sync_threads()
-                if tidx == 0:
-                    pi = p * (F // F_TILE_C) + fi
-                    mQ[pi, 0] = sRed[0, 0]
-                    mQ[pi, 1] = sRed[0, 1]
-            elif const_expr(self.mode == "col"):
+                if warp == 0:
+                    row_amax = Float32(0.0)
+                    col_amax = Float32(0.0)
+                    if lane < NUM_THREADS // 32:
+                        row_amax = sRed[lane, 0]
+                        col_amax = sRed[lane, 1]
+                    for off in (16, 8, 4, 2, 1):
+                        row_peer = cute.arch.shuffle_sync(row_amax, offset=lane ^ off)
+                        col_peer = cute.arch.shuffle_sync(col_amax, offset=lane ^ off)
+                        row_amax = cutlass.max(row_amax, row_peer)
+                        col_amax = cutlass.max(col_amax, col_peer)
+                    if lane == 0:
+                        pi = p * (F // F_TILE_C) + fi
+                        mQ[pi, 0] = row_amax
+                        mQ[pi, 1] = col_amax
+            elif const_expr(self.mode in ("col", "dual")):
                 # thread = (feature col, token half); 4 groups of 16 tokens.
                 # One scalar read pass feeds a depth-5 amax tree.
-                f = f0 + tidx % 128
-                half = tidx // 128
-                pc = tidx % 128
+                f = f0 + tidx % F_TILE_C
+                half = tidx // F_TILE_C
+                pc = tidx % F_TILE_C
                 if f < F:
                     for gg in cutlass.range_constexpr(4):
                         g = half * 4 + gg
-                        # convert = one shl per element (int pipe); amax =
-                        # abs-masked u32 max tree (int pipe) - bitwise an
-                        # f32 cvt/neg/max chain
                         for tt in cutlass.range_constexpr(16):
                             q32[tt] = _bits_f32(sZu[g * 16 + tt, pc].to(cutlass.Uint32) << 16)
                         for i2 in cutlass.range_constexpr(8):
@@ -492,17 +680,14 @@ class NVFP4QuantKernel:
                         for i2 in cutlass.range_constexpr(4):
                             a8u[i2] = _max_u32(a8u[i2], a8u[i2 + 4])
                         amax = _bits_f32(
-                            _max_u32(_max_u32(a8u[0], a8u[1]), _max_u32(a8u[2], a8u[3]))
+                            _max_u32(
+                                _max_u32(a8u[0], a8u[1]),
+                                _max_u32(a8u[2], a8u[3]),
+                            )
                         )
                         if const_expr(self.emit_amax):
-                            # every quantized group's amax is already in hand
-                            # (post-RHT when rht=True): fold the CTA max for
-                            # the delayed-recipe partial (bitwise the value
-                            # the mode="amax" pre-pass computes for this tile)
                             cta_amax = cutlass.max(cta_amax, amax)
                         if const_expr(self.rht):
-                            # Match TE: sf=min(vec_max*ges/6, 448), without a
-                            # lower clamp, and recip=min(1/(sf*gds), f32max).
                             scaled = cutlass.min(_abs_f32(amax) * pts, Float32(E4M3_MAX))
                         else:
                             bs = _div_rn(amax, Float32(F4_MAX))
@@ -524,13 +709,13 @@ class NVFP4QuantKernel:
                             )
                         else:
                             recip = _div_rn(inv_pts, sf1[0].to(Float32))
-                        # no +-6 clamp: both e2m1 converters are .satfinite
-                        # (|v| > 6 incl inf -> sign|0x7, bitwise the
-                        # clamp-then-convert result; NaN cannot arise -
-                        # recip is finite by construction in both scale
-                        # chains)
-                        for tt in cutlass.range_constexpr(16):
-                            q32[tt] = q32[tt] * recip
+                        for tt in cutlass.range_constexpr(0, 16, 2):
+                            q32[tt], q32[tt + 1] = cute.arch.mul_packed_f32x2(
+                                (q32[tt], q32[tt + 1]),
+                                (recip, recip),
+                                rnd="rn",
+                                ftz=False,
+                            )
                         if const_expr(self.rounding == "sr"):
                             tg = colpad0 // 16 + lt * 8 + g
                             ctr = (cutlass.Uint64(f) << cutlass.Uint64(32)) | cutlass.Uint64(tg)
@@ -569,12 +754,38 @@ class NVFP4QuantKernel:
                     w4 = cute.make_rmem_tensor(lay4, cutlass.Uint8)
                     for bb in cutlass.range_constexpr(4):
                         w4[bb] = sfbytes[bb]
-                    dsf = cute.make_tensor(
-                        mSF.iterator + cute.assume(base + (lt * 2 + half) * 512, divby=4),
-                        lay4,
-                    )
+                    if const_expr(self.mode == "dual"):
+                        sf_local = half * 512 + (pc % 32) * 16 + (pc // 32) * 4
+                        dsf = cute.make_tensor(
+                            sColSF.iterator + cute.assume(sf_local, divby=4), lay4
+                        )
+                    else:
+                        dsf = cute.make_tensor(
+                            mSF.iterator + cute.assume(base + (lt * 2 + half) * 512, divby=4),
+                            lay4,
+                        )
                     cute.copy(atom_sf, w4, dsf)
                 cute.arch.sync_threads()
+                if const_expr(self.mode == "dual"):  # noqa: SIM102
+                    if tidx < 64:
+                        sf_half = Int32(tidx // 32)
+                        sf_chunk = Int32(tidx % 32)
+                        sf_word = cute.make_rmem_tensor(lay16, cutlass.Uint8)
+                        sf_src = cute.make_tensor(
+                            sColSF.iterator + cute.assume(sf_half * 512 + sf_chunk * 16, divby=16),
+                            lay16,
+                        )
+                        cute.copy(atom_q16, sf_src, sf_word)
+                        sf_base = (
+                            F * (colpad0 // 16)
+                            + (f0 // 128) * (nt_e * 2) * 512
+                            + (lt * 2 + sf_half) * 512
+                            + sf_chunk * 16
+                        )
+                        sf_dst = cute.make_tensor(
+                            mSF.iterator + cute.assume(sf_base, divby=16), lay16
+                        )
+                        cute.copy(atom_q16, sf_word, sf_dst)
                 # cooperative qdata store: 16B chunks, 64B contiguous per row
                 w16 = cute.make_rmem_tensor(lay16, cutlass.Uint8)
                 for i in cutlass.range_constexpr(F_TILE_C * 4 // NUM_THREADS):
@@ -583,8 +794,7 @@ class NVFP4QuantKernel:
                     c16 = c % 4
                     if f0 + r2 < F:
                         src = cute.make_tensor(
-                            sQ.iterator + cute.assume(r2 * 80 + c16 * 16, divby=16),
-                            lay16,
+                            sQ.iterator + cute.assume(r2 * 80 + c16 * 16, divby=16), lay16
                         )
                         cute.copy(atom_q16, src, w16)
                         dq2 = cute.make_tensor(
@@ -650,8 +860,11 @@ class NVFP4QuantKernel:
                             )
                             pk = _max_bf16x2(_max_bf16x2(t0, t1), _max_bf16x2(t2, t3))
                             amax = _bits_f32(_max_u32(pk << 16, pk & cutlass.Uint32(_HI16)))
-                            bs = _div_rn(amax, Float32(F4_MAX))
-                            scaled = _div_rn(bs, pts)
+                            if const_expr(self.te_row_math):
+                                scaled = amax * (inv_pts * Float32(INV6))
+                            else:
+                                bs = _div_rn(amax, Float32(F4_MAX))
+                                scaled = _div_rn(bs, pts)
                             scaled = cutlass.max(
                                 cutlass.min(scaled, Float32(E4M3_MAX)), Float32(E4M3_EPS)
                             )
@@ -660,9 +873,17 @@ class NVFP4QuantKernel:
                                 cute.make_layout(1),
                             )
                             sf1u8[0] = cutlass.Uint8(_cvt_e4m3_rn(scaled) & 0xFF)
-                            recip = _div_rn(inv_pts, sf1[0].to(Float32))
-                            for tt in cutlass.range_constexpr(16):
-                                q32[tt] = q32[tt] * recip
+                            if const_expr(self.te_row_math):
+                                recip = _div_rn(Float32(1.0), sf1[0].to(Float32) * pts)
+                            else:
+                                recip = _div_rn(inv_pts, sf1[0].to(Float32))
+                            for tt in cutlass.range_constexpr(0, 16, 2):
+                                q32[tt], q32[tt + 1] = cute.arch.mul_packed_f32x2(
+                                    (q32[tt], q32[tt + 1]),
+                                    (recip, recip),
+                                    rnd="rn",
+                                    ftz=False,
+                                )
                             if const_expr(self.rounding == "sr"):
                                 orow = row0 + lt * 128 + r
                                 ctr = (cutlass.Uint64(orow) << cutlass.Uint64(32)) | cutlass.Uint64(
@@ -718,9 +939,14 @@ class NVFP4QuantKernel:
                                 lay4,
                             )
                             cute.copy(atom_sf, ssf, sf4)
-                            base = sftile * rk_tot * 512 + (r2 % 32) * 16 + (r2 // 32) * 4
+                            base = (
+                                sftile * rk_tot * 512
+                                + (f0 // 64 + atom) * 512
+                                + (r2 % 32) * 16
+                                + (r2 // 32) * 4
+                            )
                             dsf = cute.make_tensor(
-                                mSF.iterator + cute.assume(base + (f0 // 64 + atom) * 512, divby=4),
+                                mSF.iterator + cute.assume(base, divby=4),
                                 lay4,
                             )
                             cute.copy(atom_sf, sf4, dsf)
@@ -751,14 +977,23 @@ class NVFP4QuantKernel:
             # reduces the exact grid slice without a zero-fill kernel).
             # _abs_f32 pins the zero sign: PTX max.f32 does not define it,
             # and the pre-pass partial must remain bitwise +0.0.
-            sRedE[tidx] = cta_amax
+            lane = tidx % 32
+            warp = tidx // 32
+            for off in (16, 8, 4, 2, 1):
+                peer = cute.arch.shuffle_sync(cta_amax, offset=lane ^ off)
+                cta_amax = cutlass.max(cta_amax, peer)
+            if lane == 0:
+                sRedE[warp] = cta_amax
             cute.arch.sync_threads()
-            for off in (128, 64, 32, 16, 8, 4, 2, 1):
-                if tidx < off:
-                    sRedE[tidx] = cutlass.max(sRedE[tidx], sRedE[tidx + off])
-                cute.arch.sync_threads()
-            if tidx == 0:
-                mAmaxOut[p * (F // F_TILE_C) + fi] = _abs_f32(sRedE[0])
+            if warp == 0:
+                cta_amax = Float32(0.0)
+                if lane < NUM_THREADS // 32:
+                    cta_amax = sRedE[lane]
+                for off in (16, 8, 4, 2, 1):
+                    peer = cute.arch.shuffle_sync(cta_amax, offset=lane ^ off)
+                    cta_amax = cutlass.max(cta_amax, peer)
+                if lane == 0:
+                    mAmaxOut[p * (F // F_TILE_C) + fi] = _abs_f32(cta_amax)
 
     @staticmethod
     @jit_cache
@@ -770,10 +1005,13 @@ class NVFP4QuantKernel:
         sf_layout="blocked",
         rht=False,
         emit_amax=False,
+        te_row_math=False,
         has_tile_offsets=False,
         experts=0,
     ):
-        rows, F_sym, qm, qn, sfn, m_sym, ep1, am = (cute.sym_int() for _ in range(8))
+        rows, F_sym, qm, qn, sfn, m_sym, ep1, am, rqm, rqn, rsfn = (
+            cute.sym_int() for _ in range(11)
+        )
         mZ = fake_tensor(in_dtype, (rows, F_sym), 8)
         mGidx = fake_tensor(Int32, (m_sym,), 1) if gather else None
         mCu = fake_tensor(Int32, (experts + 1 if has_tile_offsets else ep1,), 1)
@@ -784,9 +1022,17 @@ class NVFP4QuantKernel:
             mPts = None
         else:
             mQ = fake_tensor(cutlass.Uint8, (qm, qn), 16)  # 16B store chunks
-            mSF = fake_tensor(cutlass.Uint8, (sfn,), 8)  # linear: 8B stores
+            mSF = fake_tensor(cutlass.Uint8, (sfn,), 16)
             mPts = fake_tensor(Float32, (2,), 1)
         mAmaxOut = fake_tensor(Float32, (am,), 1) if emit_amax else None
+        if mode == "dual":
+            mRowQ = fake_tensor(cutlass.Uint8, (rqm, rqn), 16)
+            mRowSF = fake_tensor(cutlass.Uint8, (rsfn,), 8)
+            mRowPts = fake_tensor(Float32, (2,), 1)
+        else:
+            mRowQ = None
+            mRowSF = None
+            mRowPts = None
         need_h = rht or mode == "amax"
         mH = fake_tensor(cutlass.BFloat16, (16, 16), 16) if need_h else None
         return cute.compile(
@@ -798,6 +1044,7 @@ class NVFP4QuantKernel:
                 sf_layout,
                 rht,
                 emit_amax,
+                te_row_math,
                 has_tile_offsets,
                 experts,
             ),
@@ -810,6 +1057,9 @@ class NVFP4QuantKernel:
             mH,
             mPts,
             mAmaxOut,
+            mRowQ,
+            mRowSF,
+            mRowPts,
             Int32(1),
             Int32(16),
             Int32(0),
@@ -869,6 +1119,7 @@ def nvfp4_rht_amax(
         "blocked",
         False,
         False,
+        False,
         padded_offsets is not None,
         E,
     )(
@@ -879,6 +1130,9 @@ def nvfp4_rht_amax(
         partials,
         None,
         rht_matrix(z.device),
+        None,
+        None,
+        None,
         None,
         None,
         n_tiles,
@@ -923,6 +1177,7 @@ def nvfp4_quantize_rowwise(
     seed: int = 0,
     sf_layout: str = "blocked",
     padded_offsets: Tensor | None = None,
+    te_math: bool = False,
 ):
     """Quantize expert-ordered rows, optionally gathering source rows from ``z``."""
     F = z.shape[1]
@@ -941,6 +1196,7 @@ def nvfp4_quantize_rowwise(
         sf_layout,
         False,
         False,
+        te_math,
         padded_offsets is not None,
         E,
     )(
@@ -952,6 +1208,9 @@ def nvfp4_quantize_rowwise(
         sf_out.view(torch.uint8).view(-1),
         None,
         pts2,
+        None,
+        None,
+        None,
         None,
         n_tiles,
         F,
@@ -1008,6 +1267,7 @@ def nvfp4_quantize_colwise(
         "blocked",
         rht,
         amax_out is not None,
+        False,
         padded_offsets is not None,
         E,
     )(
@@ -1020,6 +1280,66 @@ def nvfp4_quantize_colwise(
         rht_matrix(z.device) if rht else None,
         pts2,
         amax_out,
+        None,
+        None,
+        None,
+        n_tiles,
+        F,
+        int(seed) & 0x7FFFFFFF,
+    )
+
+
+def nvfp4_quantize_row_colwise(
+    z: Tensor,
+    cu: Tensor,
+    row_pts,
+    col_pts,
+    row_q: Tensor,
+    row_sf: Tensor,
+    col_q: Tensor,
+    col_sf: Tensor,
+    gather_idx: Tensor | None = None,
+    rounding: str = "rn",
+    seed: int = 0,
+    amax_out: Tensor | None = None,
+    padded_offsets: Tensor | None = None,
+):
+    """Quantize rowwise and post-RHT columnwise from one staged BF16 tile."""
+    F = z.shape[1]
+    assert F % 128 == 0 and z.stride(-1) == 1
+    assert z.dtype == torch.bfloat16
+    E = cu.numel() - 1
+    _check_padded_offsets(padded_offsets, cu, E)
+    M = int(gather_idx.numel()) if gather_idx is not None else z.shape[0]
+    row_pts2 = _prep(row_pts)
+    col_pts2 = _prep(col_pts)
+    n_tiles = -(-M // 128) + E
+    if amax_out is not None:
+        assert amax_out.dtype == torch.float32 and amax_out.numel() >= n_tiles * (F // 128)
+    NVFP4QuantKernel.compile(
+        torch2cute_dtype_map[z.dtype],
+        "dual",
+        gather_idx is not None,
+        rounding,
+        "blocked",
+        True,
+        amax_out is not None,
+        False,
+        padded_offsets is not None,
+        E,
+    )(
+        z,
+        gather_idx,
+        cu,
+        padded_offsets,
+        col_q.view(torch.uint8),
+        col_sf.view(torch.uint8).view(-1),
+        rht_matrix(z.device),
+        col_pts2,
+        amax_out,
+        row_q.view(torch.uint8),
+        row_sf.view(torch.uint8).view(-1),
+        row_pts2,
         n_tiles,
         F,
         int(seed) & 0x7FFFFFFF,

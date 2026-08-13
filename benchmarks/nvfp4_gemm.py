@@ -12,6 +12,7 @@ import argparse
 import importlib
 import importlib.util
 import json
+import random
 import statistics
 import time
 from collections.abc import Callable
@@ -43,7 +44,15 @@ except ImportError:
     )
 
 
-BACKEND_NAMES = ("native", "torch_scaled_grouped_mm", "te_nvfp4", "cutlass", "cublaslt")
+BACKEND_NAMES = (
+    "native",
+    "flashinfer_cutedsl",
+    "torch_scaled_grouped_mm",
+    "te_nvfp4",
+    "cutlass",
+    "cublaslt",
+)
+DENSE_BACKEND_NAMES = ("native", "native_grouped", "cublaslt")
 DIRECTIONS = ("fwd", "dgrad", "wgrad")
 MODES = ("prepacked", "dynamic")
 
@@ -58,11 +67,36 @@ class BackendStatus:
     reason: str
 
 
+@dataclass(frozen=True)
+class DenseCase:
+    model: str
+    projection: str
+    m: int
+    n: int
+    k: int
+
+    @property
+    def label(self) -> str:
+        return f"{self.model}:{self.projection}:m{self.m}:n{self.n}:k{self.k}"
+
+    @property
+    def flops(self) -> int:
+        return 2 * self.m * self.n * self.k
+
+
 def _module_exists(name: str) -> bool:
     try:
         return importlib.util.find_spec(name) is not None
     except (ImportError, ModuleNotFoundError, ValueError):
         return False
+
+
+def _dense_cublas_available() -> bool:
+    try:
+        from torch.nn.functional import ScalingType, SwizzleType, scaled_mm
+    except (ImportError, AttributeError):
+        return False
+    return callable(scaled_mm) and ScalingType is not None and SwizzleType is not None
 
 
 def detect_backends() -> dict[str, BackendStatus]:
@@ -103,12 +137,30 @@ def detect_backends() -> dict[str, BackendStatus]:
     torch_discovered = callable(scaled)
     torch_reason = cuda_reason or arch_reason
     if torch_discovered and cuda_ready and blackwell:
-        torch_reason = (
-            "callable found, but no stable public NVFP4 packing adapter was detected; "
-            "use the installed PyTorch benchmark for its exact scaling recipe"
-        )
+        torch_reason = "PyTorch scaled_grouped_mm with NVFP4 block scales"
     elif not torch_discovered:
         torch_reason = "torch.nn.functional.scaled_grouped_mm is not present"
+
+    flashinfer_discovered = _module_exists("flashinfer")
+    flashinfer_runnable = False
+    flashinfer_reason = "flashinfer is not installed"
+    if flashinfer_discovered:
+        try:
+            flashinfer = importlib.import_module("flashinfer")
+            flashinfer_gemm = importlib.import_module("flashinfer.cute_dsl.blockscaled_gemm")
+            flashinfer_runnable = (
+                cuda_ready
+                and sm100
+                and callable(getattr(flashinfer, "scaled_fp4_grouped_quantize", None))
+                and callable(getattr(flashinfer_gemm, "grouped_gemm_nt_masked", None))
+            )
+            flashinfer_reason = (
+                "FlashInfer CuTe DSL grouped_gemm_nt_masked"
+                if flashinfer_runnable
+                else "FlashInfer grouped NVFP4 callable is missing or the GPU is not SM100"
+            )
+        except Exception as exc:  # noqa: BLE001
+            flashinfer_reason = f"FlashInfer import failed: {type(exc).__name__}: {exc}"
 
     te_discovered = False
     te_runnable = False
@@ -177,10 +229,18 @@ def detect_backends() -> dict[str, BackendStatus]:
             DIRECTIONS,
             native_reason or "native grouped NVFP4 kernels",
         ),
+        "flashinfer_cutedsl": BackendStatus(
+            "flashinfer_cutedsl",
+            flashinfer_discovered,
+            flashinfer_runnable,
+            ("prepacked",),
+            ("fwd",),
+            flashinfer_reason,
+        ),
         "torch_scaled_grouped_mm": BackendStatus(
             "torch_scaled_grouped_mm",
             torch_discovered,
-            False,
+            torch_discovered and cuda_ready and sm100 and flashinfer_runnable,
             ("prepacked",),
             ("fwd",),
             torch_reason,
@@ -219,21 +279,115 @@ def _measure_cuda(fn: Callable[[], object], warmup: int, iterations: int) -> dic
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
-    samples = []
-    for _ in range(iterations):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+    events = [
+        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        for _ in range(iterations)
+    ]
+    wall_start = time.perf_counter()
+    for start, end in events:
         start.record()
         fn()
         end.record()
-        end.synchronize()
-        samples.append(start.elapsed_time(end))
+    torch.cuda.synchronize()
+    wall_ms = (time.perf_counter() - wall_start) * 1e3
+    samples = [start.elapsed_time(end) for start, end in events]
+    return _summarize_cuda_samples(samples, wall_ms, sum(samples))
+
+
+def _summarize_cuda_samples(
+    samples: list[float],
+    wall_ms: float,
+    health_gpu_ms: float,
+) -> dict[str, float | int | bool]:
     ordered = sorted(samples)
+
+    def percentile(fraction: float) -> float:
+        return ordered[round(fraction * (len(ordered) - 1))]
+
+    gpu_ms = sum(samples)
+    p25 = percentile(0.25)
+    p75 = percentile(0.75)
     return {
         "event_ms_p50": statistics.median(samples),
-        "event_ms_p95": ordered[min(len(ordered) - 1, int(0.95 * (len(ordered) - 1)))],
+        "event_ms_p10": percentile(0.10),
+        "event_ms_p25": p25,
+        "event_ms_p75": p75,
+        "event_ms_p90": percentile(0.90),
+        "event_ms_p95": percentile(0.95),
+        "event_ms_iqr": p75 - p25,
         "event_ms_min": min(samples),
-        "iterations": iterations,
+        "wall_ms": wall_ms,
+        "summed_gpu_ms": gpu_ms,
+        "wall_to_gpu": wall_ms / health_gpu_ms,
+        "health_valid": wall_ms / health_gpu_ms <= 1.5,
+        "iterations": len(samples),
+    }
+
+
+def _measure_cuda_interleaved(
+    functions: dict[str, Callable[[], object]],
+    warmup: int,
+    iterations: int,
+    stabilize_ms: float,
+) -> dict[str, dict[str, float | int | bool]]:
+    import torch
+
+    names = tuple(functions)
+
+    def order(step: int) -> tuple[str, ...]:
+        shuffled = list(names)
+        random.Random(20260812 + step).shuffle(shuffled)
+        return tuple(shuffled)
+
+    for fn in functions.values():
+        fn()
+    for step in range(warmup):
+        for name in order(step):
+            functions[name]()
+    torch.cuda.synchronize()
+
+    if stabilize_ms:
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
+        elapsed = 0.0
+        step = 0
+        while elapsed < stabilize_ms:
+            for _ in range(16):
+                for name in order(step):
+                    functions[name]()
+                step += 1
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            end.synchronize()
+            elapsed = start.elapsed_time(end)
+
+    events = {
+        name: [
+            (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            for _ in range(iterations)
+        ]
+        for name in names
+    }
+    wall_start = time.perf_counter()
+    for step in range(iterations):
+        for name in order(step):
+            begin, end = events[name][step]
+            begin.record()
+            functions[name]()
+            end.record()
+    torch.cuda.synchronize()
+    wall_ms = (time.perf_counter() - wall_start) * 1e3
+    samples = {
+        name: [begin.elapsed_time(end) for begin, end in pairs] for name, pairs in events.items()
+    }
+    total_gpu_ms = sum(sum(values) for values in samples.values())
+    return {
+        name: _summarize_cuda_samples(
+            values,
+            wall_ms * sum(values) / total_gpu_ms,
+            total_gpu_ms * sum(values) / total_gpu_ms,
+        )
+        for name, values in samples.items()
     }
 
 
@@ -384,6 +538,320 @@ def _native_case(
     }
 
 
+@dataclass
+class _GroupedArm:
+    call: Callable[[], object]
+    result: dict[str, object]
+
+
+def _grouped_accuracy(output, a_groups, weights) -> dict[str, float | bool]:
+    import torch
+
+    actual_rows = []
+    reference_rows = []
+    offset = 0
+    for expert, a in enumerate(a_groups):
+        rows = min(2, a.shape[0])
+        if rows:
+            actual_rows.append(output[offset : offset + rows].float())
+            reference_rows.append(a[:rows].float() @ weights[expert].float().T)
+        offset += a.shape[0]
+    actual = torch.cat(actual_rows)
+    reference = torch.cat(reference_rows)
+    cosine = torch.nn.functional.cosine_similarity(actual.flatten(), reference.flatten(), dim=0)
+    rmse = (actual - reference).square().mean().sqrt()
+    return {
+        "finite": bool(torch.isfinite(output).all()),
+        "sample_cosine": float(cosine),
+        "sample_rmse": float(rmse),
+    }
+
+
+def _prepare_grouped_frontier(
+    case: GemmCase,
+    selected: tuple[str, ...],
+    args: argparse.Namespace,
+) -> tuple[dict[str, _GroupedArm], dict[str, dict[str, str]]]:
+    import torch
+
+    from nvfp4moe.kernels.gemm import grouped_nvfp4_gemm
+    from nvfp4moe.kernels.quantize import nvfp4_quantize_rowwise
+    from nvfp4moe.layer import _quant_expert_stack
+    from nvfp4moe.recipe import _DEN
+
+    torch.manual_seed(20260812)
+    counts_cpu = routing_counts(case.routed_rows, case.local_experts, case.routing)
+    counts = torch.tensor(counts_cpu, dtype=torch.int32, device="cuda")
+    cu = torch.cat((counts.new_zeros(1), counts.cumsum(0, dtype=torch.int32)))
+    scale = case.k**-0.5
+    a_groups = [
+        (torch.randn(rows, case.k, dtype=torch.bfloat16, device="cuda") * scale).contiguous()
+        for rows in counts_cpu
+    ]
+    a = torch.cat(a_groups)
+    weights = (
+        torch.randn(
+            case.local_experts,
+            case.n,
+            case.k,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * scale
+    ).contiguous()
+    pts_a = (a.abs().amax().float() / _DEN).clamp_min(1e-30).reshape(1)
+    pts_b = (weights.abs().amax().float() / _DEN).clamp_min(1e-30).reshape(1)
+    arms: dict[str, _GroupedArm] = {}
+    failures: dict[str, dict[str, str]] = {}
+
+    if "native" in selected:
+        qa_u8 = torch.empty(case.routed_rows, case.k // 2, dtype=torch.uint8, device="cuda")
+        sf_rows = -(-case.routed_rows // 128) + case.local_experts
+        sfa = torch.zeros(
+            1,
+            sf_rows,
+            case.k // 64,
+            32,
+            4,
+            4,
+            dtype=torch.float8_e4m3fn,
+            device="cuda",
+        )
+        nvfp4_quantize_rowwise(
+            a,
+            cu,
+            torch.cat((pts_a, pts_a.reciprocal())),
+            qa_u8,
+            sfa,
+        )
+        qb, sfb = _quant_expert_stack(
+            [weights[expert] for expert in range(case.local_experts)],
+            pts_b,
+        )
+        qa = qa_u8.view(torch.float4_e2m1fn_x2)
+        out = torch.empty(case.routed_rows, case.n, dtype=torch.bfloat16, device="cuda")
+        tile_ms = (args.tile_m,) if args.tile_m else (128, 256)
+        tile_ns = (args.tile_n,) if args.tile_n else ((128, 256) if case.n % 256 == 0 else (128,))
+        runtimes = {
+            (tile_m, tile_n): grouped_nvfp4_gemm(
+                case.local_experts,
+                case.n,
+                case.k,
+                tile_m,
+                tile_n,
+            )
+            for tile_m in tile_ms
+            for tile_n in tile_ns
+        }
+
+        def native_call(runtime):
+            runtime(qa, qb, out, cu, sfa, sfb, pts_a * pts_b)
+            return out
+
+        candidate_timings = _measure_cuda_interleaved(
+            {
+                f"{tile_m}x{tile_n}": (lambda runtime=runtime: native_call(runtime))
+                for (tile_m, tile_n), runtime in runtimes.items()
+            },
+            1,
+            10,
+            min(args.stabilize_ms, 50.0),
+        )
+        tile_m, tile_n = min(
+            runtimes,
+            key=lambda value: float(candidate_timings[f"{value[0]}x{value[1]}"]["event_ms_p50"]),
+        )
+        runtime = runtimes[(tile_m, tile_n)]
+        arms["native"] = _GroupedArm(
+            lambda: native_call(runtime),
+            {
+                "status": "ok",
+                "config": {"tile_m": tile_m, "tile_n": tile_n},
+                **_grouped_accuracy(native_call(runtime), a_groups, weights),
+            },
+        )
+
+    needs_flashinfer = bool({"flashinfer_cutedsl", "torch_scaled_grouped_mm"} & set(selected))
+    if needs_flashinfer:
+        try:
+            from flashinfer import scaled_fp4_grouped_quantize
+            from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
+
+            max_m = max(counts_cpu)
+            a_padded = torch.zeros(
+                case.local_experts,
+                max_m,
+                case.k,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            for expert, expert_a in enumerate(a_groups):
+                a_padded[expert, : expert_a.shape[0]].copy_(expert_a)
+            global_a = pts_a.reciprocal().expand(case.local_experts).contiguous()
+            global_b = pts_b.reciprocal().expand(case.local_experts).contiguous()
+            qa_fi, sfa_fi = scaled_fp4_grouped_quantize(a_padded, counts, global_a)
+            full_n = torch.full_like(counts, case.n)
+            qb_fi, sfb_fi = scaled_fp4_grouped_quantize(weights, full_n, global_b)
+            alpha = (pts_a * pts_b).expand(case.local_experts).contiguous()
+            out_fi = torch.empty(
+                case.local_experts,
+                max_m,
+                case.n,
+                dtype=torch.bfloat16,
+                device="cuda",
+            ).permute(1, 2, 0)
+
+            def flashinfer_call():
+                grouped_gemm_nt_masked(
+                    (qa_fi, sfa_fi),
+                    (qb_fi, sfb_fi),
+                    out_fi,
+                    counts,
+                    ab_dtype="float4_e2m1fn",
+                    sf_dtype="float8_e4m3fn",
+                    c_dtype="bfloat16",
+                    sf_vec_size=16,
+                    alpha=alpha,
+                    alpha_dtype="float32",
+                )
+                return out_fi
+
+            if "flashinfer_cutedsl" in selected:
+                flashinfer_call()
+                fi_concat = torch.cat(
+                    [out_fi[:rows, :, expert] for expert, rows in enumerate(counts_cpu)]
+                )
+                arms["flashinfer_cutedsl"] = _GroupedArm(
+                    flashinfer_call,
+                    {
+                        "status": "ok",
+                        "config": {"mma_tiler_mn": [128, 128]},
+                        **_grouped_accuracy(fi_concat, a_groups, weights),
+                    },
+                )
+
+            if "torch_scaled_grouped_mm" in selected:
+                if any(rows % 128 for rows in counts_cpu):
+                    failures["torch_scaled_grouped_mm"] = {
+                        "status": "skipped",
+                        "reason": "PyTorch NVFP4 grouped GEMM requires 128-row aligned groups",
+                    }
+                else:
+                    from torch.nn.functional import ScalingType, SwizzleType, scaled_grouped_mm
+
+                    qa_physical = qa_fi.permute(2, 0, 1)
+                    qa_torch = torch.cat(
+                        [qa_physical[expert, :rows] for expert, rows in enumerate(counts_cpu)]
+                    ).view(torch.float4_e2m1fn_x2)
+                    qb_torch = qb_fi.permute(2, 0, 1).view(torch.float4_e2m1fn_x2)
+                    sfa_torch = sfa_fi.permute(5, 2, 4, 0, 1, 3).reshape(-1, case.k // 16)
+                    sfb_torch = sfb_fi.permute(5, 2, 4, 0, 1, 3).flatten(1)
+
+                    def torch_call():
+                        return scaled_grouped_mm(
+                            qa_torch,
+                            qb_torch.transpose(-2, -1),
+                            scale_a=[sfa_torch, pts_a.expand(case.local_experts)],
+                            scale_recipe_a=[
+                                ScalingType.BlockWise1x16,
+                                ScalingType.TensorWise,
+                            ],
+                            scale_b=[sfb_torch, pts_b.expand(case.local_experts)],
+                            scale_recipe_b=[
+                                ScalingType.BlockWise1x16,
+                                ScalingType.TensorWise,
+                            ],
+                            swizzle_a=SwizzleType.SWIZZLE_32_4_4,
+                            swizzle_b=SwizzleType.SWIZZLE_32_4_4,
+                            offs=cu[1:],
+                            output_dtype=torch.bfloat16,
+                        )
+
+                    torch_out = torch_call()
+                    arms["torch_scaled_grouped_mm"] = _GroupedArm(
+                        torch_call,
+                        {
+                            "status": "ok",
+                            "config": {"input_packing": "flashinfer_nvfp4"},
+                            **_grouped_accuracy(torch_out, a_groups, weights),
+                        },
+                    )
+        except Exception as exc:  # noqa: BLE001
+            reason = f"{type(exc).__name__}: {exc}"
+            for backend in ("flashinfer_cutedsl", "torch_scaled_grouped_mm"):
+                if backend in selected and backend not in arms and backend not in failures:
+                    failures[backend] = {"status": "error", "reason": reason}
+    return arms, failures
+
+
+def _run_grouped_frontier_case(
+    case: GemmCase,
+    selected: tuple[str, ...],
+    statuses: dict[str, BackendStatus],
+    args: argparse.Namespace,
+) -> None:
+    runnable = tuple(name for name in selected if statuses[name].runnable)
+    arms, failures = _prepare_grouped_frontier(case, runnable, args)
+    functions = {name: arm.call for name, arm in arms.items()}
+    timings = (
+        _measure_cuda_interleaved(
+            functions,
+            args.warmup,
+            args.iterations,
+            args.stabilize_ms,
+        )
+        if functions
+        else {}
+    )
+    for backend in selected:
+        base = {
+            "event": "result",
+            "backend": backend,
+            "mode": "prepacked",
+            "direction": "fwd",
+            "case": _case_dict(case),
+        }
+        if not statuses[backend].runnable:
+            result = {"status": "skipped", "reason": statuses[backend].reason}
+        elif backend in failures:
+            result = failures[backend]
+        elif backend not in arms:
+            result = {"status": "skipped", "reason": "frontier adapter is unavailable"}
+        else:
+            result = arms[backend].result
+            timing = timings[backend]
+            timing["effective_tflops"] = case.flops / (float(timing["event_ms_p50"]) * 1e9)
+            result["timing"] = timing
+        print(json.dumps({**base, **result}), flush=True)
+
+    if "native" in arms:
+        canary = _measure_cuda_interleaved(
+            functions,
+            args.warmup,
+            args.iterations,
+            args.stabilize_ms,
+        )["native"]
+        first = timings["native"]
+        drift = float(canary["event_ms_p50"]) / float(first["event_ms_p50"]) - 1.0
+        print(
+            json.dumps(
+                {
+                    "event": "canary",
+                    "backend": "native",
+                    "mode": "prepacked",
+                    "direction": "fwd",
+                    "case": _case_dict(case),
+                    "drift": drift,
+                    "drift_valid": abs(drift) <= 0.05,
+                    "status": "ok",
+                    "timing": canary,
+                    "config": arms["native"].result["config"],
+                }
+            ),
+            flush=True,
+        )
+
+
 def _te_case(
     case: GemmCase,
     mode: str,
@@ -473,6 +941,392 @@ def _te_case(
 RUNNERS = {"native": _native_case, "te_nvfp4": _te_case}
 
 
+def _dense_cases(args: argparse.Namespace) -> list[DenseCase]:
+    models = parse_models(args.models)
+    rows = parse_ints(args.tokens, args.suite)
+    projections = parse_names(args.projections, ("fc1", "fc2"), "projection")
+    return [
+        DenseCase(model, projection, m, *MODEL_SHAPES[model].gemm_shape(projection))
+        for model in models
+        for m in rows
+        for projection in projections
+    ]
+
+
+def _dense_inputs(case: DenseCase):
+    import torch
+
+    from nvfp4moe import nvfp4_quantize
+
+    torch.manual_seed(20260811)
+    scale = case.k**-0.5
+    a = (torch.randn(case.m, case.k, dtype=torch.bfloat16, device="cuda") * scale).contiguous()
+    b = (torch.randn(case.n, case.k, dtype=torch.bfloat16, device="cuda") * scale).contiguous()
+    one = torch.ones(1, dtype=torch.float32, device="cuda")
+    qa, sfa, _ = nvfp4_quantize(a, one)
+    qb, sfb, _ = nvfp4_quantize(b, one)
+    return a, b, qa, qb, sfa, sfb, one
+
+
+def _dense_accuracy(output, a, b) -> dict[str, float | bool]:
+    import torch
+
+    sample_rows = min(16, a.shape[0])
+    reference = a[:sample_rows].float() @ b.float().T
+    actual = output[:sample_rows].float()
+    cosine = torch.nn.functional.cosine_similarity(actual.flatten(), reference.flatten(), dim=0)
+    rmse = (actual - reference).square().mean().sqrt()
+    return {
+        "finite": bool(torch.isfinite(output).all()),
+        "sample_cosine": float(cosine),
+        "sample_rmse": float(rmse),
+    }
+
+
+@dataclass
+class _DenseArm:
+    call: Callable[[], object]
+    result: dict[str, object]
+    auxiliary: dict[str, Callable[[], object]]
+
+
+def _prepare_dense_native(
+    case: DenseCase,
+    mode: str,
+    args: argparse.Namespace,
+    inputs,
+) -> _DenseArm:
+    import torch
+
+    from nvfp4moe import nvfp4_gemm, nvfp4_gemm_out, nvfp4_quantize
+    from nvfp4moe.kernels.dense_gemm import DenseNvfp4Gemm
+
+    a, b, qa, qb, sfa, sfb, one = inputs
+
+    tile_ms = (args.tile_m,) if args.tile_m else (128, 256)
+    tile_ns = (args.tile_n,) if args.tile_n else (64, 128, 192, 256)
+    trial_out = torch.empty(case.m, case.n, dtype=torch.bfloat16, device="cuda")
+    runtimes = {
+        (tm, tn): DenseNvfp4Gemm(case.n, case.k, tm, tn) for tm in tile_ms for tn in tile_ns
+    }
+    candidates = {
+        f"{tm}x{tn}": (lambda runtime=runtime: runtime(qa, qb, trial_out, sfa, sfb, one))
+        for (tm, tn), runtime in runtimes.items()
+    }
+    candidate_timings = _measure_cuda_interleaved(
+        candidates,
+        1,
+        20,
+        min(args.stabilize_ms, 100.0),
+    )
+    trials = [
+        (float(candidate_timings[f"{tm}x{tn}"]["event_ms_p50"]), tm, tn) for tm, tn in runtimes
+    ]
+    _, tile_m, tile_n = min(trials)
+
+    def prepacked():
+        return nvfp4_gemm(
+            qa,
+            qb,
+            sfa,
+            sfb,
+            one,
+            tile_m=tile_m,
+            tile_n=tile_n,
+        )
+
+    def dynamic():
+        current_qa, current_sfa, _ = nvfp4_quantize(a, one)
+        return nvfp4_gemm(
+            current_qa,
+            qb,
+            current_sfa,
+            sfb,
+            one,
+            tile_m=tile_m,
+            tile_n=tile_n,
+        )
+
+    call = prepacked if mode == "prepacked" else dynamic
+    result: dict[str, object] = {
+        "status": "ok",
+        "config": {"tile_m": tile_m, "tile_n": tile_n},
+        "autotune": [
+            {"event_ms_p50": trial, "tile_m": tm, "tile_n": tn} for trial, tm, tn in trials
+        ],
+        **_dense_accuracy(call(), a, b),
+    }
+    auxiliary = {}
+    if mode == "prepacked":
+        out = torch.empty(case.m, case.n, dtype=torch.bfloat16, device="cuda")
+
+        def out_call():
+            return nvfp4_gemm_out(
+                qa,
+                qb,
+                sfa,
+                sfb,
+                one,
+                out,
+                tile_m=tile_m,
+                tile_n=tile_n,
+            )
+
+        auxiliary = {"out": out_call}
+    return _DenseArm(call, result, auxiliary)
+
+
+def _prepare_dense_grouped(
+    case: DenseCase,
+    mode: str,
+    args: argparse.Namespace,
+    inputs,
+) -> _DenseArm:
+    import torch
+
+    from nvfp4moe import nvfp4_quantize
+    from nvfp4moe.kernels.gemm import GroupedNvfp4Gemm
+
+    a, b, qa, qb, sfa, sfb, one = inputs
+    out = torch.empty(case.m, case.n, dtype=torch.bfloat16, device="cuda")
+    cu = torch.tensor([0, case.m], dtype=torch.int32, device="cuda")
+    grouped_sfa = torch.zeros(
+        (1, sfa.shape[0] + 1, *sfa.shape[1:]),
+        dtype=sfa.dtype,
+        device=sfa.device,
+    )
+    grouped_sfa[0, : sfa.shape[0]].copy_(sfa)
+    tile_ms = (args.tile_m,) if args.tile_m else (128, 256)
+    tile_ns = (args.tile_n,) if args.tile_n else ((128, 256) if case.n % 256 == 0 else (128,))
+    runtimes = {
+        (tm, tn): GroupedNvfp4Gemm(1, case.n, case.k, tm, tn) for tm in tile_ms for tn in tile_ns
+    }
+
+    def call(runtime, current_qa=qa, current_sfa=grouped_sfa):
+        runtime(
+            current_qa,
+            qb.unsqueeze(0),
+            out,
+            cu,
+            current_sfa,
+            sfb.unsqueeze(0),
+            one,
+        )
+        return out
+
+    trials = []
+    candidates = {
+        f"{tm}x{tn}": (lambda runtime=runtime: call(runtime))
+        for (tm, tn), runtime in runtimes.items()
+    }
+    candidate_timings = _measure_cuda_interleaved(
+        candidates,
+        1,
+        20,
+        min(args.stabilize_ms, 100.0),
+    )
+    for tm, tn in runtimes:
+        trials.append((float(candidate_timings[f"{tm}x{tn}"]["event_ms_p50"]), tm, tn))
+    _, tile_m, tile_n = min(trials)
+    runtime = runtimes[(tile_m, tile_n)]
+
+    def dynamic():
+        current_qa, current_sfa, _ = nvfp4_quantize(a, one)
+        grouped_sfa[0, : current_sfa.shape[0]].copy_(current_sfa)
+        return call(runtime, current_qa, grouped_sfa)
+
+    benchmark_call = (lambda: call(runtime)) if mode == "prepacked" else dynamic
+    result = {
+        "status": "ok",
+        "config": {"tile_m": tile_m, "tile_n": tile_n},
+        **_dense_accuracy(benchmark_call(), a, b),
+    }
+    return _DenseArm(benchmark_call, result, {})
+
+
+def _prepare_dense_cublas(case: DenseCase, mode: str, inputs) -> _DenseArm | None:
+    if mode != "prepacked":
+        return None
+    import torch
+    from torch.nn.functional import ScalingType, SwizzleType, scaled_mm
+
+    a, b, qa, qb, sfa, sfb, _ = inputs
+    scale_a = sfa.reshape(-1)
+    scale_b = sfb.reshape(-1)
+
+    def call():
+        return scaled_mm(
+            qa,
+            qb.T,
+            scale_a,
+            ScalingType.BlockWise1x16,
+            scale_b,
+            ScalingType.BlockWise1x16,
+            swizzle_a=SwizzleType.SWIZZLE_32_4_4,
+            swizzle_b=SwizzleType.SWIZZLE_32_4_4,
+            output_dtype=torch.bfloat16,
+        )
+
+    result = {"status": "ok", **_dense_accuracy(call(), a, b)}
+    return _DenseArm(call, result, {})
+
+
+def _prepare_dense_arm(
+    backend: str,
+    case: DenseCase,
+    mode: str,
+    args: argparse.Namespace,
+    inputs,
+) -> _DenseArm | None:
+    if backend == "native":
+        return _prepare_dense_native(case, mode, args, inputs)
+    if backend == "native_grouped":
+        return _prepare_dense_grouped(case, mode, args, inputs)
+    if backend == "cublaslt":
+        return _prepare_dense_cublas(case, mode, inputs)
+    raise ValueError(f"unknown dense backend: {backend}")
+
+
+def _dense_main(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.warmup < 0 or args.iterations <= 0 or args.max_cases < 0 or args.stabilize_ms < 0:
+        parser.error("warmup/max-cases/stabilize-ms must be non-negative and iterations positive")
+    try:
+        cases = _dense_cases(args)
+        selected = parse_names(
+            args.backends or "native,cublaslt",
+            DENSE_BACKEND_NAMES,
+            "backend",
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.max_cases:
+        cases = cases[: args.max_cases]
+    available = {
+        "native": _module_exists("nvfp4moe"),
+        "native_grouped": _module_exists("nvfp4moe"),
+        "cublaslt": _dense_cublas_available(),
+    }
+    payload = {
+        "benchmark": "standalone_nvfp4_dense_gemm",
+        "suite": args.suite,
+        "definitions": {
+            "operation": "C = A @ B.T",
+            "prepacked": "NVFP4 operands and scale factors are resident",
+            "dynamic": "BF16 A quantization plus GEMM; B stays resident",
+            "timing": "backend calls are interleaved in alternating order after stabilization",
+        },
+        "backends": {name: {"available": available[name]} for name in selected},
+        "case_count": len(cases),
+        "cases": [asdict(case) | {"label": case.label, "flops": case.flops} for case in cases],
+    }
+    if args.list:
+        print(json.dumps(payload, indent=2))
+        return 0
+    modes = MODES if args.mode == "both" else (args.mode,)
+    print(json.dumps({"event": "start", **payload, "cases": None}), flush=True)
+    started = time.time()
+    for case in cases:
+        for mode in modes:
+            inputs = _dense_inputs(case)
+            prepared = {}
+            failures = {}
+            for backend in selected:
+                if not available[backend]:
+                    failures[backend] = {
+                        "status": "skipped",
+                        "reason": f"{backend} is not installed",
+                    }
+                    continue
+                try:
+                    arm = _prepare_dense_arm(backend, case, mode, args, inputs)
+                    if arm is None:
+                        failures[backend] = {
+                            "status": "skipped",
+                            "reason": "the cuBLASLt row excludes quantization",
+                        }
+                    else:
+                        prepared[backend] = arm
+                except Exception as exc:  # noqa: BLE001
+                    failures[backend] = {
+                        "status": "error",
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    }
+
+            functions = {backend: arm.call for backend, arm in prepared.items()}
+            native = prepared.get("native")
+            if native is not None:
+                functions.update(
+                    {f"native_{name}": call for name, call in native.auxiliary.items()}
+                )
+            timings = (
+                _measure_cuda_interleaved(
+                    functions,
+                    args.warmup,
+                    args.iterations,
+                    args.stabilize_ms,
+                )
+                if functions
+                else {}
+            )
+
+            for backend in selected:
+                base = {
+                    "event": "result",
+                    "backend": backend,
+                    "mode": mode,
+                    "case": asdict(case) | {"label": case.label, "flops": case.flops},
+                }
+                if backend in failures:
+                    result = failures[backend]
+                else:
+                    result = prepared[backend].result
+                    timing = timings[backend]
+                    timing["effective_tflops"] = case.flops / (float(timing["event_ms_p50"]) * 1e9)
+                    result["timing"] = timing
+                    if backend == "native":
+                        for name in native.auxiliary:
+                            auxiliary_timing = timings[f"native_{name}"]
+                            auxiliary_timing["effective_tflops"] = case.flops / (
+                                float(auxiliary_timing["event_ms_p50"]) * 1e9
+                            )
+                            result[f"{name}_timing"] = auxiliary_timing
+                print(json.dumps({**base, **result}), flush=True)
+
+            if native is not None:
+                canary_timings = _measure_cuda_interleaved(
+                    functions,
+                    args.warmup,
+                    args.iterations,
+                    0.0,
+                )
+                canary_timing = canary_timings["native"]
+                canary_timing["effective_tflops"] = case.flops / (
+                    float(canary_timing["event_ms_p50"]) * 1e9
+                )
+                first_timing = timings["native"]
+                drift = (
+                    float(canary_timing["event_ms_p50"]) / float(first_timing["event_ms_p50"]) - 1.0
+                )
+                print(
+                    json.dumps(
+                        {
+                            "event": "canary",
+                            "backend": "native",
+                            "mode": mode,
+                            "case": asdict(case) | {"label": case.label, "flops": case.flops},
+                            "drift": drift,
+                            "drift_valid": abs(drift) <= 0.05,
+                            "status": "ok",
+                            "timing": canary_timing,
+                            "config": native.result["config"],
+                        }
+                    ),
+                    flush=True,
+                )
+    print(json.dumps({"event": "done", "wall_seconds": time.time() - started}), flush=True)
+    return 0
+
+
 def _case_dict(case: GemmCase) -> dict[str, object]:
     row = asdict(case)
     row["label"] = case.label
@@ -498,6 +1352,7 @@ def listing_payload(args: argparse.Namespace) -> dict[str, object]:
             "prepacked": "resident NVFP4 operands and scales; grouped GEMM only",
             "dynamic": "BF16 activation quantization plus GEMM; weights stay resident/prepacked",
             "routed_rows": "tokens * top-k before any capacity padding",
+            "timing": "runnable prepacked forward backends are interleaved in one GPU session",
         },
         "models": {key: asdict(MODEL_SHAPES[key]) for key in models},
         "backends": {name: asdict(status) for name, status in statuses.items()},
@@ -508,19 +1363,21 @@ def listing_payload(args: argparse.Namespace) -> dict[str, object]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--workload", choices=("grouped", "dense"), default="grouped")
     parser.add_argument("--list", action="store_true", help="print matrix and availability only")
     parser.add_argument("--suite", choices=("quick", "full"), default="quick")
     parser.add_argument("--models", default="all", help="comma-separated registry keys")
     parser.add_argument("--tokens", default=None, help="comma-separated token counts")
-    parser.add_argument(
-        "--backends", default="native,torch_scaled_grouped_mm,te_nvfp4,cutlass,cublaslt"
-    )
+    parser.add_argument("--backends", default=None)
     parser.add_argument("--mode", choices=(*MODES, "both"), default="prepacked")
     parser.add_argument("--direction", choices=DIRECTIONS, default="fwd")
     parser.add_argument("--projections", default="fc1,fc2")
     parser.add_argument("--routing", default="all")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--stabilize-ms", type=float, default=200.0)
+    parser.add_argument("--tile-m", type=int, choices=(0, 128, 256), default=0)
+    parser.add_argument("--tile-n", type=int, choices=(0, 64, 128, 192, 256), default=0)
     parser.add_argument(
         "--max-cases", type=int, default=0, help="0 runs the complete selected matrix"
     )
@@ -530,15 +1387,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.workload == "dense":
+        return _dense_main(args, parser)
     try:
         payload = listing_payload(args)
-        selected = parse_names(args.backends, BACKEND_NAMES, "backend")
+        selected = parse_names(
+            args.backends or "native,torch_scaled_grouped_mm,te_nvfp4,cutlass,cublaslt",
+            BACKEND_NAMES,
+            "backend",
+        )
     except ValueError as exc:
         parser.error(str(exc))
     if args.list:
         print(json.dumps(payload, indent=2))
         return 0
-    if args.warmup < 0 or args.iterations <= 0 or args.max_cases < 0:
+    if args.warmup < 0 or args.iterations <= 0 or args.max_cases < 0 or args.stabilize_ms < 0:
         parser.error("warmup/max-cases must be non-negative and iterations must be positive")
 
     cases = [
@@ -556,6 +1419,9 @@ def main(argv: list[str] | None = None) -> int:
     started = time.time()
     for case in cases:
         for mode in modes:
+            if mode == "prepacked" and args.direction == "fwd":
+                _run_grouped_frontier_case(case, selected, statuses, args)
+                continue
             for backend in selected:
                 status = statuses[backend]
                 base = {

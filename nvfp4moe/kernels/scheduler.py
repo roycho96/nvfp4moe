@@ -256,8 +256,6 @@ class MoESchedulerParams:
         self.hidden = h if isinstance(h, Int32) else Int32(h)
         self.cta_tile_shape_mnk = cta_tile_shape_mnk
         self.cluster_shape_mn = cluster_shape_mn
-        if scenario == "2Dx2D":
-            use_dynamic_sched = True
         self.use_dynamic_sched = use_dynamic_sched
 
     @property
@@ -308,7 +306,7 @@ class MoESchedulerParams:
         2Dx3D uses persistent clusters. 2Dx2D uses a full CTA grid with
         cluster-level cancellation to rebalance uneven expert K lengths.
         """
-        if params.scenario == "2Dx2D":
+        if params.scenario == "2Dx2D" and params.use_dynamic_sched:
             cm, cn = params.cluster_shape_mn
             tm, tn = params.cta_tile_shape_mnk[0], params.cta_tile_shape_mnk[1]
             grid_m = ((params.hidden + tm * cm - 1) // (tm * cm)) * cm
@@ -329,7 +327,14 @@ class MoESchedulerParams:
 class _DynamicSchedState:
     """Runtime state for dynamic tile scheduling. All fields are MLIR-serializable."""
 
-    def __init__(self, counter_ptr, broadcast_ptr, is_leader_cta, producer_state, consumer_state):
+    def __init__(
+        self,
+        counter_ptr,
+        broadcast_ptr,
+        is_leader_cta,
+        producer_state,
+        consumer_state,
+    ):
         self.counter_ptr = counter_ptr  # Pointer: gmem atomic counter
         self.broadcast_ptr = broadcast_ptr  # Pointer: smem broadcast base
         self.is_leader_cta = is_leader_cta  # Boolean
@@ -366,7 +371,13 @@ class _DynamicSchedState:
         new_cons = new_from_mlir_values(self.consumer_state, values[idx : idx + cons_len])
         idx += cons_len
 
-        return _DynamicSchedState(new_counter, new_broadcast, new_is_leader, new_prod, new_cons)
+        return _DynamicSchedState(
+            new_counter,
+            new_broadcast,
+            new_is_leader,
+            new_prod,
+            new_cons,
+        )
 
 
 # =============================================================================
@@ -769,7 +780,7 @@ class MoEPersistentTileScheduler:
     @cute.jit
     def initial_work_tile_info(self, *, loc=None, ip=None) -> MoEWorkTileInfo:
         """Get the initial work tile info."""
-        if const_expr(self.scenario == "2Dx2D"):
+        if const_expr(self.scenario == "2Dx2D" and self.use_dynamic_sched):
             return self._initial_work_from_block_idx(loc=loc, ip=ip)
         if const_expr(self.use_dynamic_sched):
             if const_expr(not hasattr(self, "cluster_pipeline")):
@@ -788,7 +799,7 @@ class MoEPersistentTileScheduler:
     @cute.jit
     def advance_to_next_work(self, *, loc=None, ip=None) -> MoEWorkTileInfo:
         """Advance to the next work tile and return its info."""
-        if const_expr(self.scenario == "2Dx2D"):
+        if const_expr(self.scenario == "2Dx2D" and self.use_dynamic_sched):
             return self._fetch_next_clc_work(loc=loc, ip=ip)
         if const_expr(self.use_dynamic_sched):
             self._current_work_linear_idx = self._fetch_next_cluster_idx(loc=loc, ip=ip)
@@ -957,10 +968,8 @@ class MoEPersistentTileScheduler:
 
         Returns an invalid tile (expert_idx = -1) if cluster_linear_idx is out of range.
         """
-        # Ensure expert tracking is initialized and up-to-date
         self._advance_expert_to_contain(cluster_linear_idx, loc=loc, ip=ip)
 
-        # Check if valid (still within expert range after advancing)
         is_valid = self.current_expert_idx < self.expert_cnt
 
         work_tile_info = MoEWorkTileInfo(
@@ -1086,17 +1095,10 @@ class MoEPersistentTileScheduler:
         cluster_tile_m_idx = -1
         cluster_tile_n_idx = -1
 
-        # Short side first: shorter dimension changes faster
-        # If m_cnt <= n_cnt: m is shorter, m changes faster
-        #   local_idx = n_idx * m_cnt + m_idx
-        # If n_cnt < m_cnt: n is shorter, n changes faster
-        #   local_idx = m_idx * n_cnt + n_idx
         if cluster_tile_m_cnt <= cluster_tile_n_cnt:
-            # M is shorter or equal, M changes faster
             cluster_tile_m_idx = local_idx % cluster_tile_m_cnt
             cluster_tile_n_idx = local_idx // cluster_tile_m_cnt
         else:
-            # N is shorter, N changes faster
             cluster_tile_n_idx = local_idx % cluster_tile_n_cnt
             cluster_tile_m_idx = local_idx // cluster_tile_n_cnt
 

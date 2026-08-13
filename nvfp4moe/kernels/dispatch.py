@@ -9,7 +9,7 @@ atomics. Router selection remains outside this module.
 import cuda.bindings.driver as cuda
 import cutlass
 import torch
-from cutlass import Float32, Int32, cute
+from cutlass import Float32, Int32, const_expr, cute
 from torch import Tensor
 
 from ._common import fake_tensor, jit_cache
@@ -25,6 +25,7 @@ class MoEDispatchKernel:
         assert CHUNK * 4 + B_MAX * E * 4 + E * 4 <= 200 * 1024, "smem budget"
         self.E = E
         self.topk = topk
+        self.warp_dispatch = E <= 32
 
     @cute.jit
     def __call__(
@@ -62,7 +63,20 @@ class MoEDispatchKernel:
                 v = mTopI[p]
             sChunk[j] = v
         cute.arch.sync_threads()
-        if tidx < self.E:
+        if const_expr(self.warp_dispatch):
+            warp = tidx // 32
+            lane = tidx % 32
+            for group in cutlass.range_constexpr((self.E + 7) // 8):
+                expert = warp + group * 8
+                if expert < self.E:
+                    cnt = Int32(0)
+                    for i in cutlass.range_constexpr(CHUNK // 32):
+                        mask = cute.arch.vote_ballot_sync(sChunk[i * 32 + lane] == expert)
+                        if lane == 0:
+                            cnt += cute.arch.popc(mask)
+                    if lane == 0:
+                        mPart[b * self.E + expert] = cnt
+        elif tidx < self.E:
             cnt = Int32(0)
             for j in cutlass.range(CHUNK):
                 if sChunk[j] == tidx:
@@ -89,6 +103,13 @@ class MoEDispatchKernel:
         sChunk = smem.allocate_tensor(Int32, cute.make_layout(CHUNK), byte_alignment=16)
         sPart = smem.allocate_tensor(Int32, cute.make_layout(B_MAX * self.E), byte_alignment=16)
         sTot = smem.allocate_tensor(Int32, cute.make_layout(self.E), byte_alignment=16)
+        if const_expr(self.warp_dispatch):
+            sBase = smem.allocate_tensor(Int32, cute.make_layout(self.E), byte_alignment=16)
+            sSeg = smem.allocate_tensor(
+                Int32,
+                cute.make_layout((CHUNK // 32, self.E), stride=(self.E, 1)),
+                byte_alignment=16,
+            )
         # stage this CTA's chunk + the full part matrix
         for i in cutlass.range_constexpr(CHUNK // NUM_THREADS):
             j = tidx + i * NUM_THREADS
@@ -112,8 +133,7 @@ class MoEDispatchKernel:
         cute.arch.sync_threads()
         if tidx < self.E:
             e = tidx
-            # exclusive prefix over experts (fixed ascending order) = cu[e];
-            # inclusive 128-padded prefix = off_pad[e] (grouped-wgrad contract)
+            # Build stable and padded expert offsets.
             cu_e = Int32(0)
             op_e = Int32(0)
             for e2 in cutlass.range_constexpr(self.E):
@@ -126,21 +146,53 @@ class MoEDispatchKernel:
                 mOffPad[e] = op_e
                 if e == 0:
                     mCu[0] = 0
-            # + counts of expert e in earlier chunks = this chunk's rank base
+            # Add this chunk's stable rank base.
             base = cu_e
             for b2 in cutlass.range(B):
                 if b2 < b:
                     base += sPart[b2 * self.E + e]
-            # stable scatter: walk the chunk in flat order (pads are -1)
-            cnt = Int32(0)
-            for j in cutlass.range(CHUNK):
-                if sChunk[j] == e:
-                    p = b * CHUNK + j
-                    s = base + cnt
-                    mGi[s] = p // self.topk
-                    mPs[s] = Float32(mTopV[p])
-                    mSlots[p] = s
-                    cnt += 1
+            if const_expr(self.warp_dispatch):
+                sBase[e] = base
+            else:
+                cnt = Int32(0)
+                for j in cutlass.range(CHUNK):
+                    if sChunk[j] == e:
+                        p = b * CHUNK + j
+                        s = base + cnt
+                        mGi[s] = p // self.topk
+                        mPs[s] = Float32(mTopV[p])
+                        mSlots[p] = s
+                        cnt += 1
+        if const_expr(self.warp_dispatch):
+            warp = tidx // 32
+            lane = tidx % 32
+            ranks = cute.make_rmem_tensor(cute.make_layout(CHUNK // NUM_THREADS), Int32)
+            for i in cutlass.range_constexpr(CHUNK // NUM_THREADS):
+                j = tidx + i * NUM_THREADS
+                value = sChunk[j]
+                rank = Int32(0)
+                segment = i * (NUM_THREADS // 32) + warp
+                for e in cutlass.range_constexpr(self.E):
+                    mask = cute.arch.vote_ballot_sync(value == e)
+                    if lane == 0:
+                        sSeg[segment, e] = cute.arch.popc(mask)
+                    if value == e:
+                        rank = Int32(cute.arch.popc(cutlass.Uint32(mask) & cute.arch.lanemask_lt()))
+                ranks[i] = rank
+            cute.arch.sync_threads()
+            for i in cutlass.range_constexpr(CHUNK // NUM_THREADS):
+                j = tidx + i * NUM_THREADS
+                p = b * CHUNK + j
+                e = sChunk[j]
+                if p < M:
+                    segment = i * (NUM_THREADS // 32) + warp
+                    dst = sBase[e] + ranks[i]
+                    for earlier in cutlass.range_constexpr(CHUNK // 32):
+                        if earlier < segment:
+                            dst += sSeg[earlier, e]
+                    mGi[dst] = p // self.topk
+                    mPs[dst] = Float32(mTopV[p])
+                    mSlots[p] = dst
 
     @staticmethod
     @jit_cache
@@ -181,15 +233,7 @@ def moe_dispatch(
     part: Tensor,
     off_pad: Tensor,
 ) -> None:
-    """Fill (gi, cu, ps, slots, off_pad) from router (topi, topv); see module
-    docstring. off_pad (E,) int32 = cumsum(ceil(count/128)*128), the padded
-    grouped-wgrad offsets contract (emitted here so the layer's bwd needs no
-    torch chain for it).
-
-    topi (T, k) int32 contiguous; topv (T, k) float32 contiguous; gi/slots (T*k,)
-    int32; cu (E+1,) int32; ps (T*k,) float32; part (B_MAX*E,) int32 scratch.
-    Deterministic and bitwise equal to the stable-argsort torch chain.
-    """
+    """Build a stable expert-major permutation from preselected routes."""
     assert topi.dtype == torch.int32 and topi.is_contiguous()
     assert topv.dtype == torch.float32 and topv.is_contiguous()
     assert topi.dim() == 2 and topv.shape == topi.shape

@@ -42,6 +42,7 @@ class GatedEpilogue:
     """Forward gated activation selected at GEMM compile time."""
 
     activation: str = "swiglu"
+    save_preact: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "activation", validate_gated_activation(self.activation))

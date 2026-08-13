@@ -89,6 +89,8 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         expert_cnt: int = 1,
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         input_order: WGradInputOrder = WGradInputOrder.Tensor2D,
+        occupancy: int = 1,
+        persistent_sched: bool = False,
     ):
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
@@ -99,10 +101,12 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         self.accumulate_on_output = accumulate_on_output
         self.weight_mode = weight_mode
         self.input_order = input_order
+        self.persistent_sched = persistent_sched
 
         self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
 
-        self.occupancy = 1
+        assert occupancy in (1, 2)
+        self.occupancy = occupancy
         self.epilogue_warp_id = (0, 1, 2, 3)
         self.mma_warp_id = 4
         self.tma_warp_id = 5
@@ -463,6 +467,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             expert_shape=(expert_cnt, intermediate_dim, hidden_dim),
             cta_tile_shape_mnk=self.cta_tile_shape_mnk,
             cluster_shape_mn=self.cluster_shape_mn,
+            use_dynamic_sched=not self.persistent_sched,
         )
         grid = MoESchedulerParams.get_grid_shape(sched_params, max_active_clusters)
 
@@ -781,7 +786,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # SharedStorage
         # =================================================================
         SchedulerStorage = MoEPersistentTileScheduler.make_storage_struct(
-            self.num_sched_stages, use_dynamic_sched=True
+            self.num_sched_stages, use_dynamic_sched=not self.persistent_sched
         )
 
         @cute.struct

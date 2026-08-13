@@ -75,8 +75,8 @@ def test_routing_counts_preserve_rows(rows, experts, routing):
 def test_moe_matrix_distinguishes_synthetic_and_trace_sources():
     synthetic = generate_moe_cases(("deepseek_v3_2",), (8192,), "quick", ("balanced",), "synthetic")
     assert len(synthetic) == 1
-    assert synthetic[0].ep_size == 32
-    assert synthetic[0].local_experts == 8
+    assert synthetic[0].ep_size == 8
+    assert synthetic[0].local_experts == 32
     assert synthetic[0].routed_rows == 65536
 
     replay = generate_moe_cases(("deepseek_v3_2",), (8192,), "quick", ("balanced",), "trace")
@@ -85,6 +85,12 @@ def test_moe_matrix_distinguishes_synthetic_and_trace_sources():
     assert replay[0].routing == "captured"
     assert replay[0].ep_size == 32
     assert replay[0].local_experts == 8
+
+
+@pytest.mark.parametrize("key", MODEL_SHAPES)
+def test_quick_synthetic_moe_has_more_experts_than_topk(key):
+    case = generate_moe_cases((key,), (8192,), "quick", ("balanced",))[0]
+    assert case.local_experts > case.topk
 
 
 def test_gemm_list_is_cpu_safe(monkeypatch, capsys):
@@ -108,6 +114,29 @@ def test_gemm_list_is_cpu_safe(monkeypatch, capsys):
     assert payload["case_count"] == 1
     assert payload["cases"][0]["routed_rows"] == 65536
     assert payload["definitions"]["prepacked"].startswith("resident NVFP4")
+
+
+def test_dense_gemm_list_is_cpu_safe(capsys):
+    result = nvfp4_gemm.main(
+        [
+            "--list",
+            "--workload",
+            "dense",
+            "--models",
+            "qwen3_30b_a3b",
+            "--tokens",
+            "128,8192",
+            "--projections",
+            "fc2",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["benchmark"] == "standalone_nvfp4_dense_gemm"
+    assert payload["case_count"] == 2
+    assert payload["cases"][0]["m"] == 128
+    assert payload["cases"][1]["m"] == 8192
+    assert payload["definitions"]["operation"] == "C = A @ B.T"
 
 
 def test_moe_list_is_cpu_safe(monkeypatch, capsys):

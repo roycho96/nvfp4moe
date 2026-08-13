@@ -22,6 +22,16 @@ copyright notice and license text.
 
 Upstream: https://github.com/NVIDIA/cutlass
 
+NVIDIA dense forward GEMM
+-------------------------
+
+nvfp4moe/kernels/dense_gemm_kernel.py adapts NVIDIA CUTLASS's Blackwell
+dense block-scaled CuTe DSL example at commit
+dcf215af68a2d08d305076c152a06f201728cd53. The file retains NVIDIA's
+BSD-3-Clause copyright notice and license text.
+
+Upstream: https://github.com/NVIDIA/cutlass/blob/dcf215af68a2d08d305076c152a06f201728cd53/examples/python/CuTeDSL/cute/blackwell/kernel/blockscaled_gemm/dense_blockscaled_gemm_persistent.py
+
 External runtime and benchmark dependencies
 -------------------------------------------
 

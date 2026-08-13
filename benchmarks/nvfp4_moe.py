@@ -12,11 +12,15 @@ import argparse
 import importlib
 import importlib.util
 import json
+import os
+import random
 import statistics
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+
+os.environ.setdefault("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
 
 try:
     from .model_shapes import (
@@ -48,6 +52,7 @@ except ImportError:
 
 BACKEND_NAMES = (
     "native",
+    "te_nvfp4_fused",
     "te_nvfp4",
     "deepgemm_bf16",
     "deepgemm_fp8_fp4",
@@ -67,6 +72,16 @@ class BackendStatus:
     passes: tuple[str, ...]
     precision: str
     reason: str
+
+
+@dataclass
+class _TrainingArm:
+    name: str
+    call: Callable[[], object]
+    x: object
+    topv: object
+    output: dict[str, object]
+    weight_grads: Callable[[], dict[str, object]]
 
 
 def _module_exists(name: str) -> bool:
@@ -125,6 +140,7 @@ def detect_backends() -> dict[str, BackendStatus]:
     )
 
     te_discovered = False
+    te_fused_discovered = False
     te_reason = base_reason
     if _module_exists("transformer_engine"):
         try:
@@ -132,6 +148,11 @@ def detect_backends() -> dict[str, BackendStatus]:
             recipe = importlib.import_module("transformer_engine.common.recipe")
             te_discovered = callable(getattr(te, "GroupedLinear", None)) and callable(
                 getattr(recipe, "NVFP4BlockScaling", None)
+            )
+            te_ops = importlib.import_module("transformer_engine.pytorch.ops")
+            te_fused_discovered = te_discovered and all(
+                callable(getattr(te_ops, name, None))
+                for name in ("GroupedLinear", "ScaledSwiGLU", "Sequential")
             )
             te_reason = (
                 "TE NVFP4 GroupedLinear with TE permutation/combine"
@@ -144,18 +165,18 @@ def detect_backends() -> dict[str, BackendStatus]:
         te_reason = "transformer_engine is not installed"
 
     torchao_discovered = False
-    torchao_reason = "TorchAO MXFP8 grouped-expert converter is not installed"
+    torchao_reason = "TorchAO MXFP8 grouped GEMM is not installed"
     if _module_exists("torchao"):
-        candidates = (
-            "torchao.prototype.mx_formats.mx_tensor",
-            "torchao.float8",
-        )
-        torchao_discovered = any(_module_exists(name) for name in candidates)
-        if torchao_discovered:
-            torchao_reason = (
-                "TorchAO is present, but MXFP8 expert integration belongs to TorchTitan and has "
-                "no standalone stable constructor here"
-            )
+        try:
+            try:
+                from .moe_backends import _torchao_mxfp8_grouped_mm
+            except ImportError:
+                from moe_backends import _torchao_mxfp8_grouped_mm
+
+            torchao_discovered = callable(_torchao_mxfp8_grouped_mm())
+            torchao_reason = "TorchAO dynamic MXFP8 scaled grouped GEMM"
+        except Exception as exc:  # noqa: BLE001
+            torchao_reason = f"TorchAO MXFP8 import failed: {type(exc).__name__}: {exc}"
 
     deepgemm_discovered = False
     deepgemm_reason = base_reason
@@ -189,6 +210,15 @@ def detect_backends() -> dict[str, BackendStatus]:
             PASSES,
             "NVFP4 x NVFP4",
             native_reason,
+        ),
+        "te_nvfp4_fused": BackendStatus(
+            "te_nvfp4_fused",
+            te_fused_discovered,
+            te_fused_discovered and cuda_ready and sm100,
+            SCOPES,
+            PASSES,
+            "TE fused NVFP4",
+            ("TE 2.17 fused CUTLASS DSL grouped MLP" if te_fused_discovered else te_reason),
         ),
         "te_nvfp4": BackendStatus(
             "te_nvfp4",
@@ -229,8 +259,8 @@ def detect_backends() -> dict[str, BackendStatus]:
         "torchao_mxfp8": BackendStatus(
             "torchao_mxfp8",
             torchao_discovered,
-            False,
-            ("full-layer",),
+            torchao_discovered and te_discovered and cuda_ready and sm100,
+            SCOPES,
             PASSES,
             "MXFP8",
             torchao_reason,
@@ -247,19 +277,30 @@ def _measure_cuda(fn: Callable[[], object], warmup: int, iterations: int) -> dic
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     samples = []
+    wall_samples = []
     for _ in range(iterations):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
+        wall_start = time.perf_counter()
         start.record()
         fn()
         end.record()
         end.synchronize()
         samples.append(start.elapsed_time(end))
+        wall_samples.append(1000 * (time.perf_counter() - wall_start))
     ordered = sorted(samples)
+    q25 = ordered[int(0.25 * (len(ordered) - 1))]
+    q75 = ordered[int(0.75 * (len(ordered) - 1))]
+    health_ratio = sum(wall_samples) / sum(samples)
     return {
         "event_ms_p50": statistics.median(samples),
+        "event_ms_p10": ordered[int(0.10 * (len(ordered) - 1))],
+        "event_ms_p90": ordered[int(0.90 * (len(ordered) - 1))],
         "event_ms_p95": ordered[min(len(ordered) - 1, int(0.95 * (len(ordered) - 1)))],
+        "event_ms_iqr": q75 - q25,
         "event_ms_min": min(samples),
+        "wall_to_event_ratio": health_ratio,
+        "health_valid": health_ratio <= 1.5,
         "iterations": iterations,
         "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
     }
@@ -269,16 +310,28 @@ def _synthetic_inputs(case: MoeCase) -> dict[str, object]:
     import torch
 
     torch.manual_seed(20260811)
-    counts = routing_counts(case.routed_rows, case.local_experts, case.routing)
-    assignments = torch.repeat_interleave(
-        torch.arange(case.local_experts, dtype=torch.int64),
-        torch.tensor(counts, dtype=torch.int64),
-    )
-    if assignments.numel() != case.routed_rows:
-        raise RuntimeError("routing generator did not preserve routed rows")
-    if assignments.numel() > 1:
-        assignments = assignments[torch.randperm(assignments.numel())]
-    topi = assignments.reshape(case.tokens, case.topk).to(torch.int32).cuda().contiguous()
+    if case.topk > case.local_experts:
+        raise ValueError(
+            f"top-k {case.topk} exceeds {case.local_experts} local experts; "
+            "full-layer synthetic cases require unique local expert ids"
+        )
+    requested_counts = routing_counts(case.routed_rows, case.local_experts, case.routing)
+    weights = torch.tensor(requested_counts, dtype=torch.float64).clamp_min_(1)
+    generator = torch.Generator().manual_seed(20260811)
+    uniforms = torch.rand(
+        case.tokens,
+        case.local_experts,
+        dtype=torch.float64,
+        generator=generator,
+    ).clamp_min_(torch.finfo(torch.float64).tiny)
+    # Exponential keys sample without replacement while retaining routing skew.
+    scores = -uniforms.log() / weights
+    topi_cpu = scores.topk(case.topk, dim=1, largest=False).indices
+    sorted_topi = topi_cpu.sort(1).values
+    if case.topk > 1 and bool((sorted_topi[:, 1:] == sorted_topi[:, :-1]).any()):
+        raise RuntimeError("synthetic router produced duplicate expert ids")
+    actual_counts = torch.bincount(topi_cpu.reshape(-1), minlength=case.local_experts)
+    topi = topi_cpu.to(torch.int32).cuda().contiguous()
     topv = torch.rand(case.tokens, case.topk, dtype=torch.float32, device="cuda")
     topv /= topv.sum(-1, keepdim=True)
     x = torch.randn(case.tokens, case.hidden, dtype=torch.bfloat16, device="cuda")
@@ -311,7 +364,9 @@ def _synthetic_inputs(case: MoeCase) -> dict[str, object]:
         "metadata": {
             "source": "synthetic",
             "routing": case.routing,
-            "requested_counts": list(counts),
+            "requested_counts": list(requested_counts),
+            "actual_counts": actual_counts.tolist(),
+            "unique_topk": True,
         },
     }
 
@@ -447,6 +502,301 @@ def _te_backend(spec: ModelShape, inputs: dict[str, object]):
     return TEExpert(spec, inputs, nvfp4=True)
 
 
+def _crop_training_grads(grads, intermediate):
+    gate_up = grads["gate_up"]
+    half = gate_up.shape[1] // 2
+    gate_up = __import__("torch").cat(
+        (gate_up[:, :intermediate], gate_up[:, half : half + intermediate]), dim=1
+    )
+    return {
+        "gate_up": gate_up.contiguous(),
+        "down": grads["down"][:, :, :intermediate].contiguous(),
+    }
+
+
+def _make_training_arm(backend_name, case, inputs, dout):
+    global_spec = MODEL_SHAPES[case.model]
+    spec = replace(global_spec, experts=case.local_experts, ep_sizes=(1,), quick_ep=1)
+    x = inputs["expert_input"].detach().clone().requires_grad_(True)
+    topv = inputs["topk_weight"].detach().clone().requires_grad_(True)
+
+    if backend_name == "native":
+        backend = _native_backend(spec, inputs)
+    elif backend_name == "te_nvfp4_fused":
+        try:
+            from .moe_backends import TEFusedExpert
+        except ImportError:
+            from moe_backends import TEFusedExpert
+
+        backend = TEFusedExpert(spec, inputs)
+    elif backend_name == "te_nvfp4":
+        backend = _te_backend(spec, inputs)
+    elif backend_name == "deepgemm_bf16":
+        try:
+            from .moe_backends import TEDeepGEMMTrainExpert
+        except ImportError:
+            from moe_backends import TEDeepGEMMTrainExpert
+
+        backend = TEDeepGEMMTrainExpert(spec, inputs)
+    elif backend_name == "torchao_mxfp8":
+        try:
+            from .moe_backends import TorchAOMXFP8Expert
+        except ImportError:
+            from moe_backends import TorchAOMXFP8Expert
+
+        backend = TorchAOMXFP8Expert(spec, inputs)
+    elif backend_name == "torch_bf16":
+        backend = _TorchGroupedExperts(spec, inputs)
+    else:
+        raise ValueError(f"{backend_name} does not provide full training")
+
+    if backend_name == "torch_bf16":
+
+        def forward(step):
+            del step
+            return backend.full_layer(x, inputs["topk_index"], topv)
+
+        zero_grad = backend.zero_grad
+
+        def raw_weight_grads():
+            return {
+                "gate_up": backend.w1.grad.transpose(1, 2),
+                "down": backend.w2.grad.transpose(1, 2),
+            }
+
+    else:
+
+        def forward(step):
+            return backend(x, inputs["topk_index"], topv, step)
+
+        zero_grad = lambda: backend.zero_grad(set_to_none=True)
+        raw_weight_grads = backend.training_gradients
+
+    output = {}
+    step = [0]
+
+    def call():
+        zero_grad()
+        x.grad = None
+        topv.grad = None
+        step[0] += 1
+        y = forward(step[0])
+        y.backward(dout)
+        output["y"] = y.detach()
+        return y
+
+    def weight_grads():
+        return _crop_training_grads(raw_weight_grads(), case.intermediate)
+
+    return _TrainingArm(backend_name, call, x, topv, output, weight_grads)
+
+
+def _sample_error(actual, reference, limit=65_536):
+    import torch
+
+    if actual is None or reference is None or actual.shape != reference.shape:
+        return {"comparable": False}
+    a = actual.detach().float().reshape(-1)
+    b = reference.detach().float().reshape(-1)
+    stride = max(1, (a.numel() + limit - 1) // limit)
+    a = a[::stride]
+    b = b[::stride]
+    diff = a - b
+    denom = torch.linalg.vector_norm(a) * torch.linalg.vector_norm(b)
+    cosine = torch.dot(a, b) / denom if denom else a.new_tensor(1.0)
+    ref_norm = torch.linalg.vector_norm(b).clamp_min(1e-12)
+    return {
+        "comparable": True,
+        "sample_count": a.numel(),
+        "cosine": float(cosine),
+        "relative_l2": float(torch.linalg.vector_norm(diff) / ref_norm),
+        "max_abs": float(diff.abs().max()),
+    }
+
+
+def _timing_summary(samples, walls, case, peak_allocated_gib):
+    ordered = sorted(samples)
+    q25 = ordered[int(0.25 * (len(ordered) - 1))]
+    q75 = ordered[int(0.75 * (len(ordered) - 1))]
+    health_ratio = sum(walls) / sum(samples)
+    p50 = statistics.median(samples)
+    return {
+        "event_ms_p50": p50,
+        "event_ms_p10": ordered[int(0.10 * (len(ordered) - 1))],
+        "event_ms_p90": ordered[int(0.90 * (len(ordered) - 1))],
+        "event_ms_iqr": q75 - q25,
+        "event_ms_min": min(samples),
+        "wall_to_event_ratio": health_ratio,
+        "health_valid": health_ratio <= 1.5,
+        "iterations": len(samples),
+        "peak_allocated_gib": peak_allocated_gib,
+        "tokens_per_second": case.tokens * 1000 / p50,
+        "routed_tokens_per_second": case.routed_rows * 1000 / p50,
+    }
+
+
+def _profile_training_arm(arm):
+    import torch
+
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        arm.call()
+    torch.cuda.synchronize()
+    kernels = []
+    for event in prof.key_averages():
+        device_us = getattr(event, "self_device_time_total", 0.0)
+        if device_us <= 0:
+            device_us = getattr(event, "self_cuda_time_total", 0.0)
+        if device_us > 0:
+            kernels.append(
+                {
+                    "name": event.key,
+                    "device_us": float(device_us),
+                    "count": int(event.count),
+                }
+            )
+    kernels.sort(key=lambda item: item["device_us"], reverse=True)
+    return kernels
+
+
+def _run_nvtx_training_arm(backend_name, case, inputs):
+    import torch
+
+    torch.manual_seed(20260812)
+    arm = _make_training_arm(backend_name, case, inputs, torch.randn_like(inputs["expert_input"]))
+    arm.call()
+    arm.call()
+    torch.cuda.synchronize()
+    torch.cuda.nvtx.range_push("nvfp4moe_training_profile")
+    arm.call()
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.synchronize()
+
+
+def _run_interleaved_training(backends, case, inputs, warmup, iterations, profile_kernels=False):
+    import torch
+
+    torch.manual_seed(20260812)
+    dout = torch.randn_like(inputs["expert_input"])
+    arms = {}
+    results = {}
+    for backend_name in backends:
+        try:
+            arms[backend_name] = _make_training_arm(backend_name, case, inputs, dout)
+        except Exception as exc:  # noqa: BLE001
+            results[backend_name] = {
+                "status": "error",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+    if not arms:
+        return results
+
+    for name in list(arms):
+        arm = arms[name]
+        try:
+            arm.call()
+            for _ in range(warmup):
+                arm.call()
+        except Exception as exc:  # noqa: BLE001
+            results[name] = {
+                "status": "error",
+                "reason": f"warmup failed: {type(exc).__name__}: {exc}",
+            }
+            del arms[name]
+    if not arms:
+        return results
+    torch.cuda.synchronize()
+    time.sleep(0.2)
+    torch.cuda.reset_peak_memory_stats()
+
+    samples = {name: [] for name in arms}
+    walls = {name: [] for name in arms}
+    rng = random.Random(20260812)
+    names = list(arms)
+    for _ in range(iterations):
+        order = names.copy()
+        rng.shuffle(order)
+        for name in order:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            wall_start = time.perf_counter()
+            start.record()
+            arms[name].call()
+            end.record()
+            end.synchronize()
+            samples[name].append(start.elapsed_time(end))
+            walls[name].append(1000 * (time.perf_counter() - wall_start))
+
+    first = names[0]
+    canary_samples = []
+    for _ in range(iterations):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        arms[first].call()
+        end.record()
+        end.synchronize()
+        canary_samples.append(start.elapsed_time(end))
+    initial_p50 = statistics.median(samples[first])
+    canary_p50 = statistics.median(canary_samples)
+    canary_drift = abs(canary_p50 / initial_p50 - 1.0)
+    drift_valid = canary_drift <= 0.05
+    peak = torch.cuda.max_memory_allocated() / 2**30
+
+    kernel_profiles = {}
+    if profile_kernels:
+        for name, arm in arms.items():
+            kernel_profiles[name] = _profile_training_arm(arm)
+            for item in kernel_profiles[name][:24]:
+                print(
+                    json.dumps(
+                        {
+                            "event": "kernel_profile",
+                            "backend": name,
+                            "device_us": item["device_us"],
+                            "count": item["count"],
+                            "name": item["name"][:240],
+                        }
+                    ),
+                    flush=True,
+                )
+
+    reference = arms.get("torch_bf16")
+    reference_grads = reference.weight_grads() if reference is not None else None
+    for name, arm in arms.items():
+        timing = _timing_summary(samples[name], walls[name], case, peak)
+        accuracy = None
+        if reference is not None:
+            grads = arm.weight_grads()
+            accuracy = {
+                "output": _sample_error(arm.output.get("y"), reference.output.get("y")),
+                "input_grad": _sample_error(arm.x.grad, reference.x.grad),
+                "router_grad": _sample_error(arm.topv.grad, reference.topv.grad),
+                "gate_up_grad": _sample_error(grads["gate_up"], reference_grads["gate_up"]),
+                "down_grad": _sample_error(grads["down"], reference_grads["down"]),
+            }
+        results[name] = {
+            "status": "ok",
+            "timing": timing,
+            "accuracy_vs_torch_bf16": accuracy,
+            **({"kernels": kernel_profiles[name]} if profile_kernels else {}),
+            "gradient_status": {
+                "input": arm.x.grad is not None and bool(torch.isfinite(arm.x.grad).all()),
+                "router_weight": arm.topv.grad is not None
+                and bool(torch.isfinite(arm.topv.grad).all()),
+            },
+            "session": {
+                "interleaved": True,
+                "first_arm": first,
+                "canary_p50_ms": canary_p50,
+                "canary_drift": canary_drift,
+                "drift_valid": drift_valid,
+                "valid": drift_valid
+                and all(sum(walls[key]) / sum(samples[key]) <= 1.5 for key in arms),
+            },
+        }
+    return results
+
+
 def _run_case(
     backend_name: str,
     case: MoeCase,
@@ -460,6 +810,8 @@ def _run_case(
 
     global_spec = MODEL_SHAPES[case.model]
     spec = replace(global_spec, experts=case.local_experts, ep_sizes=(1,), quick_ep=1)
+    if backend_name == "te_nvfp4_fused" and case.activation != "swiglu":
+        return {"status": "skipped", "reason": "TE fused grouped MLP supports SwiGLU only"}
     if scope == "expert-core":
         token, counts, cu, off_pad = _expert_layout(inputs["topk_index"], case.local_experts)
         routed = inputs["expert_input"][token].contiguous()
@@ -509,6 +861,38 @@ def _run_case(
 
             zero_grad = lambda: backend.zero_grad(set_to_none=True)
 
+        elif backend_name == "te_nvfp4_fused":
+            try:
+                from .moe_backends import TEFusedExpert
+            except ImportError:
+                from moe_backends import TEFusedExpert
+
+            backend = TEFusedExpert(spec, inputs)
+            routed, te_counts = _pad_expert_rows(routed, counts, backend.align)
+            scales = torch.ones(routed.shape[0], dtype=torch.float32, device=routed.device)
+
+            def forward(x, _tv, step):
+                del step
+                return backend.grouped(x, te_counts, scales)
+
+            zero_grad = lambda: backend.zero_grad(set_to_none=True)
+
+        elif backend_name == "torchao_mxfp8":
+            try:
+                from .moe_backends import TorchAOMXFP8Expert
+            except ImportError:
+                from moe_backends import TorchAOMXFP8Expert
+
+            backend = TorchAOMXFP8Expert(spec, inputs)
+            routed, ao_counts = _pad_expert_rows(routed, counts, backend.align)
+            offsets = ao_counts.cumsum(0).to(torch.int32)
+
+            def forward(x, _tv, step):
+                del step
+                return backend.grouped(x, offsets)
+
+            zero_grad = lambda: backend.zero_grad(set_to_none=True)
+
         elif backend_name == "torch_bf16":
             backend = _TorchGroupedExperts(spec, inputs)
             offsets = cu[1:]
@@ -531,6 +915,30 @@ def _run_case(
         zero_grad = lambda: backend.zero_grad(set_to_none=True)
     elif backend_name == "te_nvfp4":
         backend = _te_backend(spec, inputs)
+
+        def forward(x, tv, step):
+            return backend(x, inputs["topk_index"], tv, step)
+
+        zero_grad = lambda: backend.zero_grad(set_to_none=True)
+    elif backend_name == "te_nvfp4_fused":
+        try:
+            from .moe_backends import TEFusedExpert
+        except ImportError:
+            from moe_backends import TEFusedExpert
+
+        backend = TEFusedExpert(spec, inputs)
+
+        def forward(x, tv, step):
+            return backend(x, inputs["topk_index"], tv, step)
+
+        zero_grad = lambda: backend.zero_grad(set_to_none=True)
+    elif backend_name == "torchao_mxfp8":
+        try:
+            from .moe_backends import TorchAOMXFP8Expert
+        except ImportError:
+            from moe_backends import TorchAOMXFP8Expert
+
+        backend = TorchAOMXFP8Expert(spec, inputs)
 
         def forward(x, tv, step):
             return backend(x, inputs["topk_index"], tv, step)
@@ -650,7 +1058,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokens", default=None, help="comma-separated token counts")
     parser.add_argument(
         "--backends",
-        default=("native,te_nvfp4,deepgemm_bf16,deepgemm_fp8_fp4,torch_bf16,torchao_mxfp8"),
+        default=(
+            "native,te_nvfp4_fused,te_nvfp4,deepgemm_bf16,deepgemm_fp8_fp4,torch_bf16,torchao_mxfp8"
+        ),
     )
     parser.add_argument("--scope", choices=(*SCOPES, "both"), default="expert-core")
     parser.add_argument("--pass", dest="benchmark_pass", choices=(*PASSES, "both"), default="fwd")
@@ -661,6 +1071,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--routing", default="all")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument(
+        "--interleave-training",
+        action="store_true",
+        help="interleave full-layer forward+backward arms and rerun the first arm as a canary",
+    )
+    parser.add_argument("--profile-kernels", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--profile-nvtx-arm", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--max-cases", type=int, default=0, help="0 runs the complete selected matrix"
     )
@@ -682,6 +1099,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--trace is required when running --source trace")
     if args.warmup < 0 or args.iterations <= 0 or args.max_cases < 0:
         parser.error("warmup/max-cases must be non-negative and iterations must be positive")
+    if args.interleave_training and not (
+        args.scope == "full-layer" and args.benchmark_pass == "fwd_bwd"
+    ):
+        parser.error("--interleave-training requires --scope full-layer --pass fwd_bwd")
 
     cases = [
         MoeCase(**{key: value for key, value in row.items() if key != "label"})
@@ -762,6 +1183,46 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     flush=True,
                 )
+            continue
+        if args.interleave_training:
+            runnable = [
+                backend
+                for backend in selected
+                if statuses[backend].runnable
+                and "full-layer" in statuses[backend].scopes
+                and "fwd_bwd" in statuses[backend].passes
+            ]
+            if args.profile_nvtx_arm is not None:
+                if args.profile_nvtx_arm not in runnable:
+                    raise RuntimeError(f"profile backend is unavailable: {args.profile_nvtx_arm}")
+                _run_nvtx_training_arm(args.profile_nvtx_arm, case, inputs)
+                return 0
+            interleaved = _run_interleaved_training(
+                runnable,
+                case,
+                inputs,
+                args.warmup,
+                args.iterations,
+                args.profile_kernels,
+            )
+            for backend in selected:
+                status = statuses[backend]
+                base = {
+                    "event": "result",
+                    "backend": backend,
+                    "precision": status.precision,
+                    "scope": "full-layer",
+                    "pass": "fwd_bwd",
+                    "source_metadata": source_metadata,
+                    "case": _case_dict(case),
+                }
+                if backend in interleaved:
+                    result = interleaved[backend]
+                elif not status.runnable:
+                    result = {"status": "skipped", "reason": status.reason}
+                else:
+                    result = {"status": "skipped", "reason": "full training is unsupported"}
+                print(json.dumps({**base, **result}, default=str), flush=True)
             continue
         for scope in scopes:
             for benchmark_pass in passes:

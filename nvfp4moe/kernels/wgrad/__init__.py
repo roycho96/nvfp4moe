@@ -9,7 +9,17 @@ from .kernel import (
 from .utils import MoEWeightMode, WGradInputOrder
 
 
-def _kernel_and_ws(m, n, E, mma_m, mma_n, accumulate=False):
+def _kernel_and_ws(
+    m,
+    n,
+    E,
+    mma_m,
+    mma_n,
+    accumulate=False,
+    input_order=WGradInputOrder.Tensor2D,
+    occupancy=1,
+    persistent_sched=False,
+):
     from .utils import WgradSfTensormapConstructor
 
     kernel = BlockScaledMoEGroupedGemmWgradKernel(
@@ -20,25 +30,45 @@ def _kernel_and_ws(m, n, E, mma_m, mma_n, accumulate=False):
         accumulate_on_output=accumulate,
         expert_cnt=E,
         weight_mode=MoEWeightMode.DENSE,
-        input_order=WGradInputOrder.Tensor2D,
+        input_order=input_order,
+        occupancy=occupancy,
+        persistent_sched=persistent_sched,
     )
     ws_bytes = max(
-        WgradSfTensormapConstructor.get_workspace_size(
-            WGradInputOrder.Tensor2D, MoEWeightMode.DENSE, E
-        ),
+        WgradSfTensormapConstructor.get_workspace_size(input_order, MoEWeightMode.DENSE, E),
         1,
     )
     return kernel, ws_bytes
 
 
 @jit_cache
-def _compile(m, n, E, mma_m, mma_n, accumulate=False):
+def _compile(
+    m,
+    n,
+    E,
+    mma_m,
+    mma_n,
+    accumulate=False,
+    input_order=WGradInputOrder.Tensor2D,
+    occupancy=1,
+    persistent_sched=False,
+):
     import cutlass
     from cutlass import cute
     from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
     assert m % 128 == 0 and n % 128 == 0
-    kernel, ws_bytes = _kernel_and_ws(m, n, E, mma_m, mma_n, accumulate)
+    kernel, ws_bytes = _kernel_and_ws(
+        m,
+        n,
+        E,
+        mma_m,
+        mma_n,
+        accumulate,
+        input_order,
+        occupancy,
+        persistent_sched,
+    )
 
     K = 256  # sample only; the token axis is compiled dynamic
     dev = "cuda"
@@ -96,17 +126,51 @@ class GroupedWgrad:
     offsets. Accumulation uses one owner CTA per output tile without split-K.
     """
 
-    def __init__(self, m, n, E, mma_tiler=(128, 128), accumulate=False):
+    def __init__(
+        self,
+        m,
+        n,
+        E,
+        mma_tiler=(256, 256),
+        accumulate=False,
+        input_order="tensor2d",
+        occupancy=1,
+        persistent_sched=False,
+    ):
         self.m, self.n, self.E = m, n, E
         self.mma = mma_tiler
         self.accumulate = accumulate
-        _, ws_bytes = _kernel_and_ws(m, n, E, *mma_tiler, accumulate)
+        self.occupancy = occupancy
+        self.persistent_sched = persistent_sched
+        try:
+            self.input_order = WGradInputOrder(input_order)
+        except ValueError as exc:
+            raise ValueError("input_order must be 'tensor2d' or 'tensor_ragged'") from exc
+        _, ws_bytes = _kernel_and_ws(
+            m,
+            n,
+            E,
+            *mma_tiler,
+            accumulate,
+            self.input_order,
+            occupancy,
+            persistent_sched,
+        )
         self._ws = torch.empty(ws_bytes, dtype=torch.uint8, device="cuda")
         self._fn = None
 
     def __call__(self, a, b_t, sfa, sfb, off_pad, out, gs_a, gs_b):
         if self._fn is None:
-            self._fn = _compile(self.m, self.n, self.E, *self.mma, self.accumulate)
+            self._fn = _compile(
+                self.m,
+                self.n,
+                self.E,
+                *self.mma,
+                self.accumulate,
+                self.input_order,
+                self.occupancy,
+                self.persistent_sched,
+            )
         K2 = a.shape[1]
         a_v = a.view(torch.uint8).view(torch.float4_e2m1fn_x2)
         b_v = b_t.view(torch.uint8).view(torch.float4_e2m1fn_x2).t()

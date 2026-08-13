@@ -606,8 +606,7 @@ def is_valid_layouts(
 
     if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
         is_valid = False
-    # TODO: Currently we don't support m major output for Float4E2M1FN,
-    # Need to support it in the future.
+    # FP4 output is K-major because the M-major store path is unsupported.
     if d_dtype is cutlass.Float4E2M1FN and cd_major == "m":
         is_valid = False
     return is_valid

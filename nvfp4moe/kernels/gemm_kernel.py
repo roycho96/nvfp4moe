@@ -133,7 +133,9 @@ class Sm100GroupedBlockScaledGemmKernel:
         cluster_shape_mn: tuple[int, int],
         activation: str | None = None,
         dactivation: str | None = None,
+        save_preact: bool = False,
         mma_inst_tile_k: int = 4,
+        use_dynamic_sched: bool = True,
     ):
         """Initializes the configuration for a Blackwell grouped blockscaled GEMM kernel.
 
@@ -155,6 +157,10 @@ class Sm100GroupedBlockScaledGemmKernel:
         self.dactivation = None if dactivation is None else validate_gated_activation(dactivation)
         self.gated = self.activation is not None
         self.dgrad = self.dactivation is not None
+        self.save_preact = bool(save_preact)
+        self.use_dynamic_sched = bool(use_dynamic_sched)
+        if self.save_preact and not self.gated:
+            raise ValueError("saved preactivation requires a gated epilogue")
         self.mma_inst_tile_k = mma_inst_tile_k
         self.sf_vec_size = sf_vec_size
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -317,23 +323,23 @@ class Sm100GroupedBlockScaledGemmKernel:
         )
         self.num_preact_stage = 0
         self.num_aux_stage = 0
-        if self.dgrad:
-            ab_stage_reduction = (
-                2 if self.use_2cta_instrs and self.mma_inst_shape_mn[1] == 256 else 1
-            )
-            if self.mma_inst_tile_k == 2:
+        if self.dgrad or self.save_preact:
+            ab_stage_reduction = 1
+            if self.dgrad and self.use_2cta_instrs and self.mma_inst_shape_mn[1] == 256:
+                ab_stage_reduction = 2
+            if self.dgrad and self.mma_inst_tile_k == 2:
                 ab_stage_reduction += 1
                 if self.use_2cta_instrs and self.mma_inst_shape_mn[1] == 128:
                     ab_stage_reduction += 1
             self.num_ab_stage = max(2, self.num_ab_stage - ab_stage_reduction)
             self.num_c_stage = 2
-            self.num_preact_stage = 2
             self.num_aux_stage = 2
+            if self.dgrad:
+                self.num_preact_stage = 2
 
-        # A one-stage accumulator normally serializes MMA with the epilogue.
-        # For the fused gated tile, alternate two TMEM banks: one holds the
-        # accumulator while the other temporarily holds its scale factors.
-        self.interleave_scale_tmem = self.gated and self.num_acc_stage == 1
+        # Alternate TMEM banks when a single accumulator stage would serialize
+        # the mainloop and epilogue.
+        self.interleave_scale_tmem = self.num_acc_stage == 1 and self.mma_tiler[1] == 256
         self.tmem_release_subtile = -1
         if self.interleave_scale_tmem:
             scale_columns = (
@@ -378,7 +384,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             self.num_c_stage,
         )
         self.aux_smem_layout_staged = self.c_smem_layout_staged
-        if self.dgrad:
+        if self.dgrad or self.save_preact:
             self.aux_smem_layout_staged = sm100_utils.make_smem_layout_epi(
                 cutlass.BFloat16,
                 self.c_layout,
@@ -418,6 +424,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         data_sfa: cute.Tensor,
         data_sfb: cute.Tensor,
         cu_seqlens_m: cute.Tensor,
+        sched_counter: cute.Tensor,
         group_count: cutlass.Constexpr[int],
         problem_n: cutlass.Constexpr[int],
         problem_k: cutlass.Constexpr[int],
@@ -685,6 +692,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                 preact_smem_layout,
                 self.epi_tile,
             )
+        if cutlass.const_expr(self.dgrad or self.save_preact):
             aux_smem_layout = cute.slice_(self.aux_smem_layout_staged, (None, None, 0))
             tma_atom_aux, tma_tensor_aux = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileS2GOp(),
@@ -700,6 +708,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             expert_shape=(group_count, problem_n, problem_k),
             cta_tile_shape_mnk=self.cta_tile_shape_mnk,
             cluster_shape_mn=self.cluster_shape_mn,
+            use_dynamic_sched=self.use_dynamic_sched,
         )
 
         self.buffer_align_bytes = 1024
@@ -707,7 +716,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         # Define shared storage for kernel
         SchedulerStorage = MoEPersistentTileScheduler.make_storage_struct(
             self.num_sched_stage,
-            use_dynamic_sched=False,
+            use_dynamic_sched=self.use_dynamic_sched,
         )
         PreactBarriers = cute.struct.MemRange[cutlass.Int32, 0]
         PreactStorage = cute.struct.MemRange[cutlass.Int32, 0]
@@ -724,6 +733,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                 ],
                 self.buffer_align_bytes,
             ]
+        if cutlass.const_expr(self.dgrad or self.save_preact):
             AuxStorage = cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.BFloat16,
@@ -805,6 +815,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             moe_sched_params,
             group_count,
             cu_seqlens_m,
+            sched_counter,
             alpha,
             output_sf,
             output_scale,
@@ -849,6 +860,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         moe_sched_params: MoESchedulerParams,
         group_count: cutlass.Constexpr,
         cu_seqlens_m: cute.Tensor,
+        sched_counter: cute.Tensor,
         alpha: cute.Tensor,
         output_sf: cute.Tensor,
         output_scale: cute.Tensor,
@@ -866,6 +878,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_c)
             if cutlass.const_expr(self.dgrad):
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_preact)
+            if cutlass.const_expr(self.dgrad or self.save_preact):
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_aux)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
@@ -943,6 +956,26 @@ class Sm100GroupedBlockScaledGemmKernel:
             barrier_storage=storage.scheduler.tile_info_mbar.data_ptr(),
             defer_sync=True,
         )
+
+        expert_ends = cute.make_tensor(
+            cu_seqlens_m.iterator + 1,
+            cute.make_layout(group_count),
+        )
+        sched_counter_ptr = cute.make_ptr(
+            cutlass.Int32,
+            sched_counter.iterator.toint(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        )
+        tile_sched = MoEPersistentTileScheduler.create(
+            moe_sched_params,
+            expert_ends,
+            cute.arch.block_idx(),
+            cute.arch.grid_dim(),
+            counter_ptr=sched_counter_ptr,
+            sched_storage=storage.scheduler,
+        )
+        tile_sched.internal_init()
         preact_pipeline = None
         if cutlass.const_expr(self.dgrad):
             preact_pipeline = pipeline.PipelineTmaAsync.create(
@@ -981,6 +1014,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                 c_smem_layout_staged.outer,
                 swizzle=c_smem_layout_staged.inner,
             )
+        if cutlass.const_expr(self.dgrad or self.save_preact):
             sAux = storage.sAux.get_tensor(
                 aux_smem_layout_staged.outer,
                 swizzle=aux_smem_layout_staged.inner,
@@ -1085,23 +1119,6 @@ class Sm100GroupedBlockScaledGemmKernel:
         #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
-        grid_dim = cute.arch.grid_dim()
-        #
-        # Persistent tile scheduling loop
-        #
-        # When the problem shapes are on device, we launch one CTA per SM.
-        # The if condition later prevents the warps from extra CTAs from doing any work.
-        expert_ends = cute.make_tensor(
-            cu_seqlens_m.iterator + 1,
-            cute.make_layout(group_count),
-        )
-        tile_sched = MoEPersistentTileScheduler.create(
-            moe_sched_params,
-            expert_ends,
-            cute.arch.block_idx(),
-            grid_dim,
-        )
-
         if warp_idx == self.sched_warp_id:
             sched_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
@@ -1172,10 +1189,12 @@ class Sm100GroupedBlockScaledGemmKernel:
             reuse_cache_policy = None
             stream_cache_policy = None
             if cutlass.const_expr(self.mma_inst_tile_k == 2):
-                # Small shards reuse A across output tiles; B remains streaming.
                 if cutlass.const_expr(group_count <= 128):
                     reuse_cache_policy = _tma_evict_last_policy()
                 stream_cache_policy = _tma_evict_first_policy()
+
+            last_group_idx = cutlass.Int32(-1)
+            expert_row = cutlass.Int32(0)
 
             while work_tile.is_valid_tile:
                 cur_k_tile_cnt = k_tile_count
@@ -1199,7 +1218,9 @@ class Sm100GroupedBlockScaledGemmKernel:
                         cur_group_idx,
                     )
 
-                    expert_row = cu_seqlens_m[cur_group_idx]
+                    if cur_group_idx != last_group_idx:
+                        expert_row = cu_seqlens_m[cur_group_idx]
+                        last_group_idx = cur_group_idx
                     mA_mk = cute.domain_offset(
                         (expert_row, None),
                         mA_mkl[(None, None, 0)],
@@ -1220,7 +1241,6 @@ class Sm100GroupedBlockScaledGemmKernel:
                         0,
                         cute.rank(sA) - 1,
                     )
-
                     sfa_tile = expert_row // 128 + cur_group_idx
                     mSFA_mk = cute.domain_offset(
                         ((None, sfa_tile), None),
@@ -1242,7 +1262,6 @@ class Sm100GroupedBlockScaledGemmKernel:
                         0,
                         cute.rank(sSFA) - 1,
                     )
-
                     #
                     # Slice to per mma tile index
                     #
@@ -1389,11 +1408,9 @@ class Sm100GroupedBlockScaledGemmKernel:
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
 
             # Make SFA tmem tensor
-            acc_bank = (
-                tCtAcc_base[(None, None, None, 0)]
-                if cutlass.const_expr(self.interleave_scale_tmem)
-                else tCtAcc_base
-            )
+            acc_bank = tCtAcc_base
+            if cutlass.const_expr(self.interleave_scale_tmem):
+                acc_bank = tCtAcc_base[(None, None, None, 0)]
             acc_tmem_col_offset = tcgen05.find_tmem_tensor_col_offset(acc_bank)
             sfa_tmem_ptr = cute.recast_ptr(
                 acc_tmem_ptr + acc_tmem_col_offset,
@@ -1694,6 +1711,20 @@ class Sm100GroupedBlockScaledGemmKernel:
                     full_tiled_copy_r2s,
                 )
                 tRS_sC = tiled_copy_r2s.get_slice(epi_tidx).partition_D(sC)
+                if cutlass.const_expr(self.save_preact):
+                    aux_copy_atom_r2s = sm100_utils.get_smem_store_op(
+                        self.c_layout,
+                        cutlass.BFloat16,
+                        self.acc_dtype,
+                        tiled_copy_t2r,
+                    )
+                    aux_tiled_copy_r2s = cute.make_tiled_copy_D(
+                        aux_copy_atom_r2s,
+                        tiled_copy_t2r,
+                    )
+                    tTR_rAux = cute.make_rmem_tensor(tTR_rAcc.shape, cutlass.BFloat16)
+                    tRS_rAux = aux_tiled_copy_r2s.retile(tTR_rAux)
+                    tRS_sAux = aux_tiled_copy_r2s.get_slice(epi_tidx).partition_D(sAux)
             else:
                 tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
                 tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
@@ -1726,7 +1757,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                     tRS_sAux = aux_tiled_copy_r2s.get_slice(epi_tidx).partition_D(sAux)
             c_tma_smem = cute.group_modes(sC, 0, cute.rank(sC) - 1)
             aux_tma_smem = None
-            if cutlass.const_expr(self.dgrad):
+            if cutlass.const_expr(self.dgrad or self.save_preact):
                 aux_tma_smem = cute.group_modes(sAux, 0, cute.rank(sAux) - 1)
 
             #
@@ -1764,7 +1795,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                 32 * len(self.epilog_warp_id),
             )
             c_store_stages = self.num_c_stage
-            if cutlass.const_expr(self.dgrad):
+            if cutlass.const_expr(self.dgrad or self.save_preact):
                 c_store_stages = self.num_aux_stage
             c_pipeline = pipeline.PipelineTmaStore.create(
                 num_stages=c_store_stages,
@@ -1775,6 +1806,9 @@ class Sm100GroupedBlockScaledGemmKernel:
             if cutlass.const_expr(self.is_nvfp4_output):
                 output_inv_pts = cutlass.Float32(output_scale[1])
             alpha_value = cutlass.Float32(alpha[0])
+            last_group_idx = cutlass.Int32(-1)
+            expert_row = cutlass.Int64(0)
+            expert_rows = cutlass.Int32(0)
 
             while work_tile.is_valid_tile:
                 cur_group_idx = work_tile.expert_idx
@@ -1790,8 +1824,10 @@ class Sm100GroupedBlockScaledGemmKernel:
                 cute.arch.fence_acq_rel_cta()
                 sched_pipeline.consumer_release(sched_consumer_state)
                 sched_consumer_state.advance()
-                expert_row = cutlass.Int64(cu_seqlens_m[cur_group_idx])
-                expert_rows = cu_seqlens_m[cur_group_idx + 1] - cu_seqlens_m[cur_group_idx]
+                if cur_group_idx != last_group_idx:
+                    expert_row = cutlass.Int64(cu_seqlens_m[cur_group_idx])
+                    expert_rows = cu_seqlens_m[cur_group_idx + 1] - cutlass.Int32(expert_row)
+                    last_group_idx = cur_group_idx
                 c_window = cute.domain_offset(
                     (
                         mC_mnl.shape[0] - expert_rows,
@@ -1815,7 +1851,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                     cute.rank(c_subtiles) - 1,
                 )
                 aux_tma_gmem = None
-                if cutlass.const_expr(self.dgrad):
+                if cutlass.const_expr(self.dgrad or self.save_preact):
                     aux_window = cute.domain_offset(
                         (
                             mAux_mnl.shape[0] - expert_rows,
@@ -1929,6 +1965,19 @@ class Sm100GroupedBlockScaledGemmKernel:
                         tTR_rAcc.fill(0)
 
                     if cutlass.const_expr(self.gated):
+                        if cutlass.const_expr(self.save_preact):
+                            acc_values = cute.make_tensor(
+                                tTR_rAcc.iterator,
+                                cute.make_layout(cute.size(tTR_rAcc)),
+                            )
+                            preact_values = cute.make_tensor(
+                                tTR_rAux.iterator,
+                                cute.make_layout(cute.size(tTR_rAux)),
+                            )
+                            for value_idx in cutlass.range_constexpr(cute.size(acc_values)):
+                                preact_values[value_idx] = (acc_values[value_idx] * alpha_value).to(
+                                    cutlass.BFloat16
+                                )
                         postact = gated_postact_fragment(
                             tTR_rAcc,
                             alpha_value,
@@ -2035,6 +2084,9 @@ class Sm100GroupedBlockScaledGemmKernel:
                             for value_idx in cutlass.range_constexpr(cute.size(postact)):
                                 postact_out[value_idx] = postact[value_idx].to(self.c_dtype)
                         c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
+                        aux_buffer = c_buffer
+                        if cutlass.const_expr(self.save_preact):
+                            aux_buffer = (num_prev_subtiles + subtile_idx) % self.num_aux_stage
                         if warp_idx == self.epilog_warp_id[0]:
                             c_pipeline.producer_acquire()
                         self.epilog_sync_barrier.arrive_and_wait()
@@ -2043,6 +2095,12 @@ class Sm100GroupedBlockScaledGemmKernel:
                             tiled_copy_r2s.retile(postact_out),
                             tRS_sC[(None, None, None, c_buffer)],
                         )
+                        if cutlass.const_expr(self.save_preact):
+                            cute.copy(
+                                aux_tiled_copy_r2s,
+                                tRS_rAux,
+                                tRS_sAux[(None, None, None, aux_buffer)],
+                            )
                         cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier.arrive_and_wait()
                         if warp_idx == self.epilog_warp_id[0]:
@@ -2051,6 +2109,12 @@ class Sm100GroupedBlockScaledGemmKernel:
                                 c_tma_smem[(None, c_buffer)],
                                 c_tma_gmem[(None, subtile_idx)],
                             )
+                            if cutlass.const_expr(self.save_preact):
+                                utils.block_copy(
+                                    tma_atom_aux,
+                                    aux_tma_smem[(None, aux_buffer)],
+                                    aux_tma_gmem[(None, subtile_idx)],
+                                )
                             c_pipeline.producer_commit()
                     elif cutlass.const_expr(self.dgrad):
                         retiled_acc = tiled_copy_r2s.retile(tTR_rAcc)
@@ -2178,7 +2242,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                     else:
                         if not is_k_tile_cnt_zero:
                             acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                            tRS_rC.store((acc_vec * alpha[0]).to(self.c_dtype))
+                            tRS_rC.store((acc_vec * alpha_value).to(self.c_dtype))
                         elif cutlass.const_expr(self.is_nvfp4_output):
                             zeros_i8 = cute.make_rmem_tensor(
                                 cute.recast_layout(

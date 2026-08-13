@@ -3,6 +3,7 @@
 from importlib import import_module
 
 __all__ = [
+    "DenseNvfp4Gemm",
     "GatedBackwardEpilogue",
     "GatedEpilogue",
     "GroupedGemmKernel",
@@ -24,6 +25,7 @@ __all__ = [
 ]
 
 _EXPORTS = {
+    "DenseNvfp4Gemm": (".dense_gemm", "DenseNvfp4Gemm"),
     "GatedBackwardEpilogue": (".epilogue", "GatedBackwardEpilogue"),
     "GatedEpilogue": (".epilogue", "GatedEpilogue"),
     "GroupedGemmKernel": (".gemm_kernel", "GroupedGemmKernel"),

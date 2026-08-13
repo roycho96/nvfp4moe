@@ -3,6 +3,7 @@
 from importlib import import_module
 
 __all__ = [
+    "DenseNvfp4Gemm",
     "GatedBackwardEpilogue",
     "GatedEpilogue",
     "GroupedGemmKernel",
@@ -18,12 +19,16 @@ __all__ = [
     "moe_dispatch",
     "moe_finalize",
     "moe_finalize_bwd",
+    "nvfp4_gemm",
+    "nvfp4_gemm_out",
+    "nvfp4_quantize",
     "nvfp4_quantize_colwise",
     "nvfp4_quantize_rowwise",
 ]
 __version__ = "0.1.0"
 
 _EXPORTS = {
+    "DenseNvfp4Gemm": (".kernels.dense_gemm", "DenseNvfp4Gemm"),
     "GatedBackwardEpilogue": (".kernels.epilogue", "GatedBackwardEpilogue"),
     "GatedEpilogue": (".kernels.epilogue", "GatedEpilogue"),
     "GroupedGemmKernel": (".kernels.gemm_kernel", "GroupedGemmKernel"),
@@ -39,6 +44,9 @@ _EXPORTS = {
     "moe_dispatch": (".kernels.dispatch", "moe_dispatch"),
     "moe_finalize": (".kernels.finalize", "moe_finalize"),
     "moe_finalize_bwd": (".kernels.finalize", "moe_finalize_bwd"),
+    "nvfp4_gemm": (".ops", "nvfp4_gemm"),
+    "nvfp4_gemm_out": (".ops", "nvfp4_gemm_out"),
+    "nvfp4_quantize": (".ops", "nvfp4_quantize"),
     "nvfp4_quantize_colwise": (".kernels.quantize", "nvfp4_quantize_colwise"),
     "nvfp4_quantize_rowwise": (".kernels.quantize", "nvfp4_quantize_rowwise"),
 }

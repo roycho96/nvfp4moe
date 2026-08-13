@@ -21,7 +21,7 @@ dependencies = [
     "apache-tvm-ffi>=0.1.6,<0.2",
     "cuda-python>=13,<14",
     "einops>=0.8",
-    "nvidia-cutlass-dsl~=4.6.0",
+    "nvidia-cutlass-dsl>=4.6,<4.8",
     "torch>=2.11",
     "torch-c-dlpack-ext",
 ]

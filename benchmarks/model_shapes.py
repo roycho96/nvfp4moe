@@ -225,6 +225,11 @@ def _ep_grid(spec: ModelShape, suite: str) -> tuple[int, ...]:
     return (spec.quick_ep,) if suite == "quick" else spec.ep_sizes
 
 
+def _quick_moe_ep(spec: ModelShape) -> int:
+    candidates = [ep for ep in spec.ep_sizes if spec.local_experts(ep) > spec.topk]
+    return max(candidates, default=spec.quick_ep)
+
+
 def generate_gemm_cases(
     models: Iterable[str],
     tokens: Iterable[int],
@@ -276,10 +281,13 @@ def generate_moe_cases(
     rows = []
     for key in models:
         spec = MODEL_SHAPES[key]
-        # A replay file represents one local EP shard.  Using the quick EP
-        # keeps every registered model within the native 256-expert limit and
-        # avoids pretending that one global checkpoint tensor is a local run.
-        ep_grid = (spec.quick_ep,) if source == "trace" else _ep_grid(spec, suite)
+        # A trace represents one local EP shard.
+        if source == "trace":
+            ep_grid = (spec.quick_ep,)
+        elif suite == "quick":
+            ep_grid = (_quick_moe_ep(spec),)
+        else:
+            ep_grid = spec.ep_sizes
         for ep_size in ep_grid:
             for token_count in tokens:
                 for routing in routing_grid:

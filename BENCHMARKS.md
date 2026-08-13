@@ -1,96 +1,134 @@
-# B200 benchmarks
+# B200 benchmark results
 
-Measured on August 11, 2026, on one NVIDIA B200 (`sm100`) with NGC PyTorch
-26.07, CUDA 13, CUTLASS DSL 4.6, Transformer Engine 2.17, and DeepGEMM at
-`559d79f`. JIT compilation, weight packing, calibration, and input creation
-complete before timing.
+Results were measured on NVIDIA B200 (`sm100`) with NGC PyTorch 26.07 and
+CUDA 13. The standalone grouped comparison uses CUTLASS DSL 4.7, FlashInfer
+0.6.17, and PyTorch 2.13 nightly. The training comparison uses Transformer
+Engine 2.17.
 
-There are two public benchmark entry points:
+Two public entry points cover the project:
 
-1. `benchmarks/nvfp4_gemm.py` for standalone grouped GEMM
-2. `benchmarks/nvfp4_moe.py` for expert-core and complete MoE layer timing
+1. `benchmarks/nvfp4_gemm.py` — dense and grouped NVFP4 GEMM
+2. `benchmarks/nvfp4_moe.py` — expert-core and complete MoE layer
 
-Both emit JSON for `--list` and JSONL while running. A missing backend is
-reported as `skipped`; the scripts never record another implementation under
-its name.
+Both scripts emit JSON with `--list` and JSONL while running. Missing backends
+are reported as skipped; no fallback is timed under another backend's name.
 
-## ⚙️ Workload
+## ⚙️ Method
 
-The tables below use 8,192 tokens and deterministic jagged routing. Top-k 8
-models therefore execute 65,536 routed rows. Each case uses the practical
-quick-suite expert-parallel shard shown here.
+- Inputs are fixed for every backend in a case.
+- Timed arms are interleaved in one GPU session.
+- Tables report CUDA-event median latency. Raw JSONL also includes IQR and
+  p10/p90.
+- The first arm is rerun as a canary. A case is rejected above 5% drift.
+- A run is rejected when wall time divided by summed GPU time exceeds 1.5.
+- Compilation, input creation, calibration, and weight packing happen before
+  timing unless the case is marked `dynamic`.
 
-| model | D | I | global E | top-k | EP | local E | activation |
-|---|---:|---:|---:|---:|---:|---:|---|
-| Qwen3-30B-A3B | 2,048 | 768 | 128 | 8 | 16 | 8 | SwiGLU |
-| Qwen3-235B-A22B | 4,096 | 1,536 | 128 | 8 | 16 | 8 | SwiGLU |
-| Gemma 4 26B A4B | 2,816 | 704→768 | 128 | 8 | 16 | 8 | GeGLU |
-| DeepSeek-V3.2 | 7,168 | 2,048 | 256 | 8 | 32 | 8 | SwiGLU |
-| Kimi-K2.7 | 7,168 | 2,048 | 384 | 8 | 48 | 8 | SwiGLU |
-| MiniMax-M2 | 3,072 | 1,536 | 256 | 8 | 32 | 8 | SwiGLU |
-| Llama 4 Scout | 5,120 | 8,192 | 16 | 1 | 2 | 8 | SwiGLU |
+Synthetic top-k assignments are sampled without replacement. The training
+quick suite also keeps more local experts than top-k, so balanced and skewed
+routing remain distinct. Standalone GEMM retains the common eight-expert
+shard:
 
-Forward tables are CUDA-event medians of 10 samples after three warmups.
-Training tables are medians of five forward-plus-backward samples after two
-warmups. All comparisons are same-session. TE pads each local expert to 64
-rows; both logical and executed throughput are emitted in the raw result.
+| model | hidden | intermediate | global experts | top-k | GEMM EP size / local E | training EP size / local E |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3-30B-A3B | 2,048 | 768 | 128 | 8 | 16 / 8 | 8 / 16 |
+| Qwen3-235B-A22B | 4,096 | 1,536 | 128 | 8 | 16 / 8 | 8 / 16 |
+| Gemma 4 26B A4B | 2,816 | 704→768 | 128 | 8 | 16 / 8 | 8 / 16 |
+| DeepSeek-V3.2 | 7,168 | 2,048 | 256 | 8 | 32 / 8 | 8 / 32 |
+| Kimi-K2.7 | 7,168 | 2,048 | 384 | 8 | 48 / 8 | 24 / 16 |
+| MiniMax-M2 | 3,072 | 1,536 | 256 | 8 | 32 / 8 | 8 / 32 |
+| Llama 4 Scout | 5,120 | 8,192 | 16 | 1 | 2 / 8 | 8 / 2 |
 
-## 🧱 Standalone NVFP4 grouped GEMM
+## 🧱 Grouped NVFP4 GEMM
 
-`dynamic` includes BF16 activation quantization and grouped GEMM. Expert
-weights remain resident and prepacked for both implementations.
+The prepacked test excludes activation quantization and interleaves native,
+FlashInfer `grouped_gemm_nt_masked`, and PyTorch `scaled_grouped_mm`. PyTorch
+is measured only for balanced routing because its NVFP4 grouped path requires
+128-row-aligned groups.
 
-| model | native FC1 | TE FC1 | native FC2 | TE FC2 | native speedup range |
-|---|---:|---:|---:|---:|---:|
-| Qwen3-30B | 0.188 ms | 0.527 ms | 0.114 ms | 0.445 ms | 2.80×–3.89× |
-| Qwen3-235B | 0.490 ms | 0.949 ms | 0.284 ms | 0.687 ms | 1.93×–2.42× |
-| Gemma 4 26B | 0.238 ms | 0.615 ms | 0.143 ms | 0.497 ms | 2.58×–3.47× |
-| DeepSeek-V3.2 | 0.989 ms | 1.632 ms | 0.544 ms | 1.028 ms | 1.65×–1.89× |
-| Kimi-K2.7 | 0.990 ms | 1.702 ms | 0.572 ms | 1.063 ms | 1.72×–1.86× |
-| MiniMax-M2 | 0.383 ms | 0.810 ms | 0.231 ms | 0.597 ms | 2.12×–2.58× |
-| Llama 4 Scout | 0.361 ms | 0.637 ms | 0.206 ms | 0.458 ms | 1.76×–2.23× |
+Latency below is in microseconds for 65,536 routed rows:
 
-Native won all 14 dynamic cases. The CLI also measures prepacked GEMM-only,
-dgrad, and the K-grouped wgrad contract. Qwen FC2 smoke tests exercised all
-six native mode/direction combinations successfully.
+| model | FC1 native / FlashInfer / PyTorch | FC2 native / FlashInfer / PyTorch |
+|---|---:|---:|
+| Qwen3-30B | **123.7** / 138.9 / 131.5 | 92.5 / **90.5** / 124.0 |
+| Qwen3-235B | **367.8** / 455.5 / **367.8** | 258.4 / 271.1 / **253.6** |
+| Gemma 4 26B | **154.2** / 174.8 / 164.2 | 123.6 / **118.9** / 162.4 |
+| DeepSeek-V3.2 | **711.0** / 1,096.4 / 771.9 | **432.0** / 595.4 / 479.1 |
+| Kimi-K2.7 | **738.0** / 1,131.9 / 792.4 | **448.4** / 619.9 / 497.6 |
+| MiniMax-M2 | 311.6 / 356.3 / **305.6** | 197.0 / 208.1 / **194.9** |
+| Llama 4 Scout | **331.0** / 424.6 / 349.3 | **162.5** / 202.2 / 179.7 |
 
-## ⚡ Full MoE forward
+The DeepSeek and Kimi rows were remeasured on August 13 after the long-hidden
+scheduler update. Native led FlashInfer in all eight balanced/jagged cases and
+PyTorch in all four aligned balanced cases. The balanced advantage was
+6.9–9.9% over PyTorch and 27.5–35.2% over FlashInfer. PyTorch remains skipped
+for jagged routing because it requires 128-row-aligned groups.
 
-`full-layer` includes dispatch, FC1, activation, FC2, probability weighting,
-and combine. Router logits and top-k selection are excluded. These rows use
-synthetic tensors with the exact model geometry and deterministic routing;
-they are performance cases, not checkpoint-quality comparisons.
+For K=2,048 FC2, a direct scheduler A/B measured static at 394.0 us versus
+dynamic at 396.9 us on balanced routing, and 394.0 versus 396.6 us on jagged
+routing. The standalone runtime now selects static scheduling for K≤2,048 and
+keeps dynamic scheduling for longer reductions. Explicit scheduler selection
+remains available to the expert-layer runtime.
 
-| model | native NVFP4 | TE NVFP4 | DeepGEMM BF16 | DeepGEMM FP8×FP4 | Torch BF16 |
-|---|---:|---:|---:|---:|---:|
-| Qwen3-30B | **0.527 ms** | 2.532 ms | 1.252 ms | 2.417 ms | 1.899 ms |
-| Qwen3-235B | **0.963 ms** | 2.749 ms | 2.476 ms | 4.495 ms | 4.415 ms |
-| Gemma 4 26B | **0.532 ms** | 1.708 ms | 1.270 ms | 2.698 ms | 2.391 ms |
-| DeepSeek-V3.2 | **1.713 ms** | 3.695 ms | 4.381 ms | 7.062 ms | 8.809 ms |
-| Kimi-K2.7 | **1.714 ms** | 3.714 ms | 4.358 ms | 7.091 ms | 8.958 ms |
-| MiniMax-M2 | **0.782 ms** | 2.475 ms | 2.001 ms | 3.704 ms | 3.480 ms |
-| Llama 4 Scout | **0.763 ms** | 2.311 ms | 2.719 ms | 3.504 ms | 2.429 ms |
+All retained rows used 20 samples after 200 ms stabilization, had a valid
+native canary, and reached sampled BF16-reference cosine of at least 0.99078.
+
+## 🔹 Dense NVFP4 GEMM
+
+Dense mode measures `C = A @ B.T` without an expert dimension. It compares the
+native kernel with the NGC image's cuBLASLt path through
+`torch.nn.functional.scaled_mm`. The native runner autotunes CTA tiles before
+the timed region and exposes both allocating and preallocated output APIs.
+
+The full suite covers FC1 and FC2 from Qwen3-30B, Qwen3-235B, DeepSeek-V3.2,
+and Llama 4 at M=128, 512, 2,048, and 8,192. cuBLASLt was faster overall in the
+measured matrix; native led a small subset of large-K cases. Dense results are
+therefore reported as a comparison, not a universal SOTA claim.
 
 ## 🔁 Full MoE training
 
-The timed region contains forward, output-gradient backward, input gradient,
-router-weight gradient, and both expert weight gradients.
+The timed region contains dispatch, FC1, activation, FC2, probability
+weighting, combine, input gradient, router-weight gradient, and both expert
+weight gradients. Transformer Engine uses its fused NVFP4
+`GroupedLinear → SwiGLU → GroupedLinear` training graph. Torch BF16 is included
+as a precision and performance reference.
 
-| model | native NVFP4 | TE NVFP4 | DeepGEMM BF16 |
-|---|---:|---:|---:|
-| Qwen3-30B | **2.071 ms** | 3.843 ms | 3.573 ms |
-| DeepSeek-V3.2 | **8.897 ms** | 9.939 ms | 16.135 ms |
-| Kimi-K2.7 | **8.830 ms** | 10.063 ms | 16.244 ms |
-| MiniMax-M2 | **3.790 ms** | 5.366 ms | 6.831 ms |
+Corrected 8K results from August 12, 2026:
 
-All input and router gradients were finite. The native path led both
-comparators in every measured training case, including the long-K DeepSeek and
-Kimi geometries.
+| model / routing | native NVFP4 | TE fused NVFP4 | Torch BF16 | native vs TE |
+|---|---:|---:|---:|---:|
+| Qwen3-30B / balanced | **2.520 ms** | 3.888 ms | 4.814 ms | 35.2% faster |
+| Qwen3-30B / jagged | **2.482 ms** | 3.921 ms | 4.865 ms | 36.7% faster |
+| DeepSeek-V3.2 / balanced | **7.383 ms** | 9.784 ms | 22.373 ms | 24.5% faster |
+| DeepSeek-V3.2 / jagged | **7.408 ms** | 9.838 ms | 22.443 ms | 24.7% faster |
+| Kimi-K2.7 / balanced | **6.980 ms** | 8.916 ms | 22.112 ms | 21.7% faster |
+| Kimi-K2.7 / jagged | **7.018 ms** | 8.891 ms | 22.359 ms | 21.1% faster |
+| MiniMax-M2 / balanced | **3.584 ms** | 5.538 ms | 9.116 ms | 35.3% faster |
+| MiniMax-M2 / jagged | **3.564 ms** | 5.508 ms | 9.076 ms | 35.3% faster |
+
+Each row uses 10 interleaved samples after three warmups. Canary drift was
+0.19–4.27%, so every row passed the 5% gate.
+
+An earlier matrix allowed duplicate expert ids inside a token. The native arm
+processed all 65,536 routes while TE's mask collapsed duplicates to 43,019
+unique routes. Those results were invalid and are not used above. The corrected
+generator samples top-k experts without replacement and records actual counts
+in every result.
+
+For EP shards with at most 32 local experts, a warp-ballot scatter replaced one
+thread-per-expert serial scans. At local E=8, direct same-session measurement
+reduced dispatch from 111 to 17 microseconds. Parallelizing the histogram then
+reduced local-E=32 dispatch from 25.73 to 23.09 microseconds. Both comparisons
+were bitwise identical. The remaining backward control cost is primarily
+router-gradient dot reduction; a packed implementation increased latency and
+was rejected.
 
 ## 🧪 Precision
 
-A separate 8,192-token FineWeb-Edu trace uses Qwen3-30B-A3B layer-0 checkpoint
-weights, activations, and routing. Against a BF16 PyTorch layer reference:
+Against the Torch BF16 layer in the final run, native output cosine was
+0.9727–0.9735 and input-gradient cosine was 0.9619–0.9626. Router and expert
+weight gradients were finite in every case. A separate Qwen3-30B FineWeb-Edu
+trace measured:
 
 | tensor | cosine similarity | relative L2 |
 |---|---:|---:|
@@ -100,69 +138,67 @@ weights, activations, and routing. Against a BF16 PyTorch layer reference:
 | gate/up weight gradient | 0.968857 | 0.25141 |
 | down weight gradient | 0.986734 | 0.16351 |
 
-The routed-core B200 test measured 0.97357 output cosine to the FP32 master
-reference and verified finite input, gate, up, and down gradients. Packed E2M1
-data and active E4M3 scale factors are checked against the independent PyTorch
-format reference; TE row/column quantization is also checked bitwise.
+These are layer-level numerical checks, not convergence results.
 
-These are layer-level checks, not a convergence result.
+## 🧭 Coverage
 
-## 🧭 Matrix controls
+The full suites cover:
 
-The quick suite uses token counts 128 and 8,192, one practical EP shard, and
-balanced/jagged routing. The full suite covers:
-
-- tokens: 1, 128, 512, 2,048, 8,192, 16,384
-- routing: balanced, jagged, hotspot, and boundary-tail distributions
+- tokens: 1, 128, 512, 2,048, 8,192, and 16,384
+- balanced, jagged, hotspot, boundary-tail, and empty-expert routing
 - every registered EP size
-- FC1 and FC2
-- standalone fwd, dgrad, and wgrad
-- prepacked and dynamic quantization scopes
-- expert-core and full-layer
-- forward and forward-plus-backward
+- FC1, FC2, dgrad, and K-grouped wgrad
+- prepacked and dynamic activation quantization
+- expert-core and full-layer forward/forward-backward timing
 
-`--source trace` replays a local EP shard. The `.pt` file must contain
+`--source trace` replays a local EP shard from a `.pt` file containing
 `expert_input`, `topk_index`, `topk_weight`, `gate_up_weight`, and
-`down_weight`. The same timing rules apply to synthetic and captured inputs.
+`down_weight`.
 
-## 🔁 Reproduce
+## 🚀 Reproduce
 
-Inspect matrices without a GPU:
+Inspect the matrices without a GPU:
 
 ```bash
 python benchmarks/nvfp4_gemm.py --list --suite full
 python benchmarks/nvfp4_moe.py --list --suite full
 ```
 
-Run the 8K standalone comparison:
+Run standalone grouped and dense comparisons:
 
 ```bash
 python benchmarks/nvfp4_gemm.py \
-  --models all --tokens 8192 --routing jagged \
-  --backends native,te_nvfp4 --mode dynamic
+  --models all --tokens 8192 --routing balanced,jagged \
+  --backends native,flashinfer_cutedsl,torch_scaled_grouped_mm \
+  --mode prepacked --warmup 3 --iterations 20
+
+python benchmarks/nvfp4_gemm.py \
+  --workload dense --suite full \
+  --models qwen3_30b_a3b,qwen3_235b_a22b,deepseek_v3_2,llama4_scout \
+  --tokens 128,512,2048,8192 --projections fc1,fc2 \
+  --backends native,cublaslt --mode prepacked
 ```
 
-Run the full expert comparison and training pass:
+Run the full training comparison:
 
 ```bash
 python benchmarks/nvfp4_moe.py \
-  --models all --tokens 8192 --routing jagged \
-  --scope both --pass fwd
-
-python benchmarks/nvfp4_moe.py \
   --models qwen3_30b_a3b,deepseek_v3_2,kimi_k2_7,minimax_m2 \
-  --tokens 8192 --routing jagged --scope full-layer --pass fwd_bwd
+  --tokens 8192 --routing balanced,jagged \
+  --backends native,te_nvfp4_fused,torch_bf16 \
+  --scope full-layer --pass fwd_bwd --interleave-training
 ```
 
-Run release checks on a Modal B200:
+Run release checks on Modal:
 
 ```bash
 modal run benchmarks/modal_ci.py
 modal run benchmarks/modal_ci.py --benchmark-smoke
 modal run benchmarks/modal_ci.py --matrix gemm
-modal run benchmarks/modal_ci.py --matrix moe-forward
 modal run benchmarks/modal_ci.py --matrix moe-training
+modal run benchmarks/modal_ci.py --grouped focused
+modal run benchmarks/modal_ci.py --dense full
 ```
 
-Keep raw JSONL, NCU, and NSYS artifacts with the environment and git revision
-when publishing new results.
+Keep raw JSONL, profiler artifacts, environment versions, and the git revision
+with any newly published results.

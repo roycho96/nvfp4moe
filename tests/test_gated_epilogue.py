@@ -14,6 +14,7 @@ from nvfp4moe.kernels.epilogue import (
 
 def test_epilogue_policies_validate_activation():
     assert GatedEpilogue("swiglu").activation == "swiglu"
+    assert GatedEpilogue("swiglu", save_preact=True).save_preact
     assert GatedBackwardEpilogue("geglu").activation == "geglu"
     with pytest.raises(ValueError, match="activation must be one of"):
         GatedEpilogue("gelu")

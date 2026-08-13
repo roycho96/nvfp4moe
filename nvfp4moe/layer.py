@@ -8,6 +8,7 @@ from .kernels.finalize import moe_finalize, moe_finalize_bwd
 from .kernels.gemm import GroupedNvfp4Gemm
 from .kernels.quantize import (
     nvfp4_quantize_colwise,
+    nvfp4_quantize_row_colwise,
     nvfp4_quantize_rowwise,
     nvfp4_rht_amax,
 )
@@ -66,7 +67,8 @@ def _gkws(L, M):
         dgrad2 = _GKW_D2_NATIVE
     else:
         dgrad2 = _GKW_2CTA
-    return _GKW, dgrad2, _GKW
+    common = _GKW_2CTA if M >= 256 * L.E and L.d > 2048 and L.I > 1024 else _GKW
+    return common, dgrad2, common
 
 
 def _native_fc1_config(L, M):
@@ -94,6 +96,7 @@ class _MoEFn(torch.autograd.Function):
     ):
         del w_gate, w_up, w2
         L = layer
+        ctx.interleaved_w1 = L._owns_weights
         T, d = x.shape
         M = T if routed else gather_idx.numel()
         I = L.I
@@ -112,6 +115,7 @@ class _MoEFn(torch.autograd.Function):
             sfx,
             gather_idx=None if routed else gather_idx,
             padded_offsets=off_pad,
+            te_math=True,
         )
         qx = qx_u8.view(torch.float4_e2m1fn_x2)
         sf_rows = -(-M // 128) + L.E
@@ -119,6 +123,7 @@ class _MoEFn(torch.autograd.Function):
         ascale = (L.s_x.pts * L.p_w1).reshape(1)
         q_h = L._buf("q_h", (M, I // 2), torch.float4_e2m1fn_x2)
         sf_h = L._buf("sf_h", (L.rm_max, I // 64, 32, 4, 4), torch.float8_e4m3fn, batch1=True)
+        preact = torch.empty(M, 2 * I, dtype=torch.bfloat16, device=x.device)
         sf_h.zero_()
         native_fc1 = L._native_gemm(
             "fc1",
@@ -127,6 +132,7 @@ class _MoEFn(torch.autograd.Function):
             _native_fc1_config(L, M),
             output_dtype=torch.float4_e2m1fn_x2,
             activation=L.activation,
+            save_preact=True,
         )
         native_fc1(
             qx,
@@ -138,6 +144,7 @@ class _MoEFn(torch.autograd.Function):
             ascale,
             output_sf=sf_h[:, :sf_rows],
             output_scale=L.s_h.pair,
+            aux=preact,
         )
         # FC2 folds routing probabilities and scales into its epilogue.
         # Save a private output buffer when router gradients are required.
@@ -168,12 +175,19 @@ class _MoEFn(torch.autograd.Function):
                 slots,
                 y,
                 L.topk,
-                tile_t=4,
+                tile_t=2,
                 n_frag=2,
                 weights=probs_sorted,
             )
         ctx.save_for_backward(
-            x, qx_u8, sfx, gather_idx, cu, probs_sorted, slots, off_pad, *((yw,) if need_dp else ())
+            x,
+            preact,
+            gather_idx,
+            cu,
+            probs_sorted,
+            slots,
+            off_pad,
+            *((yw,) if need_dp else ()),
         )
         ctx.need_dprobs = need_dp
         ctx.routed = routed
@@ -183,16 +197,21 @@ class _MoEFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dY):
         saved = ctx.saved_tensors
-        x, qx_u8, sfx, gi, cu, ps, slots, off_pad = saved[:8]
-        yw_saved = saved[8] if ctx.need_dprobs else None
+        x, preact, gi, cu, ps, slots, off_pad = saved[:7]
+        yw_saved = saved[7] if ctx.need_dprobs else None
         L = ctx.layer
         routed = ctx.routed
         T, d = x.shape
         M = T if routed else gi.numel()
         I = L.I
         sf_rows = -(-M // 128) + L.E
+        if off_pad is None:
+            raise RuntimeError("off_pad must be supplied by the routing layer")
+        mp_max = L._mp_max(M)
+        n_ct = -(-M // 128) + L.E
+        cw = {}
+        pend = []
         dY = dY.contiguous().to(torch.bfloat16)
-        qx = qx_u8.view(torch.float4_e2m1fn_x2)
         # Delayed mode reuses the previous post-RHT column amax. Row scales
         # remain same-step, and the first backward seeds delayed state.
         dca = L.delayed_col_amax
@@ -241,28 +260,40 @@ class _MoEFn(torch.autograd.Function):
         sf_dy = L._buf("sf_dy", (L.rm_max, d // 64, 32, 4, 4), torch.float8_e4m3fn, batch1=True)
         rd = "sr" if L.sr_seed is not None else "rn"
         sv = L.sr_seed if L.sr_seed is not None else 0
-        nvfp4_quantize_rowwise(
-            dY_M,
-            cu,
-            L.s_dy.pair,
-            q_dy,
-            sf_dy,
-            rounding=rd,
-            seed=sv,
-            padded_offsets=off_pad,
-        )
-        # Recompute the BF16 pre-activation using the forward input path.
-        preact = L._buf("preact", (M, 2 * I), torch.bfloat16)
-        preact_scale = (L.s_x.pts * L.p_w1).reshape(1)
-        L._native_gemm("recompute", 2 * I, d, _GKW)(
-            qx,
-            L.qb1,
-            preact,
-            cu,
-            sfx[:, :sf_rows],
-            L.sfb1,
-            preact_scale,
-        )
+        if L.rht and L.fused_row_col:
+            qb = L._buf("cw_dy_q", (d, mp_max // 2), torch.uint8)
+            sb = L._buf("cw_dy_sf", (d * mp_max // 16,), torch.float8_e4m3fn)
+            aout = None
+            if dca:
+                aout = L._buf("dca_dy_part", (n_ct * (d // 128),), torch.float32)
+                pend.append((L.s_dy_c, aout))
+            nvfp4_quantize_row_colwise(
+                dY_M,
+                cu,
+                L.s_dy.pair,
+                L.s_dy_c.pair,
+                q_dy,
+                sf_dy,
+                qb,
+                sb,
+                rounding=rd,
+                seed=sv,
+                amax_out=aout,
+                padded_offsets=off_pad,
+            )
+            cw["dy"] = (qb, sb, L.s_dy_c)
+        else:
+            nvfp4_quantize_rowwise(
+                dY_M,
+                cu,
+                L.s_dy.pair,
+                q_dy,
+                sf_dy,
+                rounding=rd,
+                seed=sv,
+                padded_offsets=off_pad,
+                te_math=True,
+            )
         # dgrad2 fuses the gated-activation derivative and saved activation.
         dH = L._buf("dH", (M, 2 * I), torch.bfloat16)
         hh = L._buf("hh", (M, I), torch.bfloat16)
@@ -302,16 +333,40 @@ class _MoEFn(torch.autograd.Function):
             L.s_dh.update(dH)
         q_dh = L._buf("q_dh", (M, I), torch.uint8)  # 2I/2 bytes
         sf_dh = L._buf("sf_dh", (L.rm_max, 2 * I // 64, 32, 4, 4), torch.float8_e4m3fn, batch1=True)
-        nvfp4_quantize_rowwise(
-            dH,
-            cu,
-            L.s_dh.pair,
-            q_dh,
-            sf_dh,
-            rounding=rd,
-            seed=sv + 1,
-            padded_offsets=off_pad,
-        )
+        if L.rht and L.fused_row_col:
+            qb = L._buf("cw_dh_q", (2 * I, mp_max // 2), torch.uint8)
+            sb = L._buf("cw_dh_sf", (2 * I * mp_max // 16,), torch.float8_e4m3fn)
+            aout = None
+            if dca:
+                aout = L._buf("dca_dh_part", (n_ct * (2 * I // 128),), torch.float32)
+                pend.append((L.s_dh_c, aout))
+            nvfp4_quantize_row_colwise(
+                dH,
+                cu,
+                L.s_dh.pair,
+                L.s_dh_c.pair,
+                q_dh,
+                sf_dh,
+                qb,
+                sb,
+                rounding=rd,
+                seed=sv + 1,
+                amax_out=aout,
+                padded_offsets=off_pad,
+            )
+            cw["dh"] = (qb, sb, L.s_dh_c)
+        else:
+            nvfp4_quantize_rowwise(
+                dH,
+                cu,
+                L.s_dh.pair,
+                q_dh,
+                sf_dh,
+                rounding=rd,
+                seed=sv + 1,
+                padded_offsets=off_pad,
+                te_math=True,
+            )
         dX_M = L._buf("dX_M", (M, d), torch.bfloat16)
         q_dh_fp4 = q_dh.view(torch.float4_e2m1fn_x2)
         dgrad1_scale = (L.s_dh.pts * L.p_w1t).reshape(1)
@@ -328,12 +383,9 @@ class _MoEFn(torch.autograd.Function):
             dX = dX_M
         else:
             dX = torch.empty(T, d, device=x.device, dtype=torch.bfloat16)
-            moe_finalize(dX_M, slots, dX, L.topk, tile_t=4, n_frag=2)
+            moe_finalize(dX_M, slots, dX, L.topk, tile_t=1, n_frag=2)
         # Columnwise quantization feeds one grouped wgrad per weight.
         # Buffers use the padded static upper bound for variable routing.
-        mp_max = L._mp_max(M)
-        if off_pad is None:
-            raise RuntimeError("off_pad must be supplied by the routing layer")
         s_hh, s_cx = L.s_hh_c, L.s_x_c
         if L.rht:
             if not dca or warm:
@@ -349,9 +401,16 @@ class _MoEFn(torch.autograd.Function):
         else:
             s_hh.update(hh)
             s_cx.update(x)
-        cw = {}
-        pend = []  # Delayed scales are refreshed after wgrad consumes them.
-        n_ct = -(-M // 128) + L.E
+        # Consume each quantized operand pair while its qdata and scales are hot.
+        acc = L.wgrad_accumulate
+        if acc:
+            dW1, dW2 = L.acc_dw1, L.acc_dw2
+            wg1_ = L.wg1 if L._acc_fresh else L.wg1_acc
+            wg2_ = L.wg2 if L._acc_fresh else L.wg2_acc
+        else:
+            dW1 = torch.empty(L.E, 2 * I, d, device=x.device, dtype=torch.bfloat16)
+            dW2 = torch.empty(L.E, d, I, device=x.device, dtype=torch.bfloat16)
+            wg1_, wg2_ = L.wg1, L.wg2
         for name, z, F_, sc, gidx, crd, csd in (
             # Apply stochastic rounding only to gradient casts.
             ("dy", dY_M, d, L.s_dy_c if L.rht else L.s_dy, None, rd, sv + 2),
@@ -359,6 +418,8 @@ class _MoEFn(torch.autograd.Function):
             ("dh", dH, 2 * I, L.s_dh_c if L.rht else L.s_dh, None, rd, sv + 3),
             ("x", x, d, s_cx, None if routed else gi, "rn", 0),
         ):
+            if name in cw:
+                continue
             qb = L._buf(f"cw_{name}_q", (F_, mp_max // 2), torch.uint8)
             sb = L._buf(f"cw_{name}_sf", (F_ * mp_max // 16,), torch.float8_e4m3fn)
             aout = None
@@ -379,22 +440,12 @@ class _MoEFn(torch.autograd.Function):
                 padded_offsets=off_pad,
             )
             cw[name] = (qb, sb, sc)
-        # Accumulation overwrites on the first microbatch, then reduce-adds
-        # into layer-owned buffers. Autograd does not add those gradients again.
-        acc = L.wgrad_accumulate
-        if acc:
-            dW1, dW2 = L.acc_dw1, L.acc_dw2
-            wg1_ = L.wg1 if L._acc_fresh else L.wg1_acc
-            wg2_ = L.wg2 if L._acc_fresh else L.wg2_acc
-        else:
-            # Keep fresh gradients because autograd may retain prior aliases.
-            dW1 = torch.empty(L.E, 2 * I, d, device=x.device, dtype=torch.bfloat16)
-            dW2 = torch.empty(L.E, d, I, device=x.device, dtype=torch.bfloat16)
-            wg1_, wg2_ = L.wg1, L.wg2
-        for an, bn, out, wg, gs in (
-            ("dy", "hh", dW2, wg2_, L._gs2),
-            ("dh", "x", dW1, wg1_, L._gs1),
-        ):
+            if name == "hh":
+                an, bn, out, wg, gs = "dy", "hh", dW2, wg2_, L._gs2
+            elif name == "x":
+                an, bn, out, wg, gs = "dh", "x", dW1, wg1_, L._gs1
+            else:
+                continue
             qa, sa, pa = cw[an]
             qb_, sb_, pb = cw[bn]
             gs.copy_((pa.pts * pb.pts).expand(L.E))
@@ -415,6 +466,8 @@ class _MoEFn(torch.autograd.Function):
             dprobs = dot
         if acc:
             return dX, None, None, None, None, None, dprobs, None, None, None, None
+        if ctx.interleaved_w1:
+            return dX, dW1, None, dW2, None, None, dprobs, None, None, None, None
         return (
             dX,
             dW1[:, 0::2],
@@ -441,10 +494,12 @@ class MoEExpertLayer(nn.Module):
         topk,
         rht=True,
         delayed_col_amax=False,
+        fused_row_col=True,
         wgrad_accumulate=False,
         gemm_cfg="auto",
         activation="swiglu",
         allocate_weights=True,
+        use_dynamic_sched=True,
     ):
         super().__init__()
         assert d % 256 == 0 and I % 128 == 0, "tile/SF alignment (see README)"
@@ -462,6 +517,8 @@ class MoEExpertLayer(nn.Module):
         self.d, self.I, self.E, self.topk = d, I, E, topk
         # Delayed column amax removes pre-passes at the cost of one-step scale lag.
         self.delayed_col_amax = delayed_col_amax
+        self.fused_row_col = fused_row_col
+        self.use_dynamic_sched = bool(use_dynamic_sched)
         self._dcol_ready = False
         self._dca_red = torch.empty((), dtype=torch.float32, device="cuda")
         # RHT follows the columnwise placement used for wgrad operands.
@@ -553,6 +610,7 @@ class MoEExpertLayer(nn.Module):
         output_dtype=torch.bfloat16,
         activation=None,
         dactivation=None,
+        save_preact=False,
     ):
         key = (
             name,
@@ -563,12 +621,14 @@ class MoEExpertLayer(nn.Module):
             output_dtype,
             activation,
             dactivation,
+            save_preact,
+            self.use_dynamic_sched,
         )
         runtime = self._native_gemms.get(key)
         if runtime is None:
             epilogue = None
             if activation is not None:
-                epilogue = GatedEpilogue(activation)
+                epilogue = GatedEpilogue(activation, save_preact)
             elif dactivation is not None:
                 epilogue = GatedBackwardEpilogue(dactivation)
             runtime = GroupedNvfp4Gemm(
@@ -579,6 +639,7 @@ class MoEExpertLayer(nn.Module):
                 config["tile_N"],
                 output_dtype=output_dtype,
                 epilogue=epilogue,
+                use_dynamic_sched=self.use_dynamic_sched,
             )
             self._native_gemms[key] = runtime
         return runtime
@@ -666,6 +727,7 @@ class MoEExpertLayer(nn.Module):
             sfx,
             gather_idx=gather_idx,
             padded_offsets=off_pad,
+            te_math=True,
         )
         self._native_gemm("calibrate", 2 * self.I, d, _GKW)(
             qx_u8.view(torch.float4_e2m1fn_x2),
@@ -724,8 +786,8 @@ class MoEExpertLayer(nn.Module):
         self.rm_max = max(self.rm_max, -(-M // 128) + self.E)
         return _MoEFn.apply(
             x,
-            self.w1[:, 0::2],
-            self.w1[:, 1::2],
+            self.w1,
+            None,
             self.w2,
             gather_idx,
             cu,

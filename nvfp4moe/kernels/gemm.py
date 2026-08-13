@@ -14,6 +14,12 @@ from .epilogue import GatedBackwardEpilogue, GatedEpilogue, resolve_gemm_epilogu
 from .gemm_kernel import GroupedGemmKernel
 
 
+def _resolve_dynamic_schedule(use_dynamic_sched: bool | None, k: int) -> bool:
+    if use_dynamic_sched is None:
+        return k > 2048
+    return bool(use_dynamic_sched)
+
+
 def _seed_tensor(dtype, mode0: int, mode1: int):
     ref = cutlass_torch.matrix(1, mode0, mode1, False, Float32)
     _, backing = cutlass_torch.cute_tensor_like(ref, dtype, True, assumed_align=16)
@@ -34,6 +40,8 @@ def _compile_grouped(
     output_dtype: torch.dtype,
     activation: str | None,
     dactivation: str | None,
+    save_preact: bool,
+    use_dynamic_sched: bool,
 ):
     with torch.cuda.device(device):
         c_dtype = torch2cute_dtype_map[output_dtype]
@@ -47,12 +55,17 @@ def _compile_grouped(
         seed_sfb = _seed_tensor(cutlass.Float8E4M3FN, 16, 16)
         seeds = (seed_a, seed_b, seed_c, seed_sfa, seed_sfb)
 
-        rows, aux_rows, sfa_rows = cute.sym_int(), cute.sym_int(), cute.sym_int()
+        rows, preact_rows, aux_rows, sfa_rows = (
+            cute.sym_int(),
+            cute.sym_int(),
+            cute.sym_int(),
+            cute.sym_int(),
+        )
         runtime_inputs = (
             fake_tensor(cutlass.Float4E2M1FN, (rows, k), 32),
             fake_tensor(cutlass.Float4E2M1FN, (experts, n, k), 32),
             fake_tensor(c_dtype, (rows, output_n), 128 // c_dtype.width),
-            fake_tensor(cutlass.BFloat16, (aux_rows, n * 2), 8),
+            fake_tensor(cutlass.BFloat16, (preact_rows, n * 2), 8),
             fake_tensor(cutlass.BFloat16, (aux_rows, n), 8),
             fake_tensor(
                 cutlass.Float8E4M3FN,
@@ -63,6 +76,7 @@ def _compile_grouped(
                 (experts, -(-n // 128), k // 64, 32, 4, 4),
             ),
             fake_tensor(Int32, (experts + 1,), 1),
+            fake_tensor(Int32, (1,), 1),
         )
         alpha_fake = fake_tensor(Float32, (1,), 1)
         output_sf_fake = fake_tensor(
@@ -85,7 +99,9 @@ def _compile_grouped(
             cluster,
             activation=activation,
             dactivation=dactivation,
+            save_preact=save_preact,
             mma_inst_tile_k=2 if dactivation is not None and k >= 4096 else 4,
+            use_dynamic_sched=use_dynamic_sched,
         )
         hardware = cutlass.utils.HardwareInfo()
         max_active = hardware.get_max_active_clusters(cluster[0] * cluster[1])
@@ -124,8 +140,10 @@ class GroupedNvfp4Gemm:
         activation: str | None = None,
         dactivation: str | None = None,
         epilogue: GatedEpilogue | GatedBackwardEpilogue | None = None,
+        use_dynamic_sched: bool | None = None,
     ):
         activation, dactivation = resolve_gemm_epilogue(epilogue, activation, dactivation)
+        save_preact = isinstance(epilogue, GatedEpilogue) and epilogue.save_preact
         if epilogue is None:
             if activation is not None:
                 epilogue = GatedEpilogue(activation)
@@ -162,6 +180,8 @@ class GroupedNvfp4Gemm:
             raise ValueError("native dgrad2 uses packed BF16 pairs in an Int32 view")
         if dactivation is not None and n % 128:
             raise ValueError("native dgrad2 requires N aligned to 128")
+        if save_preact and output_dtype != torch.float4_e2m1fn_x2:
+            raise ValueError("saved preactivation requires a gated NVFP4 output")
         self.experts = experts
         self.n = n
         self.k = k
@@ -170,7 +190,9 @@ class GroupedNvfp4Gemm:
         self.output_dtype = output_dtype
         self.activation = activation
         self.dactivation = dactivation
+        self.save_preact = save_preact
         self.epilogue = epilogue
+        self.use_dynamic_sched = _resolve_dynamic_schedule(use_dynamic_sched, k)
         self.output_n = n
         if activation is not None:
             self.output_n = n // 2
@@ -181,6 +203,7 @@ class GroupedNvfp4Gemm:
         self._unused_output_scale = torch.ones(2, dtype=torch.float32, device="cuda")
         self._unused_preact = torch.empty(1, 2 * n, dtype=torch.bfloat16, device="cuda")
         self._unused_aux = torch.empty(1, n, dtype=torch.bfloat16, device="cuda")
+        self._sched_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
 
     def prepare(
         self,
@@ -266,6 +289,18 @@ class GroupedNvfp4Gemm:
                     or tuple(tensor.shape) != shape
                 ):
                     raise ValueError(f"{name} must be contiguous BF16 with shape {shape}")
+        elif self.save_preact:
+            preact = self._unused_preact
+            expected_aux = (a.shape[0], self.n)
+            if (
+                aux is None
+                or not aux.is_cuda
+                or aux.device.index != self.device
+                or not aux.is_contiguous()
+                or aux.dtype != torch.bfloat16
+                or tuple(aux.shape) != expected_aux
+            ):
+                raise ValueError(f"aux must be contiguous BF16 with shape {expected_aux}")
         else:
             preact = self._unused_preact
             aux = self._unused_aux
@@ -311,6 +346,7 @@ class GroupedNvfp4Gemm:
             sfa,
             sfb,
             cu,
+            self._sched_counter,
         )
         self._alpha = alpha
         self._output_sf = output_sf
@@ -331,11 +367,15 @@ class GroupedNvfp4Gemm:
                 self.output_dtype,
                 self.activation,
                 self.dactivation,
+                self.save_preact,
+                self.use_dynamic_sched,
             )
         stream_handle = torch.cuda.current_stream().cuda_stream
         if stream_handle != self._stream_handle:
             self._stream_handle = stream_handle
             self._stream = cuda.CUstream(stream_handle)
+        if self.use_dynamic_sched:
+            self._sched_counter.zero_()
         self._compiled(
             *self._seeds,
             *self._runtime_inputs,
@@ -385,6 +425,7 @@ def grouped_nvfp4_gemm(
     activation: str | None = None,
     dactivation: str | None = None,
     epilogue: GatedEpilogue | GatedBackwardEpilogue | None = None,
+    use_dynamic_sched: bool | None = None,
 ):
     return GroupedNvfp4Gemm(
         experts,
@@ -396,6 +437,7 @@ def grouped_nvfp4_gemm(
         activation,
         dactivation,
         epilogue,
+        use_dynamic_sched,
     )
 
 

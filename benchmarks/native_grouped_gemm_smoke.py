@@ -120,6 +120,7 @@ def run_case(
     tile_m=128,
     tile_n=128,
     output_dtype=torch.bfloat16,
+    profile_only=False,
 ):
     torch.manual_seed(2026)
     device = "cuda"
@@ -175,6 +176,13 @@ def run_case(
     native_call()
     torch.cuda.synchronize()
     _check_gemm_samples(native_out, qa_u8, qb, sfa, sfb, cu, pts_a, pts_b)
+    if profile_only:
+        native.prepare(qa, qb, native_out, cu, sfa, sfb, alpha)
+        torch.cuda.nvtx.range_push("nvfp4moe_profile")
+        native.launch()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.synchronize()
+        return None
     native_ms = _time(native_call)
     prepare_ms = _time(lambda: native.prepare(qa, qb, native_out, cu, sfa, sfb, alpha))
     native.prepare(qa, qb, native_out, cu, sfa, sfb, alpha)
@@ -193,6 +201,27 @@ def run_case(
     }
     print(result, flush=True)
     return result
+
+
+def run_dense_profile(n, k, rows, tile_m, tile_n):
+    from nvfp4moe import nvfp4_quantize
+    from nvfp4moe.kernels.dense_gemm import DenseNvfp4Gemm
+
+    torch.manual_seed(20260812)
+    a = torch.randn(rows, k, dtype=torch.bfloat16, device="cuda") * k**-0.5
+    b = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * k**-0.5
+    one = torch.ones(1, dtype=torch.float32, device="cuda")
+    qa, sfa, _ = nvfp4_quantize(a, one)
+    qb, sfb, _ = nvfp4_quantize(b, one)
+    out = torch.empty(rows, n, dtype=torch.bfloat16, device="cuda")
+    gemm = DenseNvfp4Gemm(n, k, tile_m, tile_n)
+    gemm(qa, qb, out, sfa, sfb, one)
+    torch.cuda.synchronize()
+    gemm.prepare(qa, qb, out, sfa, sfb, one)
+    torch.cuda.nvtx.range_push("nvfp4moe_profile")
+    gemm.launch()
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.synchronize()
 
 
 def run_dgrad2_case(
@@ -323,9 +352,21 @@ def main():
     parser.add_argument("--scheduler-edge", action="store_true")
     parser.add_argument("--dgrad-matrix", action="store_true")
     parser.add_argument("--frontier-matrix", action="store_true")
+    parser.add_argument("--training-tile-matrix", action="store_true")
     parser.add_argument(
         "--profile-case",
-        choices=("dgrad2-qwen", "dgrad2-kimi", "dgrad2-deepseek"),
+        choices=(
+            "dgrad2-qwen",
+            "dgrad2-kimi",
+            "dgrad2-deepseek",
+            "dgrad2-deepseek-local",
+            "fc1-deepseek-local",
+            "fc2-deepseek-local",
+            "dgrad1-deepseek-local",
+            "dense-qwen-fc2",
+            "dense-deepseek-fc1",
+            "dense-deepseek-fc2",
+        ),
     )
     parser.add_argument("--output-dtype", choices=("bf16", "fp32"), default="bf16")
     args = parser.parse_args()
@@ -356,6 +397,35 @@ def main():
             profile_only=True,
         )
         return
+    if args.profile_case == "dgrad2-deepseek-local":
+        run_dgrad2_case(
+            experts=8,
+            n=2048,
+            k=7168,
+            rows=65_536,
+            tile_m=256,
+            tile_n=256,
+            profile_only=True,
+        )
+        return
+    if args.profile_case == "fc1-deepseek-local":
+        run_case(8, 4096, 7168, 65_536, 256, 256, profile_only=True)
+        return
+    if args.profile_case == "fc2-deepseek-local":
+        run_case(8, 7168, 2048, 65_536, 256, 256, profile_only=True)
+        return
+    if args.profile_case == "dgrad1-deepseek-local":
+        run_case(8, 7168, 4096, 65_536, 256, 256, profile_only=True)
+        return
+    if args.profile_case == "dense-qwen-fc2":
+        run_dense_profile(2048, 768, 8192, 256, 128)
+        return
+    if args.profile_case == "dense-deepseek-fc1":
+        run_dense_profile(4096, 7168, 8192, 256, 256)
+        return
+    if args.profile_case == "dense-deepseek-fc2":
+        run_dense_profile(7168, 2048, 8192, 256, 256)
+        return
 
     if args.frontier_matrix:
         cases = [
@@ -379,6 +449,34 @@ def main():
                 result["model"] = model
                 results.append(result)
             torch.cuda.empty_cache()
+        print(results, flush=True)
+        return
+
+    if args.training_tile_matrix:
+        results = []
+        tiles = ((128, 128), (128, 256), (256, 128), (256, 256))
+        for name, n, k in (
+            ("fc1", 4096, 7168),
+            ("fc2", 7168, 2048),
+            ("dgrad1", 7168, 4096),
+        ):
+            for tile_m, tile_n in tiles:
+                result = run_case(8, n, k, 65_536, tile_m, tile_n)
+                result["operation"] = name
+                results.append(result)
+            torch.cuda.empty_cache()
+        for tile_m, tile_n in tiles:
+            result = run_dgrad2_case(
+                8,
+                2048,
+                7168,
+                65_536,
+                "swiglu",
+                tile_m,
+                tile_n,
+            )
+            result["model"] = "deepseek_v3_2"
+            results.append(result)
         print(results, flush=True)
         return
 
