@@ -292,15 +292,3 @@ modal run benchmarks/modal_ci.py::benchmark_distributed --preset training
 
 Keep the JSONL output, profiler artifacts, environment versions, and git
 revision with newly published results.
-
-## Methodology references
-
-- [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/testing/bench.py) separates kernel timing from setup and uses CUDA/Kineto measurements.
-- [TileLink](https://arxiv.org/abs/2503.20313) reports operator, layer, and end-to-end scopes separately with model-derived shapes.
-- [Comet](https://arxiv.org/abs/2502.19811) varies token count, expert count, top-k, EP size, and token imbalance in MoE evaluation.
-- [FLUX](https://arxiv.org/abs/2406.06858) separates operation-level measurements from full training and inference results.
-- [NVIDIA DGX B200 specifications](https://www.nvidia.com/en-gb/data-center/dgx-b200/) provide the dense and structured-sparse FP4 peak values.
-
-No timing from these sources is copied into the result tables. A baseline is
-reported only when its implementation ran in the same session and measured
-the stated boundary.
