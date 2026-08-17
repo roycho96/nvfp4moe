@@ -550,7 +550,8 @@ def main():
     if torch.cuda.get_device_capability(0)[0] != 10:
         print("SKIP: requires SM100")
         return 0
-    from nvfp4moe import MoEExpertLayer, NVFP4ExpertCore, moe_finalize, moe_finalize_bwd
+    from nvfp4moe import MoEExpertLayer
+    from nvfp4moe.kernels.finalize import moe_finalize, moe_finalize_bwd
 
     check_dispatch()
     check_grouped_wgrad()
@@ -684,41 +685,6 @@ def main():
         y_s.shape == (T_small, d)
         and torch.isfinite(y_s).all()
         and all(g is not None and torch.isfinite(g).all() for g in small_grads),
-    )
-
-    # Framework adapters enter after routing, with separate gate/up masters.
-    T_core, k_core = 257, 2
-    x_core_base = torch.randn(T_core, d, device="cuda", dtype=torch.bfloat16) * d**-0.5
-    gi_c, cu_c, _, _ = route(T_core, E, k_core, 23)
-    x_core = x_core_base[gi_c.long()].contiguous().requires_grad_(True)
-    w_gate = layer.w1[:, 0::2].detach().clone().requires_grad_(True)
-    w_up = layer.w1[:, 1::2].detach().clone().requires_grad_(True)
-    w_down = layer.w2.detach().clone().requires_grad_(True)
-    seg_c = cu_c[1:] - cu_c[:-1]
-    off_c = (((seg_c + 127) // 128) * 128).cumsum(0).to(torch.int32)
-    core = NVFP4ExpertCore(d, I, E).cuda()
-    core.refresh_weights(w_gate, w_up, w_down)
-    core.calibrate(x_core.detach(), cu_c, off_pad=off_c)
-    y_core = core(x_core, w_gate, w_up, w_down, cu_c, off_pad=off_c)
-    y_core_ref = torch.empty_like(y_core, dtype=torch.float32)
-    cu_l = cu_c.tolist()
-    for expert in range(E):
-        lo, hi = cu_l[expert], cu_l[expert + 1]
-        if lo == hi:
-            continue
-        h = (
-            x_core[lo:hi].float()
-            @ torch.stack((w_gate[expert].float(), w_up[expert].float()), dim=1).reshape(2 * I, d).T
-        )
-        hh = torch.nn.functional.silu(h[:, 0::2]) * h[:, 1::2]
-        y_core_ref[lo:hi] = hh @ w_down[expert].float().T
-    c, r = cosrel(y_core, y_core_ref)
-    check("routed expert core fwd closure", c > 0.95, f"cos {c:.5f} rel {r:.4f}")
-    y_core.backward(torch.randn_like(y_core))
-    routed_grads = (x_core.grad, w_gate.grad, w_up.grad, w_down.grad)
-    check(
-        "routed expert core backward gradients",
-        all(grad is not None and torch.isfinite(grad).all() for grad in routed_grads),
     )
 
     print(f"\n{'ALL PASS' if not FAILURES else f'{len(FAILURES)} FAILURES: {FAILURES}'}")

@@ -414,6 +414,8 @@ class GroupedNvfp4Gemm:
         )
         self.launch()
 
+    run = __call__
+
 
 def grouped_nvfp4_gemm(
     experts: int,

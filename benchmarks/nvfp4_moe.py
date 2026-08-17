@@ -1,9 +1,8 @@
 """NVFP4 MoE layer benchmark with synthetic routing or captured trace replay.
 
-Expert-core starts with expert-major rows and ends before probability weighting
-or combine. Full-layer includes dispatch, expert compute, probability weighting,
-and combine. Router logits and top-k selection are outside both scopes so every
-backend receives the same assignments.
+The timed layer includes dispatch, expert compute, probability weighting, and
+combine. Router logits and top-k selection are excluded so every backend receives
+the same assignments.
 """
 
 from __future__ import annotations
@@ -59,7 +58,7 @@ BACKEND_NAMES = (
     "torch_bf16",
     "torchao_mxfp8",
 )
-SCOPES = ("expert-core", "full-layer")
+SCOPES = ("full-layer",)
 PASSES = ("fwd", "fwd_bwd")
 
 
@@ -454,35 +453,6 @@ class _TorchGroupedExperts:
         return y.to(x.dtype)
 
 
-def _expert_layout(topi, experts):
-    import torch
-
-    flat = topi.reshape(-1).long()
-    order = torch.argsort(flat, stable=True)
-    token = order // topi.shape[1]
-    counts = torch.bincount(flat[order], minlength=experts)
-    cu = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(torch.int32)
-    off_pad = (((counts + 127) // 128) * 128).cumsum(0).to(torch.int32)
-    return token, counts, cu, off_pad
-
-
-def _pad_expert_rows(x, counts, alignment):
-    import torch
-
-    pieces = []
-    start = 0
-    padded_counts = []
-    for count_tensor in counts:
-        count = int(count_tensor)
-        padded = ((count + alignment - 1) // alignment) * alignment
-        pieces.append(x.new_zeros((padded, x.shape[1])))
-        if count:
-            pieces[-1][:count].copy_(x[start : start + count])
-        start += count
-        padded_counts.append(padded)
-    return torch.cat(pieces), torch.tensor(padded_counts, dtype=torch.int32, device=x.device)
-
-
 def _native_backend(spec: ModelShape, inputs: dict[str, object]):
     try:
         from .moe_backends import Nvfp4MoeExpert
@@ -812,101 +782,9 @@ def _run_case(
     spec = replace(global_spec, experts=case.local_experts, ep_sizes=(1,), quick_ep=1)
     if backend_name == "te_nvfp4_fused" and case.activation != "swiglu":
         return {"status": "skipped", "reason": "TE fused grouped MLP supports SwiGLU only"}
-    if scope == "expert-core":
-        token, counts, cu, off_pad = _expert_layout(inputs["topk_index"], case.local_experts)
-        routed = inputs["expert_input"][token].contiguous()
-        gate, up = inputs["gate_up_weight"].chunk(2, dim=1)
-        w1 = gate.detach().clone().requires_grad_(True)
-        w3 = up.detach().clone().requires_grad_(True)
-        w2 = inputs["down_weight"].detach().clone().requires_grad_(True)
-
-        if backend_name == "native":
-            from nvfp4moe import NVFP4ExpertCore
-
-            backend = NVFP4ExpertCore(
-                case.hidden,
-                case.intermediate,
-                case.local_experts,
-                activation=case.activation,
-            ).cuda()
-            backend.refresh_weights(w1, w3, w2)
-            backend.calibrate(routed, cu, off_pad=off_pad)
-
-            def forward(x, _tv, step):
-                backend.runtime.sr_seed = 123_000 + step
-                return backend(x, w1, w3, w2, cu, off_pad=off_pad)
-
-            def zero_grad():
-                for weight in (w1, w3, w2):
-                    weight.grad = None
-
-        elif backend_name == "te_nvfp4":
-            try:
-                from .moe_backends import TEExpert, _activation, _te_autocast
-            except ImportError:
-                from moe_backends import TEExpert, _activation, _te_autocast
-
-            backend = TEExpert(spec, inputs, nvfp4=True)
-            routed, te_counts = _pad_expert_rows(routed, counts, backend.align)
-            splits = tuple(int(value) for value in te_counts.cpu())
-
-            def forward(x, _tv, step):
-                del step
-                with _te_autocast(backend.te, backend.recipe):
-                    h = backend._grouped(backend.gl1, x, splits)
-                    hh = _activation(h[:, 0::2], h[:, 1::2], backend.activation)
-                    y = backend._grouped(backend.gl2, hh, splits)
-                backend.first = False
-                return y
-
-            zero_grad = lambda: backend.zero_grad(set_to_none=True)
-
-        elif backend_name == "te_nvfp4_fused":
-            try:
-                from .moe_backends import TEFusedExpert
-            except ImportError:
-                from moe_backends import TEFusedExpert
-
-            backend = TEFusedExpert(spec, inputs)
-            routed, te_counts = _pad_expert_rows(routed, counts, backend.align)
-            scales = torch.ones(routed.shape[0], dtype=torch.float32, device=routed.device)
-
-            def forward(x, _tv, step):
-                del step
-                return backend.grouped(x, te_counts, scales)
-
-            zero_grad = lambda: backend.zero_grad(set_to_none=True)
-
-        elif backend_name == "torchao_mxfp8":
-            try:
-                from .moe_backends import TorchAOMXFP8Expert
-            except ImportError:
-                from moe_backends import TorchAOMXFP8Expert
-
-            backend = TorchAOMXFP8Expert(spec, inputs)
-            routed, ao_counts = _pad_expert_rows(routed, counts, backend.align)
-            offsets = ao_counts.cumsum(0).to(torch.int32)
-
-            def forward(x, _tv, step):
-                del step
-                return backend.grouped(x, offsets)
-
-            zero_grad = lambda: backend.zero_grad(set_to_none=True)
-
-        elif backend_name == "torch_bf16":
-            backend = _TorchGroupedExperts(spec, inputs)
-            offsets = cu[1:]
-
-            def forward(x, _tv, step):
-                del step
-                return backend.expert_core(x, offsets)
-
-            zero_grad = backend.zero_grad
-        else:
-            raise ValueError(backend_name)
-
-        benchmark_input = routed
-    elif backend_name == "native":
+    if scope != "full-layer":
+        raise ValueError(scope)
+    if backend_name == "native":
         backend = _native_backend(spec, inputs)
 
         def forward(x, tv, step):
@@ -973,10 +851,8 @@ def _run_case(
     else:
         raise ValueError(backend_name)
 
-    if scope != "expert-core":
-        benchmark_input = inputs["expert_input"]
     needs_grad = benchmark_pass == "fwd_bwd"
-    x = benchmark_input.detach().clone().requires_grad_(needs_grad)
+    x = inputs["expert_input"].detach().clone().requires_grad_(needs_grad)
     topv = inputs["topk_weight"].detach().clone().requires_grad_(needs_grad)
     dout = torch.randn_like(x) if needs_grad else None
     step = [0]
@@ -998,16 +874,10 @@ def _run_case(
     timing["tokens_per_second"] = case.tokens * 1000 / p50
     timing["routed_tokens_per_second"] = case.routed_rows * 1000 / p50
     result = {"status": "ok", "timing": timing}
-    if scope == "expert-core":
-        result["actual_routed_rows"] = x.shape[0]
     if needs_grad:
         result["gradient_status"] = {
             "input": x.grad is not None and bool(torch.isfinite(x.grad).all()),
-            "router_weight": (
-                None
-                if scope == "expert-core"
-                else topv.grad is not None and bool(torch.isfinite(topv.grad).all())
-            ),
+            "router_weight": topv.grad is not None and bool(torch.isfinite(topv.grad).all()),
         }
     return result
 
@@ -1039,7 +909,6 @@ def listing_payload(args: argparse.Namespace) -> dict[str, object]:
             "trace": str(Path(args.trace).expanduser()) if args.trace else None,
         },
         "boundaries": {
-            "expert-core": "expert-major rows through FC1, activation, and FC2 only",
             "full-layer": "dispatch, expert compute, probability weighting, and combine",
             "excluded": "router logits and top-k selection",
         },
@@ -1062,7 +931,7 @@ def build_parser() -> argparse.ArgumentParser:
             "native,te_nvfp4_fused,te_nvfp4,deepgemm_bf16,deepgemm_fp8_fp4,torch_bf16,torchao_mxfp8"
         ),
     )
-    parser.add_argument("--scope", choices=(*SCOPES, "both"), default="expert-core")
+    parser.add_argument("--scope", choices=SCOPES, default="full-layer")
     parser.add_argument("--pass", dest="benchmark_pass", choices=(*PASSES, "both"), default="fwd")
     parser.add_argument("--source", choices=("synthetic", "trace"), default="synthetic")
     parser.add_argument(
@@ -1110,7 +979,7 @@ def main(argv: list[str] | None = None) -> int:
     ]
     if args.max_cases:
         cases = cases[: args.max_cases]
-    scopes = SCOPES if args.scope == "both" else (args.scope,)
+    scopes = (args.scope,)
     passes = PASSES if args.benchmark_pass == "both" else (args.benchmark_pass,)
     statuses = detect_backends()
     print(

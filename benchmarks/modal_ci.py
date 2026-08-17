@@ -147,7 +147,7 @@ def run(
                 "--backends",
                 "native,te_nvfp4,torch_bf16",
                 "--scope",
-                "both",
+                "full-layer",
                 "--pass",
                 "fwd",
                 "--warmup",
@@ -552,6 +552,19 @@ def benchmark_grouped(preset="smoke"):
     env["PYTHONPATH"] = "/root/proj"
     if preset == "dual-quant":
         command = [sys.executable, "-m", "pytest", "-q", "tests/test_dual_quantize.py"]
+    elif preset == "api":
+        command = [
+            sys.executable,
+            "/root/proj/benchmarks/api_overhead.py",
+            "--warmup",
+            "5",
+            "--iterations",
+            "30",
+            "--stabilize-ms",
+            "1000",
+            "--repeats",
+            "8",
+        ]
     elif preset == "layer-test":
         command = [sys.executable, "/root/proj/tests/test_nvfp4moe_layer.py"]
     elif preset == "training-tiles":
@@ -717,7 +730,7 @@ def benchmark_grouped(preset="smoke"):
             "training-tiles, "
             "training-dgrad, training-wgrad, recheck, "
             "focused, full, long-hidden, dual-quant, "
-            "or layer-test"
+            "api, or layer-test"
         )
     result = subprocess.run(
         command,

@@ -140,5 +140,7 @@ class DenseNvfp4Gemm:
         self.prepare(a, b, out, sfa, sfb, alpha)
         self.launch()
 
+    run = __call__
+
 
 __all__ = ["DenseNvfp4Gemm"]
