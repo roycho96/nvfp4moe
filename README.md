@@ -130,7 +130,8 @@ from the package root.
 - `K` aligned to 64
 - At most 256 local experts
 - At most 131,072 routed rows in the complete layer
-- Single-GPU kernels; no all-to-all implementation
+- The public package exposes single-GPU kernels; the benchmark includes a
+  reference NCCL expert-parallel pipeline
 - Precision tables are operator and layer checks, not convergence results
 
 ## Development
@@ -143,6 +144,8 @@ pytest -q
 python benchmarks/nvfp4_gemm.py --list --suite full
 python benchmarks/nvfp4_moe.py --list --suite full
 modal run benchmarks/modal_ci.py --grouped api
+modal run benchmarks/modal_ci.py::benchmark_distributed --preset inference
+modal run benchmarks/modal_ci.py::benchmark_distributed --preset training
 ```
 
 ## License

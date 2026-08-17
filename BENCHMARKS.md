@@ -1,16 +1,18 @@
 # B200 benchmarks
 
-Results were measured on one NVIDIA B200 (`sm100`, 148 SMs) in
+Single-GPU results were measured on one NVIDIA B200 (`sm100`, 148 SMs); the
+distributed section uses eight B200s in one node. Both use
 `nvcr.io/nvidia/pytorch:26.07-py3` with PyTorch
 `2.13.0a0+9186a08b2c.nv26.07`, CUDA 13.3, and driver 580.95.05. The grouped
 GEMM comparison uses CUTLASS DSL 4.7.0 and FlashInfer 0.6.17. The training
 comparison uses Transformer Engine 2.17.
 
-Three entry points cover the release:
+Four entry points cover the release:
 
 1. `benchmarks/nvfp4_gemm.py` measures dense and grouped NVFP4 GEMM.
 2. `benchmarks/nvfp4_moe.py` measures the complete MoE layer.
 3. `benchmarks/api_overhead.py` isolates the public GEMM call boundary.
+4. `benchmarks/distributed_ep.py` measures the end-to-end EP expert boundary.
 
 Missing backends are reported as skipped. No fallback is timed under another
 backend's name.
@@ -22,6 +24,7 @@ backend's name.
 | Prepacked GEMM | one GEMM call writing the stated output contract | input creation, compilation, autotuning, NVFP4 packing |
 | Dynamic GEMM | BF16 activation quantization and GEMM | compilation, weight packing |
 | Full MoE training | dispatch, FC1, activation, FC2, probability weighting, combine, input/router/expert-weight gradients | optimizer, master-weight refresh, EP/TP communication |
+| Distributed EP | gather, NCCL dispatch, local expert layer, reverse NCCL dispatch, probability weighting, combine; backward when selected | router logits/top-k, optimizer, master-weight refresh |
 | Public API | `plan.run(...)` on the same plan, tensors, and output as the direct call | construction, JIT, packing, allocation |
 
 Prepacked native and FlashInfer grouped calls write a preallocated output.
@@ -42,8 +45,8 @@ is explicitly marked `dynamic`.
 - Tables report CUDA-event median latency. JSONL also records IQR, p10/p90,
   versions, GPU identity, row counts, FLOPs, TFLOP/s, and peak percentage.
 - The first arm is rerun as a canary. A case is rejected above 5% drift.
-- A run is rejected when wall time divided by summed GPU kernel time exceeds
-  1.5.
+- A run is rejected when wall time divided by the enclosing CUDA-event time
+  exceeds 1.5.
 - Fixed random inputs and routing seeds are shared by every arm.
 
 Accuracy checks require a finite full output and compare up to two rows per
@@ -133,6 +136,53 @@ expert count, and 128-row alignment count.
 These are model-derived operator shapes with synthetic activations and
 routing. They are not full checkpoint or dataset runs.
 
+## Distributed expert parallelism
+
+This benchmark uses one 8×B200 node with EP size 8. `B/rank` is the batch size
+on each rank, and each rank contributes `B/rank * S` input tokens. Global input
+tokens multiply that value by eight; routed rows additionally multiply by the
+model's top-k.
+
+Latency is the slowest rank's enclosing CUDA-event time. Token gather, NCCL
+dispatch, expert IDs, the local expert layer, reverse dispatch, probability
+weighting, and combine are timed. Routing logits and top-k selection are not.
+Uneven messages use one fixed-capacity `all_to_all_single`; the table reports
+the padding overhead rather than hiding it. Values are `median [IQR]` in ms.
+
+| Model and case | Native | TE NVFP4 | Torch BF16 | TE/native | BF16/native | Transport / padding |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3-30B, B/rank 128 × S1, jagged | 1.373 [0.120] | 2.614 [0.119] | **1.173 [0.072]** | 1.90× | 0.85× | 0.513 / 25.0% |
+| Qwen3-30B, B/rank 1 × S8192, jagged | **3.236 [0.019]** | 4.459 [0.141] | 5.065 [0.015] | 1.38× | 1.56× | 1.727 / 13.5% |
+| Qwen3-235B, B/rank 1 × S2048, jagged | **1.834 [0.006]** | 2.546 [0.059] | 2.968 [0.011] | 1.39× | 1.62× | 0.966 / 13.0% |
+| DeepSeek-V3.2, B/rank 1 × S2048, jagged | **2.989 [0.016]** | 4.507 [0.077] | 5.076 [0.019] | 1.51× | 1.70× | 1.476 / 4.8% |
+| Kimi-K2.7, B/rank 1 × S2048, hotspot | **4.310 [0.020]** | 5.817 [0.054] | 8.073 [0.021] | 1.35× | 1.87× | 2.265 / 87.5% |
+| MiniMax-M2, B/rank 1 × S2048, jagged | **1.492 [0.007]** | 2.426 [0.101] | 2.375 [0.012] | 1.63× | 1.59× | 0.790 / 4.8% |
+| Llama 4 Scout, B/rank 1 × S2048, tail | **1.082 [0.020]** | 1.657 [0.033] | 2.146 [0.017] | 1.53× | 1.98× | 0.613 / 162.1% |
+
+The small Qwen decode case is communication and launch dominated, so native
+does not beat BF16 there. The larger cases amortize that fixed cost and native
+leads both comparison arms.
+
+Forward/backward includes the autograd path and the two reverse collectives.
+
+| Model and case | Native | TE NVFP4 | Torch BF16 | TE/native | BF16/native |
+|---|---:|---:|---:|---:|---:|
+| Qwen3-30B, B/rank 1 × S8192, balanced | **7.225 [0.021]** | 9.125 [0.468] | 10.122 [0.021] | 1.26× | 1.40× |
+| Qwen3-30B, B/rank 1 × S8192, jagged | **7.623 [0.074]** | 9.743 [0.083] | 10.992 [0.044] | 1.28× | 1.44× |
+| DeepSeek-V3.2, B/rank 1 × S2048, jagged | **7.912 [0.153]** | 11.381 [0.040] | 11.585 [0.014] | 1.44× | 1.46× |
+
+Inference rows use 20 samples; training rows use 10. Arms are deterministically
+interleaved in one session. Maximum accepted canary drift was 1.01%, and the
+largest wall/event ratio was 1.055. All eight ranks produced finite outputs and
+gradients. Across the three training rows, native's worst-rank minimum cosine
+against BF16 was 0.97247 for output, 0.96144 for input gradient, 0.97262 for
+router-probability gradient, 0.95992 for gate/up weight gradient, and 0.96600
+for down-weight gradient.
+
+These results cover one node. A two-node B200 run requires 16 GPUs, above the
+current Modal workspace limit of 10 concurrent GPUs, so no multi-node number is
+reported.
+
 ## Grouped NVFP4 GEMM
 
 The table reports balanced routing at 8,192 tokens. Llama 4 has fewer routed
@@ -178,7 +228,7 @@ cuBLASLt was faster overall in the measured matrix. Native led a small subset
 of large-K cases, so dense performance is not presented as a universal SOTA
 claim.
 
-## Full MoE training
+## Single-GPU full MoE training
 
 Times include the complete single-GPU forward and backward boundary defined
 above. Results use 8,192 tokens and top-k sampling without replacement.
@@ -235,6 +285,9 @@ modal run benchmarks/modal_ci.py --benchmark-smoke
 modal run benchmarks/modal_ci.py --matrix gemm
 modal run benchmarks/modal_ci.py --matrix moe-training
 modal run benchmarks/modal_ci.py --grouped api
+modal run benchmarks/modal_ci.py::benchmark_distributed --preset inference
+modal run benchmarks/modal_ci.py::benchmark_distributed --preset inference-extended
+modal run benchmarks/modal_ci.py::benchmark_distributed --preset training
 ```
 
 Keep the JSONL output, profiler artifacts, environment versions, and git

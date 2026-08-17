@@ -1,8 +1,10 @@
 import json
 
 import pytest
+import torch
 
 from benchmarks import nvfp4_gemm, nvfp4_moe
+from benchmarks.distributed_ep import _global_assignments, parse_case
 from benchmarks.model_shapes import (
     FULL_ROUTINGS,
     FULL_TOKENS,
@@ -235,3 +237,25 @@ def test_trace_listing_defaults_to_primary_8192_shape(monkeypatch):
     assert payload["case_count"] == 1
     assert payload["cases"][0]["tokens"] == 8192
     assert payload["cases"][0]["routing"] == "captured"
+
+
+def test_distributed_case_names_batch_and_sequence_explicitly():
+    case = parse_case("qwen3_30b_a3b:2:4096:jagged:fwd_bwd")
+    assert case.batch_per_rank == 2
+    assert case.sequence_length == 4096
+    assert case.tokens_per_rank == 8192
+    assert case.label == "qwen3_30b_a3b:b2:s4096:jagged:fwd_bwd"
+
+
+@pytest.mark.parametrize("routing", ("balanced", "jagged", "hotspot", "tail"))
+def test_distributed_assignments_are_unique_and_seeded(routing):
+    case = parse_case(f"qwen3_30b_a3b:2:64:{routing}:fwd")
+    spec = MODEL_SHAPES[case.model]
+    topi, topv = _global_assignments(case, spec, rank=3)
+    assert topi.shape == (128, spec.topk)
+    assert topv.shape == topi.shape
+    assert torch.allclose(topv.sum(1), torch.ones(128))
+    assert not bool((topi.sort(1).values[:, 1:] == topi.sort(1).values[:, :-1]).any())
+    repeat_topi, repeat_topv = _global_assignments(case, spec, rank=3)
+    assert torch.equal(topi, repeat_topi)
+    assert torch.equal(topv, repeat_topv)

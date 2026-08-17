@@ -65,6 +65,97 @@ grouped_benchmark_img = (
 )
 
 
+def _distributed_args(preset):
+    if preset == "smoke":
+        cases = ("qwen3_30b_a3b:1:128:balanced:fwd",)
+        backends, warmup, iterations = "native,te_nvfp4_fused,torch_bf16", "3", "10"
+    elif preset == "jagged-native":
+        cases = ("qwen3_30b_a3b:128:1:jagged:fwd",)
+        backends, warmup, iterations = "native", "1", "3"
+    elif preset == "jagged-te":
+        cases = ("qwen3_30b_a3b:128:1:jagged:fwd",)
+        backends, warmup, iterations = "te_nvfp4_fused", "1", "3"
+    elif preset == "jagged-bf16":
+        cases = ("qwen3_30b_a3b:128:1:jagged:fwd",)
+        backends, warmup, iterations = "torch_bf16", "1", "3"
+    elif preset == "qwen-compare":
+        cases = ("qwen3_30b_a3b:128:1:jagged:fwd",)
+        backends, warmup, iterations = "native,te_nvfp4_fused,torch_bf16", "5", "20"
+    elif preset == "training-smoke":
+        cases = ("qwen3_30b_a3b:1:128:jagged:fwd_bwd",)
+        backends, warmup, iterations = "native,te_nvfp4_fused,torch_bf16", "2", "5"
+    elif preset == "inference":
+        cases = (
+            "qwen3_30b_a3b:128:1:jagged:fwd",
+            "qwen3_30b_a3b:1:8192:jagged:fwd",
+            "deepseek_v3_2:1:2048:jagged:fwd",
+            "kimi_k2_7:1:2048:hotspot:fwd",
+        )
+        backends, warmup, iterations = "native,te_nvfp4_fused,torch_bf16", "3", "20"
+    elif preset == "inference-extended":
+        cases = (
+            "qwen3_235b_a22b:1:2048:jagged:fwd",
+            "minimax_m2:1:2048:jagged:fwd",
+            "llama4_scout:1:2048:tail:fwd",
+        )
+        backends, warmup, iterations = "native,te_nvfp4_fused,torch_bf16", "3", "20"
+    elif preset == "training":
+        cases = (
+            "qwen3_30b_a3b:1:8192:balanced:fwd_bwd",
+            "qwen3_30b_a3b:1:8192:jagged:fwd_bwd",
+            "deepseek_v3_2:1:2048:jagged:fwd_bwd",
+        )
+        backends, warmup, iterations = "native,te_nvfp4_fused,torch_bf16", "3", "10"
+    else:
+        raise ValueError(
+            "distributed preset must be smoke, jagged-native, jagged-te, jagged-bf16, "
+            "qwen-compare, training-smoke, inference, inference-extended, or training"
+        )
+    args = [
+        "/root/proj/benchmarks/distributed_ep.py",
+        "--backends",
+        backends,
+        "--warmup",
+        warmup,
+        "--iterations",
+        iterations,
+        "--stabilize-ms",
+        "1000",
+    ]
+    for case in cases:
+        args.extend(("--case", case))
+    return args
+
+
+@app.function(gpu="B200:8", image=grouped_benchmark_img, timeout=21600, volumes={"/vol": vol})
+def benchmark_distributed(preset="smoke"):
+    import os
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = "/root/proj:/root/proj/benchmarks"
+    env["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+    env["NCCL_NET"] = "Socket"
+    env["NCCL_NET_PLUGIN"] = "none"
+    env["PYTHONUNBUFFERED"] = "1"
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=8",
+        *_distributed_args(preset),
+    ]
+    result = subprocess.run(
+        command,
+        timeout=21000,
+        env=env,
+        cwd="/root/proj",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"distributed benchmark exited with {result.returncode}")
+
+
 @app.function(gpu="B200", image=img, timeout=3600, volumes={"/vol": vol})
 def run(
     smoke_only=False,
