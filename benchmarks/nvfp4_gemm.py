@@ -19,6 +19,8 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
+from nvfp4moe.gemm import quantize
+
 try:
     from .model_shapes import (
         FULL_ROUTINGS,
@@ -43,7 +45,6 @@ except ImportError:
         parse_names,
         routing_counts,
     )
-
 
 BACKEND_NAMES = (
     "native",
@@ -1064,15 +1065,13 @@ def _dense_cases(args: argparse.Namespace) -> list[DenseCase]:
 def _dense_inputs(case: DenseCase):
     import torch
 
-    from nvfp4moe import nvfp4_quantize
-
     torch.manual_seed(20260811)
     scale = case.k**-0.5
     a = (torch.randn(case.m, case.k, dtype=torch.bfloat16, device="cuda") * scale).contiguous()
     b = (torch.randn(case.n, case.k, dtype=torch.bfloat16, device="cuda") * scale).contiguous()
     one = torch.ones(1, dtype=torch.float32, device="cuda")
-    qa, sfa, _ = nvfp4_quantize(a, one)
-    qb, sfb, _ = nvfp4_quantize(b, one)
+    qa, sfa, _ = quantize(a, one)
+    qb, sfb, _ = quantize(b, one)
     return a, b, qa, qb, sfa, sfb, one
 
 
@@ -1108,7 +1107,6 @@ def _prepare_dense_native(
 ) -> _DenseArm:
     import torch
 
-    from nvfp4moe import nvfp4_gemm, nvfp4_gemm_out, nvfp4_quantize
     from nvfp4moe.kernels.dense_gemm import DenseNvfp4Gemm
 
     a, b, qa, qb, sfa, sfb, one = inputs
@@ -1133,29 +1131,17 @@ def _prepare_dense_native(
         (float(candidate_timings[f"{tm}x{tn}"]["event_ms_p50"]), tm, tn) for tm, tn in runtimes
     ]
     _, tile_m, tile_n = min(trials)
+    runtime = runtimes[(tile_m, tile_n)]
+    out = torch.empty(case.m, case.n, dtype=torch.bfloat16, device="cuda")
 
     def prepacked():
-        return nvfp4_gemm(
-            qa,
-            qb,
-            sfa,
-            sfb,
-            one,
-            tile_m=tile_m,
-            tile_n=tile_n,
-        )
+        runtime(qa, qb, out, sfa, sfb, one)
+        return out
 
     def dynamic():
-        current_qa, current_sfa, _ = nvfp4_quantize(a, one)
-        return nvfp4_gemm(
-            current_qa,
-            qb,
-            current_sfa,
-            sfb,
-            one,
-            tile_m=tile_m,
-            tile_n=tile_n,
-        )
+        current_qa, current_sfa, _ = quantize(a, one)
+        runtime(current_qa, qb, out, current_sfa, sfb, one)
+        return out
 
     call = prepacked if mode == "prepacked" else dynamic
     result: dict[str, object] = {
@@ -1163,7 +1149,7 @@ def _prepare_dense_native(
         "config": {
             "tile_m": tile_m,
             "tile_n": tile_n,
-            "output_contract": "allocating_api",
+            "output_contract": "preallocated",
         },
         "work": {
             "logical_flops": case.flops,
@@ -1174,24 +1160,7 @@ def _prepare_dense_native(
         ],
         **_dense_accuracy(call(), a, b),
     }
-    auxiliary = {}
-    if mode == "prepacked":
-        out = torch.empty(case.m, case.n, dtype=torch.bfloat16, device="cuda")
-
-        def out_call():
-            return nvfp4_gemm_out(
-                qa,
-                qb,
-                sfa,
-                sfb,
-                one,
-                out,
-                tile_m=tile_m,
-                tile_n=tile_n,
-            )
-
-        auxiliary = {"out": out_call}
-    return _DenseArm(call, result, auxiliary)
+    return _DenseArm(call, result, {})
 
 
 def _prepare_dense_grouped(
@@ -1202,7 +1171,6 @@ def _prepare_dense_grouped(
 ) -> _DenseArm:
     import torch
 
-    from nvfp4moe import nvfp4_quantize
     from nvfp4moe.kernels.gemm import GroupedNvfp4Gemm
 
     a, b, qa, qb, sfa, sfb, one = inputs
@@ -1249,7 +1217,7 @@ def _prepare_dense_grouped(
     runtime = runtimes[(tile_m, tile_n)]
 
     def dynamic():
-        current_qa, current_sfa, _ = nvfp4_quantize(a, one)
+        current_qa, current_sfa, _ = quantize(a, one)
         grouped_sfa[0, : current_sfa.shape[0]].copy_(current_sfa)
         return call(runtime, current_qa, grouped_sfa)
 

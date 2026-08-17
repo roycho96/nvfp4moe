@@ -6,6 +6,7 @@ import statistics
 import torch
 
 import nvfp4moe.reference as ref
+from nvfp4moe.gemm import quantize
 from nvfp4moe.kernels.epilogue import GatedBackwardEpilogue
 from nvfp4moe.kernels.gemm import grouped_nvfp4_gemm
 from nvfp4moe.kernels.quantize import nvfp4_quantize_rowwise
@@ -204,15 +205,14 @@ def run_case(
 
 
 def run_dense_profile(n, k, rows, tile_m, tile_n):
-    from nvfp4moe import nvfp4_quantize
     from nvfp4moe.kernels.dense_gemm import DenseNvfp4Gemm
 
     torch.manual_seed(20260812)
     a = torch.randn(rows, k, dtype=torch.bfloat16, device="cuda") * k**-0.5
     b = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * k**-0.5
     one = torch.ones(1, dtype=torch.float32, device="cuda")
-    qa, sfa, _ = nvfp4_quantize(a, one)
-    qb, sfb, _ = nvfp4_quantize(b, one)
+    qa, sfa, _ = quantize(a, one)
+    qb, sfb, _ = quantize(b, one)
     out = torch.empty(rows, n, dtype=torch.bfloat16, device="cuda")
     gemm = DenseNvfp4Gemm(n, k, tile_m, tile_n)
     gemm(qa, qb, out, sfa, sfb, one)
