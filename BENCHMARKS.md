@@ -6,10 +6,11 @@ Results were measured on one NVIDIA B200 (`sm100`, 148 SMs) in
 GEMM comparison uses CUTLASS DSL 4.7.0 and FlashInfer 0.6.17. The training
 comparison uses Transformer Engine 2.17.
 
-Two entry points cover the release:
+Three entry points cover the release:
 
 1. `benchmarks/nvfp4_gemm.py` measures dense and grouped NVFP4 GEMM.
-2. `benchmarks/nvfp4_moe.py` measures the expert core and complete MoE layer.
+2. `benchmarks/nvfp4_moe.py` measures the complete MoE layer.
+3. `benchmarks/api_overhead.py` isolates the public GEMM call boundary.
 
 Missing backends are reported as skipped. No fallback is timed under another
 backend's name.
@@ -21,6 +22,7 @@ backend's name.
 | Prepacked GEMM | one GEMM call writing the stated output contract | input creation, compilation, autotuning, NVFP4 packing |
 | Dynamic GEMM | BF16 activation quantization and GEMM | compilation, weight packing |
 | Full MoE training | dispatch, FC1, activation, FC2, probability weighting, combine, input/router/expert-weight gradients | optimizer, master-weight refresh, EP/TP communication |
+| Public API | `plan.run(...)` on the same plan, tensors, and output as the direct call | construction, JIT, packing, allocation |
 
 Prepacked native and FlashInfer grouped calls write a preallocated output.
 PyTorch `scaled_grouped_mm` allocates its result because it has no `out=` API.
@@ -47,6 +49,31 @@ is explicitly marked `dynamic`.
 Accuracy checks require a finite full output and compare up to two rows per
 nonempty expert with an FP32 GEMM formed from the same BF16 sources. This is a
 sampled kernel check, not a convergence claim.
+
+## Public API overhead
+
+`DenseGemm` and `GroupedGemm` are aliases of the native runtime classes.
+`plan.run(...)` and `plan(...)` execute the same Python function body and the
+same compiled kernel. The benchmark isolates the spelling of that call by
+reusing one plan, one set of inputs, and one output allocation.
+
+The accepted B200 session used 30 interleaved samples after a 1,000 ms
+stabilization phase. Each CUDA event enclosed eight identical calls and was
+divided by eight; the canary used the same batching. All outputs were bitwise
+identical. Maximum absolute canary drift was 0.297%, and the maximum
+wall-time/GPU-time ratio was 1.031.
+
+| Case | Direct µs | Public `run` µs | Difference | IQR direct / public µs |
+|---|---:|---:|---:|---:|
+| Qwen3-30B FC2 dense, M=8,192 | 12.620 | 12.624 | +0.032% | 0.020 / 0.015 |
+| DeepSeek-V3 FC1 dense, M=8,192 | 92.570 | 92.568 | -0.002% | 0.178 / 0.153 |
+| Qwen3-30B FC2 grouped, jagged M=65,536 | 84.150 | 84.216 | +0.078% | 0.147 / 0.150 |
+| DeepSeek-V3 FC2 grouped, jagged M=65,536 | 468.652 | 468.384 | -0.057% | 0.481 / 0.329 |
+| DeepSeek-V3 FC2 grouped, one empty expert | 466.716 | 466.598 | -0.025% | 6.189 / 3.206 |
+
+The largest positive difference was 0.078%, below the 2% API regression gate.
+These figures validate the API boundary only; the GEMM performance tables below
+compare the kernels against external implementations.
 
 ## FLOPs and peak
 
@@ -207,6 +234,7 @@ modal run benchmarks/modal_ci.py
 modal run benchmarks/modal_ci.py --benchmark-smoke
 modal run benchmarks/modal_ci.py --matrix gemm
 modal run benchmarks/modal_ci.py --matrix moe-training
+modal run benchmarks/modal_ci.py --grouped api
 ```
 
 Keep the JSONL output, profiler artifacts, environment versions, and git
