@@ -220,6 +220,7 @@ class InferenceMoE:
         max_tokens: int,
         *,
         activation: str = "swiglu",
+        activation_clamp: float | None = None,
         use_dynamic_sched: bool | None = None,
         device: torch.device | str = "cuda",
         workspace: InferenceWorkspace | None = None,
@@ -239,8 +240,15 @@ class InferenceMoE:
             raise ValueError(f"max_tokens * topk cannot exceed {B_MAX * CHUNK}")
         if activation not in ("swiglu", "geglu", "reglu"):
             raise ValueError("activation must be swiglu, geglu, or reglu")
+        if activation_clamp is not None:
+            activation_clamp = float(activation_clamp)
+            if not math.isfinite(activation_clamp) or activation_clamp <= 0:
+                raise ValueError("activation_clamp must be finite and positive")
+            if activation != "swiglu":
+                raise ValueError("activation_clamp is supported only for swiglu")
 
         self.activation = activation
+        self.activation_clamp = activation_clamp
         self.use_dynamic_sched = use_dynamic_sched
         self.device = torch.device(device)
         if self.device.type != "cuda":
@@ -464,7 +472,11 @@ class InferenceMoE:
                 128,
                 output_dtype=output_dtype,
                 epilogue=(
-                    GatedEpilogue(self.activation, save_preact=False)
+                    GatedEpilogue(
+                        self.activation,
+                        save_preact=False,
+                        clamp_limit=self.activation_clamp,
+                    )
                     if output_dtype == torch.float4_e2m1fn_x2
                     else None
                 ),
@@ -511,7 +523,11 @@ class InferenceMoE:
                     128,
                     fused_tile_n,
                     output_dtype=torch.float4_e2m1fn_x2,
-                    epilogue=GatedEpilogue(self.activation, save_preact=False),
+                    epilogue=GatedEpilogue(
+                        self.activation,
+                        save_preact=False,
+                        clamp_limit=self.activation_clamp,
+                    ),
                     use_dynamic_sched=False,
                     use_pdl=True,
                     swap_ab=True,
@@ -586,7 +602,11 @@ class InferenceMoE:
                 128,
                 128,
                 output_dtype=torch.float4_e2m1fn_x2,
-                epilogue=GatedEpilogue(self.activation, save_preact=False),
+                epilogue=GatedEpilogue(
+                    self.activation,
+                    save_preact=False,
+                    clamp_limit=self.activation_clamp,
+                ),
                 use_dynamic_sched=False,
                 use_pdl=True,
                 direct_routes=self.topk,
@@ -660,6 +680,9 @@ class InferenceMoE:
         fc1(qx, self.qb1, preact, m_indptr, sfx, self.sfb1, self._alpha1)
         gate = preact[:, 0::2].float()
         up = preact[:, 1::2].float()
+        if self.activation_clamp is not None:
+            gate.clamp_(max=self.activation_clamp)
+            up.clamp_(min=-self.activation_clamp, max=self.activation_clamp)
         if self.activation == "swiglu":
             hidden = torch.nn.functional.silu(gate).mul_(up)
         elif self.activation == "geglu":

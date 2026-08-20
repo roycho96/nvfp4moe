@@ -138,6 +138,40 @@ def test_batch_one_decode_matches_prefill():
     assert torch.equal(plan._m_indptr, torch.tensor([0, 0, 1, 1, 2], device="cuda").int())
 
 
+def test_clamped_swiglu_matches_across_decode_and_prefill():
+    from nvfp4moe import InferenceMoE
+
+    torch.manual_seed(20260824)
+    tokens, hidden, intermediate, experts, topk = 8, 256, 128, 4, 2
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda")
+    gate = torch.randn(experts, intermediate, hidden, dtype=torch.bfloat16, device="cuda")
+    up = torch.randn_like(gate)
+    down = torch.randn(experts, hidden, intermediate, dtype=torch.bfloat16, device="cuda")
+    topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]] * 2, device="cuda").int()
+    topk_weights = torch.full((tokens, topk), 0.5, device="cuda")
+
+    clamped = InferenceMoE(
+        hidden,
+        intermediate,
+        experts,
+        topk,
+        tokens,
+        activation_clamp=10.0,
+    )
+    unclamped = InferenceMoE(hidden, intermediate, experts, topk, tokens)
+    for plan in (clamped, unclamped):
+        plan.load_weights(gate, up, down)
+        plan.set_activation_scales(1.0, 1.0)
+
+    decode = clamped.run_decode(x, topk_ids, topk_weights).clone()
+    prefill = clamped.run_prefill(x, topk_ids, topk_weights).clone()
+    plain = unclamped.run_prefill(x, topk_ids, topk_weights).clone()
+    torch.cuda.synchronize()
+
+    assert torch.equal(decode, prefill)
+    assert not torch.equal(prefill, plain)
+
+
 @pytest.mark.parametrize("routing", ("balanced", "hotspot"))
 def test_fast_decode_plan_matches_prefill(routing):
     from nvfp4moe import InferenceMoE

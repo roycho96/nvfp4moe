@@ -872,7 +872,7 @@ class NVFP4GatedQuantKernel:
             for index in cutlass.range_constexpr(16):
                 gate = Float32(mPreact[row, 2 * (feature + index)])
                 up = Float32(mPreact[row, 2 * (feature + index) + 1])
-                postact[index] = gated_postact_value(gate, up, self.activation)
+                postact[index] = gated_postact_value(gate, up, self.activation, 0.0)
             scaled, scale_factors = quantize_postact_fragment(postact, Float32(mPts[1]))
             packed = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Uint8)
             for pair in cutlass.range_constexpr(8):

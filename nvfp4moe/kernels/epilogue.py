@@ -43,9 +43,19 @@ class GatedEpilogue:
 
     activation: str = "swiglu"
     save_preact: bool = False
+    clamp_limit: float | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "activation", validate_gated_activation(self.activation))
+        if self.clamp_limit is not None:
+            limit = float(self.clamp_limit)
+            if not math.isfinite(limit) or limit <= 0:
+                raise ValueError("clamp_limit must be finite and positive")
+            if self.activation != "swiglu":
+                raise ValueError("clamp_limit is supported only for swiglu")
+            if self.save_preact:
+                raise ValueError("clamped swiglu does not support saved preactivation")
+            object.__setattr__(self, "clamp_limit", limit)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,8 +110,13 @@ def gated_postact_value(
     gate: Float32,
     up: Float32,
     activation: cutlass.Constexpr[str],
+    clamp_limit: cutlass.Constexpr[float] = 0.0,
 ) -> Float32:
     validate_gated_activation(activation)
+    if const_expr(clamp_limit > 0.0):
+        limit = Float32(clamp_limit)
+        gate = cute.arch.fmin(gate, limit)
+        up = cute.arch.fmax(cute.arch.fmin(up, limit), -limit)
     if const_expr(activation == "swiglu"):
         sigmoid = cute.arch.rcp_approx(Float32(1.0) + cute.math.exp(-gate, fastmath=True))
         return gate * sigmoid * up
@@ -118,6 +133,7 @@ def gated_postact_fragment(
     accumulator: cute.Tensor,
     alpha: Float32,
     activation: cutlass.Constexpr[str],
+    clamp_limit: cutlass.Constexpr[float] = 0.0,
 ) -> cute.Tensor:
     """Apply a gated activation to adjacent FP32 accumulator values.
 
@@ -134,7 +150,7 @@ def gated_postact_fragment(
     for index in cutlass.range_constexpr(count):
         gate = values[index * 2] * alpha
         up = values[index * 2 + 1] * alpha
-        output[index] = gated_postact_value(gate, up, activation)
+        output[index] = gated_postact_value(gate, up, activation, clamp_limit)
     return output
 
 

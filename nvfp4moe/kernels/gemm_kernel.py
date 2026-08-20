@@ -140,6 +140,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         activation: str | None = None,
         dactivation: str | None = None,
         save_preact: bool = False,
+        gated_clamp_limit: float = 0.0,
         mma_inst_tile_k: int = 4,
         use_dynamic_sched: bool = True,
         use_pdl: bool = False,
@@ -173,6 +174,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         self.gated = self.activation is not None
         self.dgrad = self.dactivation is not None
         self.save_preact = bool(save_preact)
+        self.gated_clamp_limit = float(gated_clamp_limit)
         self.use_dynamic_sched = bool(use_dynamic_sched)
         self.use_pdl = bool(use_pdl)
         self.swap_ab = bool(swap_ab)
@@ -197,6 +199,8 @@ class Sm100GroupedBlockScaledGemmKernel:
             raise ValueError("gather B requires swapped K256 fast decode")
         if self.save_preact and not self.gated:
             raise ValueError("saved preactivation requires a gated epilogue")
+        if self.gated_clamp_limit < 0 or (self.gated_clamp_limit and self.activation != "swiglu"):
+            raise ValueError("gated clamp requires swiglu and a nonnegative limit")
         self.mma_inst_tile_k = mma_inst_tile_k
         self.sf_vec_size = sf_vec_size
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -2555,6 +2559,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                                             sGated[accumulator_col, row_in_cta],
                                             sGated[accumulator_col + 1, row_in_cta],
                                             self.activation,
+                                            self.gated_clamp_limit,
                                         )
                                     scaled_postact, output_sf_values = quantize_postact_fragment(
                                         postact,
@@ -2640,6 +2645,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                             tTR_rAcc,
                             alpha_value,
                             self.activation,
+                            self.gated_clamp_limit,
                         )
                         if cutlass.const_expr(self.is_nvfp4_output):
                             scaled_postact, output_sf_values = quantize_postact_fragment(

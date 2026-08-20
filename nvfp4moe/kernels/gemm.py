@@ -46,6 +46,7 @@ def _compile_grouped(
     activation: str | None,
     dactivation: str | None,
     save_preact: bool,
+    gated_clamp_limit: float,
     use_dynamic_sched: bool,
     per_expert_alpha: bool,
     use_pdl: bool,
@@ -120,6 +121,7 @@ def _compile_grouped(
             activation=activation,
             dactivation=dactivation,
             save_preact=save_preact,
+            gated_clamp_limit=gated_clamp_limit,
             mma_inst_tile_k=2 if dactivation is not None and k >= 4096 else 4,
             use_dynamic_sched=use_dynamic_sched,
             use_pdl=use_pdl,
@@ -179,6 +181,11 @@ class GroupedNvfp4Gemm:
     ):
         activation, dactivation = resolve_gemm_epilogue(epilogue, activation, dactivation)
         save_preact = isinstance(epilogue, GatedEpilogue) and epilogue.save_preact
+        gated_clamp_limit = (
+            float(epilogue.clamp_limit)
+            if isinstance(epilogue, GatedEpilogue) and epilogue.clamp_limit is not None
+            else 0.0
+        )
         if epilogue is None:
             if activation is not None:
                 epilogue = GatedEpilogue(activation)
@@ -232,6 +239,7 @@ class GroupedNvfp4Gemm:
         self.activation = activation
         self.dactivation = dactivation
         self.save_preact = save_preact
+        self.gated_clamp_limit = gated_clamp_limit
         self.epilogue = epilogue
         self.use_dynamic_sched = _resolve_dynamic_schedule(use_dynamic_sched, k)
         self.use_pdl = bool(use_pdl)
@@ -502,6 +510,7 @@ class GroupedNvfp4Gemm:
                 self.activation,
                 self.dactivation,
                 self.save_preact,
+                self.gated_clamp_limit,
                 self.use_dynamic_sched,
                 self._per_expert_alpha,
                 self.use_pdl,

@@ -119,6 +119,8 @@ is overwritten by the next call. Pass
 expert-major rows can call `run_routed(x, m_indptr, padded_offsets, out=...)`.
 Checkpoint activation scales can replace calibration through
 `set_activation_scales(input_scale, hidden_scale)`.
+For checkpoints with a bounded SwiGLU, pass the checkpoint value as
+`activation_clamp=` when constructing the plan.
 Use one plan per concurrent CUDA stream because its workspaces are reused.
 Batch-one decode fuses dispatch and input quantization when top-k is at most
 32. Long-hidden decode uses a launch grid selected for batch-one and small
@@ -180,7 +182,7 @@ from the package root.
 ```bash
 ruff check nvfp4moe benchmarks tests
 ruff format --check nvfp4moe benchmarks tests
-pytest -q
+python -m pytest -q
 
 python benchmarks/nvfp4_gemm.py --list --suite full
 python benchmarks/nvfp4_moe.py --list --suite full

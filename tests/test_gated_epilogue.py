@@ -20,6 +20,17 @@ def test_epilogue_policies_validate_activation():
         GatedEpilogue("gelu")
 
 
+def test_clamped_swiglu_policy():
+    policy = GatedEpilogue("swiglu", clamp_limit=10)
+    assert policy.clamp_limit == 10.0
+    with pytest.raises(ValueError, match="finite and positive"):
+        GatedEpilogue("swiglu", clamp_limit=0)
+    with pytest.raises(ValueError, match="only for swiglu"):
+        GatedEpilogue("geglu", clamp_limit=10)
+    with pytest.raises(ValueError, match="saved preactivation"):
+        GatedEpilogue("swiglu", save_preact=True, clamp_limit=10)
+
+
 def test_epilogue_policy_resolves_compile_mode():
     assert resolve_gemm_epilogue(GatedEpilogue("geglu"), None, None) == ("geglu", None)
     assert resolve_gemm_epilogue(GatedBackwardEpilogue("reglu"), None, None) == (None, "reglu")
