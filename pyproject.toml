@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nvfp4moe"
 dynamic = ["version"]
-description = "Training-capable NVFP4 MoE expert kernels for NVIDIA Blackwell"
+description = "NVFP4 GEMM and MoE inference/training kernels for NVIDIA Blackwell"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"

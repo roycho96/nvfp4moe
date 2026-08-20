@@ -248,6 +248,9 @@ class MoESchedulerParams:
         cta_tile_shape_mnk: tuple[int, int, int],  # (tile_m, tile_n, tile_k)
         cluster_shape_mn: tuple[int, int],  # (cluster_m, cluster_n)
         use_dynamic_sched: bool = False,
+        fast_decode_sched: bool = False,
+        static_expert_cnt: int = 0,
+        direct_routes: int = 0,
     ):
         self.scenario = scenario
         e, i, h = expert_shape
@@ -257,6 +260,9 @@ class MoESchedulerParams:
         self.cta_tile_shape_mnk = cta_tile_shape_mnk
         self.cluster_shape_mn = cluster_shape_mn
         self.use_dynamic_sched = use_dynamic_sched
+        self.fast_decode_sched = fast_decode_sched
+        self.static_expert_cnt = static_expert_cnt
+        self.direct_routes = direct_routes
 
     @property
     def cluster_tile_m(self) -> int:
@@ -293,6 +299,9 @@ class MoESchedulerParams:
             cta_tile_shape_mnk=self.cta_tile_shape_mnk,
             cluster_shape_mn=self.cluster_shape_mn,
             use_dynamic_sched=self.use_dynamic_sched,
+            fast_decode_sched=self.fast_decode_sched,
+            static_expert_cnt=self.static_expert_cnt,
+            direct_routes=self.direct_routes,
         )
 
     @staticmethod
@@ -496,6 +505,7 @@ class MoEPersistentTileScheduler:
         params: MoESchedulerParams,
         # Runtime tensor for scheduling
         offs: cute.Tensor,  # (experts,) cumsum of token counts
+        decode_plan: cute.Tensor,
         # Scheduling state
         num_persistent_clusters: Int32,
         current_work_linear_idx: Int32,
@@ -511,6 +521,7 @@ class MoEPersistentTileScheduler:
     ):
         self.params = params
         self.offs = offs
+        self.decode_plan = decode_plan
         self.num_persistent_clusters = num_persistent_clusters
         self._current_work_linear_idx = current_work_linear_idx
         self.cta_id_in_cluster = cta_id_in_cluster
@@ -619,6 +630,7 @@ class MoEPersistentTileScheduler:
         values.extend(extract_mlir_values(self.params))
         # Runtime tensor for scheduling
         values.extend(extract_mlir_values(self.offs))
+        values.extend(extract_mlir_values(self.decode_plan))
         # Scheduling state
         values.extend(extract_mlir_values(self.num_persistent_clusters))
         values.extend(extract_mlir_values(self._current_work_linear_idx))
@@ -643,6 +655,10 @@ class MoEPersistentTileScheduler:
         offs_len = len(extract_mlir_values(self.offs))
         new_offs = new_from_mlir_values(self.offs, values[idx : idx + offs_len])
         idx += offs_len
+
+        plan_len = len(extract_mlir_values(self.decode_plan))
+        new_decode_plan = new_from_mlir_values(self.decode_plan, values[idx : idx + plan_len])
+        idx += plan_len
 
         # Scheduling state
         new_num_persistent_clusters = new_from_mlir_values(
@@ -678,6 +694,7 @@ class MoEPersistentTileScheduler:
         return MoEPersistentTileScheduler(
             params=new_params,
             offs=new_offs,
+            decode_plan=new_decode_plan,
             num_persistent_clusters=new_num_persistent_clusters,
             current_work_linear_idx=new_current_work_linear_idx,
             cta_id_in_cluster=new_cta_id_in_cluster,
@@ -698,6 +715,7 @@ class MoEPersistentTileScheduler:
     def create(
         params: MoESchedulerParams,
         offs: cute.Tensor,
+        decode_plan: cute.Tensor,
         block_idx: tuple[Integer, Integer, Integer],
         grid_dim: tuple[Integer, Integer, Integer],
         # Dynamic scheduling resources (all None for static mode)
@@ -761,6 +779,7 @@ class MoEPersistentTileScheduler:
         return MoEPersistentTileScheduler(
             params=params,
             offs=offs,
+            decode_plan=decode_plan,
             num_persistent_clusters=num_persistent_clusters,
             current_work_linear_idx=current_work_linear_idx,
             cta_id_in_cluster=cta_id_in_cluster,
@@ -968,6 +987,11 @@ class MoEPersistentTileScheduler:
 
         Returns an invalid tile (expert_idx = -1) if cluster_linear_idx is out of range.
         """
+        if const_expr(self.params.fast_decode_sched):
+            return self._get_decode_work_tile(cluster_linear_idx, loc=loc, ip=ip)
+        if const_expr(self.params.direct_routes > 0):
+            return self._get_direct_work_tile(cluster_linear_idx, loc=loc, ip=ip)
+
         self._advance_expert_to_contain(cluster_linear_idx, loc=loc, ip=ip)
 
         is_valid = self.current_expert_idx < self.expert_cnt
@@ -1003,6 +1027,64 @@ class MoEPersistentTileScheduler:
                 tile_m_idx=cta_tile_m_idx,
                 tile_n_idx=cta_tile_n_idx,
                 k_tile_cnt=k_tile_cnt,
+            )
+        return work_tile_info
+
+    @dsl_user_op
+    @cute.jit
+    def _get_direct_work_tile(
+        self,
+        cluster_linear_idx: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ) -> MoEWorkTileInfo:
+        tiles_per_route = (self.intermediate + self.cluster_tile_n - 1) // self.cluster_tile_n
+        route = cluster_linear_idx // tiles_per_route
+        tile_n = cluster_linear_idx % tiles_per_route
+        work_tile_info = MoEWorkTileInfo(
+            expert_idx=Int32(-1),
+            tile_m_idx=Int32(0),
+            tile_n_idx=Int32(0),
+            k_tile_cnt=Int32(0),
+        )
+        if route < self.params.direct_routes:
+            expert = self.offs[route]
+            work_tile_info = MoEWorkTileInfo(
+                expert_idx=expert,
+                tile_m_idx=route,
+                tile_n_idx=tile_n * self.cluster_shape_mn[1] + self.cta_id_in_cluster[1],
+                k_tile_cnt=self._compute_k_tile_cnt(expert, loc=loc, ip=ip),
+            )
+        return work_tile_info
+
+    @dsl_user_op
+    @cute.jit
+    def _get_decode_work_tile(
+        self,
+        cluster_linear_idx: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ) -> MoEWorkTileInfo:
+        tiles_per_expert = (self.intermediate + self.cluster_tile_n - 1) // self.cluster_tile_n
+        m_tile_rank = cluster_linear_idx // tiles_per_expert
+        local_idx = cluster_linear_idx % tiles_per_expert
+        work_tile_info = MoEWorkTileInfo(
+            expert_idx=Int32(-1),
+            tile_m_idx=Int32(0),
+            tile_n_idx=Int32(0),
+            k_tile_cnt=Int32(0),
+        )
+        if m_tile_rank < self.decode_plan[0]:
+            packed = self.decode_plan[m_tile_rank + 1]
+            expert = packed % self.params.static_expert_cnt
+            tile_m = packed // self.params.static_expert_cnt
+            work_tile_info = MoEWorkTileInfo(
+                expert_idx=expert,
+                tile_m_idx=tile_m * self.cluster_shape_mn[0] + self.cta_id_in_cluster[0],
+                tile_n_idx=local_idx * self.cluster_shape_mn[1] + self.cta_id_in_cluster[1],
+                k_tile_cnt=self._compute_k_tile_cnt(expert, loc=loc, ip=ip),
             )
         return work_tile_info
 

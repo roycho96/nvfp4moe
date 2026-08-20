@@ -20,12 +20,24 @@ B_MAX = 128
 
 
 class MoEDispatchKernel:
-    def __init__(self, E: int, topk: int):
+    def __init__(
+        self,
+        E: int,
+        topk: int,
+        small: bool = False,
+        use_pdl: bool = True,
+        gather_experts: bool = False,
+        plan_tile_rows: int = 128,
+    ):
         assert E <= NUM_THREADS, "one counting thread per expert"
         assert CHUNK * 4 + B_MAX * E * 4 + E * 4 <= 200 * 1024, "smem budget"
         self.E = E
         self.topk = topk
-        self.warp_dispatch = E <= 32
+        self.small = small
+        self.use_pdl = use_pdl
+        self.gather_experts = gather_experts
+        self.plan_tile_rows = plan_tile_rows
+        self.warp_dispatch = E <= NUM_THREADS
 
     @cute.jit
     def __call__(
@@ -41,12 +53,131 @@ class MoEDispatchKernel:
         B: Int32,  # ceil(M / CHUNK)
         stream: cuda.CUstream,
     ):
-        self.kernel_hist(mTopI, mPart).launch(
-            grid=[B, 1, 1], block=[NUM_THREADS, 1, 1], stream=stream
+        if const_expr(self.small):
+            self.kernel_small(mTopI, mTopV, mPart, mGi, mCu, mPs, mSlots, mOffPad).launch(
+                grid=[1, 1, 1],
+                block=[NUM_THREADS, 1, 1],
+                stream=stream,
+                use_pdl=self.use_pdl,
+            )
+        else:
+            self.kernel_hist(mTopI, mPart).launch(
+                grid=[B, 1, 1],
+                block=[NUM_THREADS, 1, 1],
+                stream=stream,
+                use_pdl=self.use_pdl,
+            )
+            self.kernel_scatter(mTopI, mTopV, mPart, mGi, mCu, mPs, mSlots, mOffPad, B).launch(
+                grid=[B, 1, 1],
+                block=[NUM_THREADS, 1, 1],
+                stream=stream,
+                use_pdl=self.use_pdl,
+            )
+
+    @cute.kernel
+    def kernel_small(
+        self,
+        mTopI: cute.Tensor,
+        mTopV: cute.Tensor,
+        mPlan: cute.Tensor,
+        mGi: cute.Tensor,
+        mCu: cute.Tensor,
+        mPs: cute.Tensor,
+        mSlots: cute.Tensor,
+        mOffPad: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        M = mTopI.shape[0]
+        smem = cutlass.utils.SmemAllocator()
+        sChunk = smem.allocate_tensor(Int32, cute.make_layout(CHUNK), byte_alignment=16)
+        sBase = smem.allocate_tensor(Int32, cute.make_layout(self.E), byte_alignment=16)
+        sTot = smem.allocate_tensor(Int32, cute.make_layout(self.E), byte_alignment=16)
+        sPad = smem.allocate_tensor(Int32, cute.make_layout(self.E), byte_alignment=16)
+        sPlan = smem.allocate_tensor(Int32, cute.make_layout(self.E), byte_alignment=16)
+        sSeg = smem.allocate_tensor(
+            Int32,
+            cute.make_layout((CHUNK // 32, self.E), stride=(self.E, 1)),
+            byte_alignment=16,
         )
-        self.kernel_scatter(mTopI, mTopV, mPart, mGi, mCu, mPs, mSlots, mOffPad, B).launch(
-            grid=[B, 1, 1], block=[NUM_THREADS, 1, 1], stream=stream
-        )
+        segment_items = (CHUNK // 32) * self.E
+        segment_iters = (segment_items + NUM_THREADS - 1) // NUM_THREADS
+        for i in cutlass.range_constexpr(segment_iters):
+            linear = tidx + i * NUM_THREADS
+            if linear < segment_items:
+                sSeg[linear // self.E, linear % self.E] = 0
+        for i in cutlass.range_constexpr(CHUNK // NUM_THREADS):
+            j = tidx + i * NUM_THREADS
+            value = Int32(-1)
+            if j < M:
+                value = mTopI[j]
+            sChunk[j] = value
+        cute.arch.sync_threads()
+        if const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
+
+        warp = tidx // 32
+        lane = tidx % 32
+        ranks = cute.make_rmem_tensor(cute.make_layout(CHUNK // NUM_THREADS), Int32)
+        for i in cutlass.range_constexpr(CHUNK // NUM_THREADS):
+            j = tidx + i * NUM_THREADS
+            value = sChunk[j]
+            segment = i * (NUM_THREADS // 32) + warp
+            peers = cute.arch.match_sync(Int32(-1), value)
+            rank = Int32(cute.arch.popc(peers & cute.arch.lanemask_lt()))
+            if value >= 0 and rank == 0:
+                sSeg[segment, value] = cute.arch.popc(peers)
+            ranks[i] = rank
+        cute.arch.sync_threads()
+
+        count = Int32(0)
+        if tidx < self.E:
+            for segment in cutlass.range_constexpr(CHUNK // 32):
+                segment_count = sSeg[segment, tidx]
+                sSeg[segment, tidx] = count
+                count += segment_count
+            sTot[tidx] = count
+            tile_count = (count + self.plan_tile_rows - 1) // self.plan_tile_rows
+            sPad[tidx] = tile_count * 128
+            sPlan[tidx] = tile_count
+        cute.arch.sync_threads()
+        for offset in (1, 2, 4, 8, 16, 32, 64, 128):
+            add_count = Int32(0)
+            add_padded = Int32(0)
+            add_plan = Int32(0)
+            if tidx < self.E and tidx >= offset:
+                add_count = sTot[tidx - offset]
+                add_padded = sPad[tidx - offset]
+                add_plan = sPlan[tidx - offset]
+            cute.arch.sync_threads()
+            if tidx < self.E:
+                sTot[tidx] += add_count
+                sPad[tidx] += add_padded
+                sPlan[tidx] += add_plan
+            cute.arch.sync_threads()
+        if tidx < self.E:
+            base = sTot[tidx] - count
+            sBase[tidx] = base
+            mCu[tidx + 1] = sTot[tidx]
+            mOffPad[tidx] = sPad[tidx]
+            tile_count = (count + self.plan_tile_rows - 1) // self.plan_tile_rows
+            plan_base = sPlan[tidx] - tile_count
+            for tile_m in cutlass.range(tile_count):
+                mPlan[plan_base + tile_m + 1] = tidx + tile_m * self.E
+            mPlan[mPlan.shape[0] - self.E + tidx] = (sPad[tidx] - tile_count * 128) // 128
+            if tidx == 0:
+                mCu[0] = 0
+                mPlan[0] = sPlan[self.E - 1]
+        cute.arch.sync_threads()
+
+        for i in cutlass.range_constexpr(CHUNK // NUM_THREADS):
+            j = tidx + i * NUM_THREADS
+            expert = sChunk[j]
+            if j < M:
+                segment = i * (NUM_THREADS // 32) + warp
+                dst = sBase[expert] + sSeg[segment, expert] + ranks[i]
+                mGi[dst] = expert if const_expr(self.gather_experts) else j // self.topk
+                mPs[dst] = Float32(mTopV[j])
+                mSlots[j] = dst
 
     @cute.kernel
     def kernel_hist(self, mTopI: cute.Tensor, mPart: cute.Tensor):
@@ -63,6 +194,8 @@ class MoEDispatchKernel:
                 v = mTopI[p]
             sChunk[j] = v
         cute.arch.sync_threads()
+        if const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
         if const_expr(self.warp_dispatch):
             warp = tidx // 32
             lane = tidx % 32
@@ -120,6 +253,9 @@ class MoEDispatchKernel:
             sChunk[j] = v
         n_part = B * self.E
         n_iters = (n_part + NUM_THREADS - 1) // NUM_THREADS
+        if const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
         for i in cutlass.range(n_iters):
             j = tidx + i * NUM_THREADS
             if j < n_part:
@@ -159,7 +295,7 @@ class MoEDispatchKernel:
                     if sChunk[j] == e:
                         p = b * CHUNK + j
                         s = base + cnt
-                        mGi[s] = p // self.topk
+                        mGi[s] = e if const_expr(self.gather_experts) else p // self.topk
                         mPs[s] = Float32(mTopV[p])
                         mSlots[p] = s
                         cnt += 1
@@ -190,13 +326,20 @@ class MoEDispatchKernel:
                     for earlier in cutlass.range_constexpr(CHUNK // 32):
                         if earlier < segment:
                             dst += sSeg[earlier, e]
-                    mGi[dst] = p // self.topk
+                    mGi[dst] = e if const_expr(self.gather_experts) else p // self.topk
                     mPs[dst] = Float32(mTopV[p])
                     mSlots[p] = dst
 
     @staticmethod
     @jit_cache
-    def compile(E, topk):
+    def compile(
+        E,
+        topk,
+        small=False,
+        use_pdl=True,
+        gather_experts=False,
+        plan_tile_rows=128,
+    ):
         m1, m2, m3, m4, m5, c1, p1, e1 = (cute.sym_int() for _ in range(8))
         topi = fake_tensor(Int32, (m1,), 1)
         topv = fake_tensor(Float32, (m2,), 1)
@@ -207,7 +350,7 @@ class MoEDispatchKernel:
         slots = fake_tensor(Int32, (m5,), 1)
         off_pad = fake_tensor(Int32, (e1,), 1)
         return cute.compile(
-            MoEDispatchKernel(E, topk),
+            MoEDispatchKernel(E, topk, small, use_pdl, gather_experts, plan_tile_rows),
             topi,
             topv,
             part,
@@ -232,6 +375,10 @@ def moe_dispatch(
     slots: Tensor,
     part: Tensor,
     off_pad: Tensor,
+    *,
+    use_pdl: bool = True,
+    gather_experts: bool = False,
+    plan_tile_rows: int = 128,
 ) -> None:
     """Build a stable expert-major permutation from preselected routes."""
     assert topi.dtype == torch.int32 and topi.is_contiguous()
@@ -241,10 +388,11 @@ def moe_dispatch(
     M = T * k
     B = -(-M // CHUNK)
     assert B <= B_MAX, f"M={M} exceeds the {B_MAX * CHUNK} dispatch bound"
+    assert plan_tile_rows > 0 and 128 % plan_tile_rows == 0
     assert gi.numel() == M and slots.numel() == M and ps.numel() == M
     assert cu.numel() == E + 1 and part.numel() >= B * E
     assert off_pad.numel() == E and off_pad.dtype == torch.int32
-    MoEDispatchKernel.compile(E, k)(
+    MoEDispatchKernel.compile(E, k, B == 1, use_pdl, gather_experts, plan_tile_rows)(
         topi.view(-1), topv.view(-1), part, gi, cu, ps, slots, off_pad, B
     )
 

@@ -163,6 +163,7 @@ def run(
     dgrad_matrix=False,
     frontier_matrix=False,
     benchmark_smoke=False,
+    inference_only=False,
 ):
     import os
 
@@ -170,7 +171,10 @@ def run(
     env["PYTHONPATH"] = "/root/proj"
     ok = True
     scripts = (["benchmarks/native_grouped_gemm_smoke.py"],)
-    if benchmark_smoke:
+    if inference_only:
+        scripts = (["-m", "pytest", "-q", "tests/test_inference.py"],)
+        smoke_only = True
+    elif benchmark_smoke:
         scripts = (
             [
                 "benchmarks/nvfp4_gemm.py",
@@ -398,6 +402,88 @@ def profile(case="dgrad2-qwen"):
             print(result.stderr[-8000:])
         if result.returncode != 0:
             raise RuntimeError(f"NCU exited with {result.returncode}")
+
+
+@app.function(
+    gpu="B200",
+    image=grouped_benchmark_img,
+    timeout=14400,
+    volumes={"/vol": vol},
+    single_use_containers=True,
+)
+def benchmark_inference(preset="smoke"):
+    import os
+
+    stabilize = "1000"
+    if preset == "smoke":
+        cases = ("qwen3_30b_a3b:128:16:balanced",)
+        warmup, iterations = "3", "20"
+    elif preset == "kimi":
+        cases = ("kimi_k2_7:2048:48:hotspot",)
+        warmup, iterations = "10", "30"
+        stabilize = "15000"
+    elif preset == "gemma":
+        cases = ("gemma4_26b_a4b:2048:16:balanced",)
+        warmup, iterations = "3", "30"
+    elif preset == "decode-qwen":
+        cases = ("qwen3_30b_a3b:8:16:hotspot",)
+        warmup, iterations = "10", "50"
+        stabilize = "5000"
+    elif preset == "decode":
+        cases = (
+            "qwen3_30b_a3b:1:16:balanced",
+            "qwen3_30b_a3b:8:16:hotspot",
+            "deepseek_v3_2:1:32:empty",
+            "deepseek_v3_2:32:32:balanced",
+            "kimi_k2_7:1:48:hotspot",
+        )
+        warmup, iterations = "3", "30"
+    elif preset == "full":
+        cases = (
+            "qwen3_30b_a3b:128:16:balanced",
+            "qwen3_30b_a3b:8192:16:balanced",
+            "qwen3_235b_a22b:2048:16:hotspot",
+            "gemma4_26b_a4b:2048:16:balanced",
+            "deepseek_v3_2:2048:32:balanced",
+            "kimi_k2_7:2048:48:hotspot",
+            "minimax_m2:2048:32:empty",
+            "llama4_scout:2048:2:balanced",
+        )
+        warmup, iterations = "3", "20"
+    else:
+        raise ValueError(
+            "inference preset must be smoke, kimi, gemma, decode-qwen, decode, or full"
+        )
+    command = [
+        sys.executable,
+        "/root/proj/benchmarks/inference_moe.py",
+        "--warmup",
+        warmup,
+        "--iterations",
+        iterations,
+        "--stabilize-ms",
+        stabilize,
+    ]
+    for case in cases:
+        command.extend(("--case", case))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = "/root/proj:/root/proj/benchmarks"
+    env["FLASHINFER_WORKSPACE_BASE"] = "/vol/flashinfer"
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=13800,
+        env=env,
+        cwd="/root/proj",
+        check=False,
+    )
+    print(result.stdout[-200_000:])
+    if result.stderr:
+        print(result.stderr[-20_000:])
+    if result.returncode != 0:
+        raise RuntimeError(f"inference benchmark exited with {result.returncode}")
+    vol.commit()
 
 
 @app.function(gpu="B200", image=benchmark_img, timeout=14400, volumes={"/vol": vol})

@@ -7,12 +7,13 @@ distributed section uses eight B200s in one node. Both use
 GEMM comparison uses CUTLASS DSL 4.7.0 and FlashInfer 0.6.17. The training
 comparison uses Transformer Engine 2.17.
 
-Four entry points cover the release:
+Five entry points cover the release:
 
 1. `benchmarks/nvfp4_gemm.py` measures dense and grouped NVFP4 GEMM.
 2. `benchmarks/nvfp4_moe.py` measures the complete MoE layer.
-3. `benchmarks/api_overhead.py` isolates the public GEMM call boundary.
-4. `benchmarks/distributed_ep.py` measures the end-to-end EP expert boundary.
+3. `benchmarks/inference_moe.py` measures the inference-only MoE plan.
+4. `benchmarks/api_overhead.py` isolates the public GEMM call boundary.
+5. `benchmarks/distributed_ep.py` measures the end-to-end EP expert boundary.
 
 Missing backends are reported as skipped. No fallback is timed under another
 backend's name.
@@ -23,6 +24,7 @@ backend's name.
 |---|---|---|
 | Prepacked GEMM | one GEMM call writing the stated output contract | input creation, compilation, autotuning, NVFP4 packing |
 | Dynamic GEMM | BF16 activation quantization and GEMM | compilation, weight packing |
+| Inference MoE | dispatch, BF16 input quantization, FC1 + gated activation + requantization, FC2, probability weighting, combine | routing logits/top-k, calibration, compilation, weight packing |
 | Full MoE training | dispatch, FC1, activation, FC2, probability weighting, combine, input/router/expert-weight gradients | optimizer, master-weight refresh, EP/TP communication |
 | Distributed EP | gather, NCCL dispatch, local expert layer, reverse NCCL dispatch, probability weighting, combine; backward when selected | router logits/top-k, optimizer, master-weight refresh |
 | Public API | `plan.run(...)` on the same plan, tensors, and output as the direct call | construction, JIT, packing, allocation |
@@ -44,14 +46,99 @@ is explicitly marked `dynamic`.
   Training rows use 10 samples after three warmups.
 - Tables report CUDA-event median latency. JSONL also records IQR, p10/p90,
   versions, GPU identity, row counts, FLOPs, TFLOP/s, and peak percentage.
+- Inference JSONL also records active SM clock, P-state, and power during
+  mixed-arm stabilization.
 - The first arm is rerun as a canary. A case is rejected above 5% drift.
 - A run is rejected when wall time divided by the enclosing CUDA-event time
   exceeds 1.5.
 - Fixed random inputs and routing seeds are shared by every arm.
 
-Accuracy checks require a finite full output and compare up to two rows per
-nonempty expert with an FP32 GEMM formed from the same BF16 sources. This is a
-sampled kernel check, not a convergence claim.
+GEMM accuracy checks require a finite full output and compare up to two rows per
+nonempty expert with an FP32 GEMM formed from the same BF16 sources. The
+inference plan additionally has a BF16 reference cosine gate, repeated-run
+bitwise gate, and CUDA Graph replay test. These are operator checks, not a
+convergence claim.
+
+## Inference MoE
+
+`InferenceMoE` uses static calibrated activation scales, persistent workspaces,
+and deterministic combine. FlashInfer 0.6.17 uses its CuTeDSL fused MoE with
+atomic finalize. `FI prequant` starts from an already packed NVFP4 activation;
+native still starts from BF16, so this is the stricter performance baseline.
+`FI BF16` includes FlashInfer input quantization. Values are CUDA-event medians.
+
+This is an operator-plan comparison at EP-shard expert counts. It does not
+establish end-to-end serving performance.
+
+| Model case | T / local E / routing | Native BF16 µs | FI prequant µs | FI BF16 µs | FI prequant / native |
+|---|---:|---:|---:|---:|---:|
+| Qwen3-30B decode | 1 / 16 / balanced | **51.25** | 184.94 | 204.29 | 3.61× |
+| Qwen3-30B decode batch | 8 / 16 / hotspot | **60.99** | 187.39 | 205.26 | 3.07× |
+| DeepSeek-V3.2 decode | 1 / 32 / empty | **91.78** | 191.55 | 212.43 | 2.09× |
+| DeepSeek-V3.2 decode batch | 32 / 32 / balanced | **179.47** | 250.18 | 268.93 | 1.39× |
+| Kimi-K2.7 decode | 1 / 48 / hotspot | **98.61** | 192.19 | 210.82 | 1.95× |
+| Qwen3-30B | 128 / 16 / balanced | **191.70** | 623.94 | 687.71 | 3.25× |
+| Qwen3-30B | 8,192 / 16 / balanced | **360.80** | 684.38 | 778.96 | 1.90× |
+| Qwen3-235B | 2,048 / 16 / hotspot | **307.20** | 670.42 | 745.54 | 2.18× |
+| DeepSeek-V3.2 | 2,048 / 32 / balanced | **522.06** | 930.46 | 1,009.49 | 1.78× |
+| Kimi-K2.7 | 2,048 / 48 / hotspot | **633.39** | 841.10 | 870.61 | 1.33× |
+| MiniMax-M2 | 2,048 / 32 / one empty expert | **303.97** | 647.39 | 749.50 | 2.13× |
+| Llama 4 Scout | 2,048 / 2 / balanced | **261.34** | 647.90 | 718.18 | 2.48× |
+
+Every row interleaves the three arms in one B200 session. The main model rows
+use 20 samples after three warmups and 1,000 ms mixed-arm stabilization. Decode
+uses 30 samples under the same setup. Large Kimi uses 30 samples after 10
+warmups and 15,000 ms stabilization. Maximum accepted pre/post native canary
+drift was 4.66%, and the maximum wall/event ratio was 1.29. Compilation, packing,
+calibration, and output allocation are outside timing for every arm.
+The decode session measured P0 at 1,965 MHz during stabilization; the
+power-limited DeepSeek T32 case measured 1,642 MHz at 1,019 W.
+
+Balanced routing assigns routes round-robin with counts differing by at most
+one. Hotspot routing selects expert 0 for every token and cycles the remaining
+routes over other experts. Empty routing never selects the last expert.
+
+Gemma 4 is not in this table because FlashInfer 0.6.17 rejects GeGLU in its
+SM100 CuTeDSL fused MoE API. No SwiGLU timing is reported under the Gemma label.
+
+### TRT-LLM generated decode baseline
+
+This comparison uses FlashInfer's TRT-LLM generated NVFP4 routed-MoE kernel.
+Both BF16 arms include dispatch, activation quantization, two expert
+projections, SwiGLU, weighting, and combine. `TRT prequant` starts after input
+quantization and routing metadata packing, so it has a narrower timed boundary.
+
+| Model case | T / local E | Native BF16 µs | TRT BF16 µs | TRT prequant µs |
+|---|---:|---:|---:|---:|
+| DeepSeek-V3.2 | 1 / 32 | **28.757** | 43.039 | 21.776 |
+| DeepSeek-V3.2 | 8 / 32 | **86.319** | 127.638 | 125.548 |
+| DeepSeek-V3.2 | 32 / 32 | **130.431** | 132.395 | 129.647 |
+
+The wide decode matrix uses `H=7,168`, `I=2,048`, 48 local experts, and
+top-k 8. Balanced routing spreads routes evenly; hotspot routing sends one
+route to every local expert before filling expert 0.
+
+| Routing | T | Native BF16 µs | TRT BF16 µs | TRT / native |
+|---|---:|---:|---:|---:|
+| balanced | 1 | **28.756** | 43.087 | 1.50x |
+| balanced | 8 | **120.280** | 180.813 | 1.50x |
+| balanced | 16 | **121.210** | 182.582 | 1.51x |
+| balanced | 32 | **123.064** | 186.443 | 1.52x |
+| balanced | 64 | **128.840** | 194.940 | 1.51x |
+| hotspot | 1 | **28.757** | 43.105 | 1.50x |
+| hotspot | 8 | **28.752** | 45.357 | 1.58x |
+| hotspot | 16 | **28.766** | 51.762 | 1.80x |
+| hotspot | 32 | **41.039** | 54.152 | 1.32x |
+| hotspot | 64 | **45.127** | 58.832 | 1.30x |
+
+The arms were captured in CUDA Graphs and interleaved in one B200 session.
+Each of 21 samples enclosed 100 replays. Maximum native canary drift was 0.068%, and
+the maximum wall/event ratio was 1.007. The native and `TRT BF16` columns have
+the same input and output boundary; `TRT prequant` is shown only as a kernel
+pipeline reference. At T=64, native also measured 128.840 µs versus 190.785 µs
+for TRT prequant on balanced routing, and 45.127 µs versus 52.362 µs on hotspot
+routing. Each row is a same-session comparison; results are not divided across
+GPU sessions.
 
 ## Public API overhead
 

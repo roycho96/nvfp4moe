@@ -333,11 +333,12 @@ class NVFP4QuantKernel:
             lo = Int32(0)
             hi = Int32(E)
             for _ in cutlass.range_constexpr(E.bit_length()):
-                mid = (lo + hi) // 2
-                if (mid < E) and (p < mTileEnds[mid] // 128):
-                    hi = mid
-                else:
-                    lo = mid + 1
+                if lo < hi:
+                    mid = (lo + hi) // 2
+                    if p < mTileEnds[mid] // 128:
+                        hi = mid
+                    else:
+                        lo = mid + 1
             if lo < E:
                 e_found = lo
                 prev_tiles = Int32(0)

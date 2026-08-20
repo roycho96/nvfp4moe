@@ -3,6 +3,7 @@
 import torch
 from torch import nn
 
+from ._packing import quantize_expert_stack
 from .kernels.epilogue import GatedBackwardEpilogue, GatedEpilogue
 from .kernels.finalize import moe_finalize, moe_finalize_bwd
 from .kernels.gemm import GroupedNvfp4Gemm
@@ -14,31 +15,6 @@ from .kernels.quantize import (
 )
 from .kernels.wgrad import GroupedWgrad
 from .recipe import _DEN, TensorScale
-
-
-def _quant_expert_stack(mats, pts):
-    qs, ss = [], []
-    pts = pts.detach().to(dtype=torch.float32).reshape(1)
-    pts_pair = torch.cat([pts, 1.0 / pts])
-    for m in mats:
-        rows, features = m.shape
-        q = torch.empty(rows, features // 2, dtype=torch.uint8, device=m.device)
-        rm = -(-rows // 128)
-        sf_buf = torch.empty(
-            rm + 1,
-            features // 64,
-            32,
-            4,
-            4,
-            dtype=torch.float8_e4m3fn,
-            device=m.device,
-        )
-        cu = torch.tensor([0, rows], dtype=torch.int32, device=m.device)
-        nvfp4_quantize_rowwise(m.contiguous(), cu, pts_pair, q, sf_buf)
-        qs.append(q)
-        ss.append(sf_buf[:rm])
-    return torch.stack(qs).view(torch.float4_e2m1fn_x2), torch.stack(ss)
-
 
 _GKW = {"tile_M": 128, "tile_N": 256, "cluster_M": 1, "cluster_N": 1, "max_swizzle_size": 1}
 # Tuned fine-grained configs for FC2 and input-gradient GEMMs.
@@ -686,7 +662,7 @@ class MoEExpertLayer(nn.Module):
         ):
             amax = torch.stack([m.abs().amax() for m in mats]).amax()
             pts = (amax.float() / _DEN).clamp(min=1e-30).reshape(1).to(dev)
-            q, s = _quant_expert_stack(mats, pts)
+            q, s = quantize_expert_stack(mats, pts)
             setattr(self, {"w1": "qb1", "w2": "qb2", "w2d": "qW2d", "w1t": "qW1T"}[nm], q)
             setattr(self, {"w1": "sfb1", "w2": "sfb2", "w2d": "sW2d", "w1t": "sW1T"}[nm], s)
             setattr(self, {"w1": "p_w1", "w2": "p_w2", "w2d": "p_w2d", "w1t": "p_w1t"}[nm], pts)

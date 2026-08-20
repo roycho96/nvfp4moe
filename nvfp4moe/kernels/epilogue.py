@@ -96,6 +96,24 @@ def gated_postact_shape(accumulator_layout: cute.Layout):
 
 
 @cute.jit
+def gated_postact_value(
+    gate: Float32,
+    up: Float32,
+    activation: cutlass.Constexpr[str],
+) -> Float32:
+    validate_gated_activation(activation)
+    if const_expr(activation == "swiglu"):
+        sigmoid = cute.arch.rcp_approx(Float32(1.0) + cute.math.exp(-gate, fastmath=True))
+        return gate * sigmoid * up
+    if const_expr(activation == "geglu"):
+        root = math.sqrt(2.0 / math.pi)
+        argument = root * (gate + Float32(0.044715) * gate * gate * gate)
+        gelu = Float32(0.5) * gate * (Float32(1.0) + cute.math.tanh(argument, fastmath=True))
+        return gelu * up
+    return cute.arch.fmax(gate, Float32(0.0)) * up
+
+
+@cute.jit
 def gated_postact_fragment(
     accumulator: cute.Tensor,
     alpha: Float32,
@@ -116,16 +134,7 @@ def gated_postact_fragment(
     for index in cutlass.range_constexpr(count):
         gate = values[index * 2] * alpha
         up = values[index * 2 + 1] * alpha
-        if const_expr(activation == "swiglu"):
-            sigmoid = cute.arch.rcp_approx(Float32(1.0) + cute.math.exp(-gate, fastmath=True))
-            output[index] = gate * sigmoid * up
-        elif const_expr(activation == "geglu"):
-            root = math.sqrt(2.0 / math.pi)
-            argument = root * (gate + Float32(0.044715) * gate * gate * gate)
-            gelu = Float32(0.5) * gate * (Float32(1.0) + cute.math.tanh(argument, fastmath=True))
-            output[index] = gelu * up
-        else:
-            output[index] = cute.arch.fmax(gate, Float32(0.0)) * up
+        output[index] = gated_postact_value(gate, up, activation)
     return output
 
 
@@ -249,6 +258,7 @@ __all__ = [
     "gated_output_n",
     "gated_postact_fragment",
     "gated_postact_shape",
+    "gated_postact_value",
     "gated_sf_u32_word_count",
     "quantize_postact_fragment",
     "resolve_gemm_epilogue",

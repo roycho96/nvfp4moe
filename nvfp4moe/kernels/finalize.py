@@ -30,6 +30,9 @@ class MoEFinalizeKernel:
         num_threads: int = 256,
         n_frag: int = 1,
         weighted: bool = False,
+        use_pdl: bool = False,
+        direct: bool = False,
+        broadcast_slots: bool = False,
     ):
         self.dtype = dtype
         self.topk = topk
@@ -45,6 +48,9 @@ class MoEFinalizeKernel:
         assert n_frag in (1, 2)
         self.n_frag = n_frag
         self.weighted = weighted
+        self.use_pdl = use_pdl
+        self.direct = direct
+        self.broadcast_slots = broadcast_slots
 
     @cute.jit
     def __call__(
@@ -60,10 +66,13 @@ class MoEFinalizeKernel:
             grid=[cute.ceil_div(T, self.tile_t), cute.ceil_div(d, self.cols_per_cta), 1],
             block=[self.num_threads, 1, 1],
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
     def kernel(self, mYw: cute.Tensor, mSlots: cute.Tensor, mOut: cute.Tensor, mWeights):
+        if const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
         bx, by, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         T, d = mOut.shape[0], mOut.shape[1]
@@ -82,10 +91,39 @@ class MoEFinalizeKernel:
                     acc.fill(0.0)
                     # Two fragments overlap gathers without the register cost
                     # of keeping one fragment per top-k contribution.
-                    if const_expr(self.n_frag == 1):
+                    if const_expr(self.direct):
+                        frags = [
+                            cute.make_rmem_tensor(lay_vec, self.dtype) for _ in range(self.n_frag)
+                        ]
+                        src = cute.make_tensor(
+                            mYw.iterator + cute.assume(col0, divby=self.vec),
+                            lay_vec,
+                        )
+                        cute.copy(atom, src, frags[0])
+                        for j in cutlass.range_constexpr(self.topk):
+                            if j + 1 < self.topk:
+                                next_src = cute.make_tensor(
+                                    mYw.iterator
+                                    + cute.assume((j + 1) * yw_stride + col0, divby=self.vec),
+                                    lay_vec,
+                                )
+                                cute.copy(atom, next_src, frags[(j + 1) % self.n_frag])
+                            value = frags[j % self.n_frag].load().to(Float32)
+                            weight = Float32(0.0)
+                            if lane == 0:
+                                weight = Float32(mWeights[j])
+                            weight = cute.arch.shuffle_sync(weight, offset=0)
+                            acc.store(acc.load() + value * weight)
+                    elif const_expr(self.n_frag == 1):
                         frag = cute.make_rmem_tensor(lay_vec, self.dtype)
                         for j in cutlass.range_constexpr(self.topk):
-                            s = mSlots[t * self.topk + j]
+                            if const_expr(self.broadcast_slots):
+                                s = Int32(0)
+                                if lane == 0:
+                                    s = mSlots[t * self.topk + j]
+                                s = cute.arch.shuffle_sync(s, offset=0)
+                            else:
+                                s = mSlots[t * self.topk + j]
                             if s >= 0:  # uniform across CTA: no divergence
                                 # row strides are multiples of vec (host
                                 # assert): 128-bit alignment is provable
@@ -106,34 +144,41 @@ class MoEFinalizeKernel:
                     else:
                         sl = cute.make_rmem_tensor(cute.make_layout(self.topk), Int32)
                         for j in cutlass.range_constexpr(self.topk):
-                            sl[j] = mSlots[t * self.topk + j]
+                            if const_expr(self.broadcast_slots):
+                                slot = Int32(0)
+                                if lane == 0:
+                                    slot = mSlots[t * self.topk + j]
+                                sl[j] = cute.arch.shuffle_sync(slot, offset=0)
+                            else:
+                                sl[j] = mSlots[t * self.topk + j]
                         frags = [
                             cute.make_rmem_tensor(lay_vec, self.dtype) for _ in range(self.n_frag)
                         ]
-                        if sl[0] >= 0:
-                            srcd = cute.make_tensor(
-                                mYw.iterator
-                                + cute.assume(sl[0] * yw_stride + col0, divby=self.vec),
-                                lay_vec,
-                            )
-                            cute.copy(atom, srcd, frags[0])
+                        first_slot = cutlass.max(sl[0], Int32(0))
+                        srcd = cute.make_tensor(
+                            mYw.iterator
+                            + cute.assume(first_slot * yw_stride + col0, divby=self.vec),
+                            lay_vec,
+                        )
+                        cute.copy(atom, srcd, frags[0])
                         for j in cutlass.range_constexpr(self.topk):
-                            if j + 1 < self.topk:  # noqa: SIM102
-                                if sl[j + 1] >= 0:
-                                    srce = cute.make_tensor(
-                                        mYw.iterator
-                                        + cute.assume(sl[j + 1] * yw_stride + col0, divby=self.vec),
-                                        lay_vec,
-                                    )
-                                    cute.copy(atom, srce, frags[(j + 1) % self.n_frag])
+                            if j + 1 < self.topk:
+                                next_slot = cutlass.max(sl[j + 1], Int32(0))
+                                srce = cute.make_tensor(
+                                    mYw.iterator
+                                    + cute.assume(next_slot * yw_stride + col0, divby=self.vec),
+                                    lay_vec,
+                                )
+                                cute.copy(atom, srce, frags[(j + 1) % self.n_frag])
+                            value = frags[j % self.n_frag].load().to(Float32)
+                            if const_expr(self.weighted):
+                                safe_slot = cutlass.max(sl[j], Int32(0))
+                                weight = Float32(0.0)
+                                if lane == 0:
+                                    weight = Float32(mWeights[safe_slot])
+                                weight = cute.arch.shuffle_sync(weight, offset=0)
+                                value = value * weight
                             if sl[j] >= 0:
-                                value = frags[j % self.n_frag].load().to(Float32)
-                                if const_expr(self.weighted):
-                                    weight = Float32(0.0)
-                                    if lane == 0:
-                                        weight = Float32(mWeights[sl[j]])
-                                    weight = cute.arch.shuffle_sync(weight, offset=0)
-                                    value = value * weight
                                 acc.store(acc.load() + value)
                     out_frag = cute.make_rmem_tensor(lay_vec, self.dtype)
                     out_frag.store(acc.load().to(self.dtype))
@@ -145,11 +190,21 @@ class MoEFinalizeKernel:
 
     @staticmethod
     @jit_cache
-    def compile(dtype, topk, tile_t, num_threads, n_frag=1, weighted=False):
+    def compile(
+        dtype,
+        topk,
+        tile_t,
+        num_threads,
+        n_frag=1,
+        weighted=False,
+        use_pdl=False,
+        direct=False,
+        broadcast_slots=False,
+    ):
         m_sym, t_sym, d_sym, tk_sym = (cute.sym_int() for _ in range(4))
         vec = 128 // dtype.width
         yw = fake_tensor(dtype, (m_sym, d_sym), vec)
-        slots = fake_tensor(Int32, (tk_sym,), 1)
+        slots = None if direct else fake_tensor(Int32, (tk_sym,), 1)
         out = fake_tensor(dtype, (t_sym, d_sym), vec)
         weights = fake_tensor(Float32, (m_sym,), 1) if weighted else None
         return cute.compile(
@@ -160,6 +215,9 @@ class MoEFinalizeKernel:
                 num_threads=num_threads,
                 n_frag=n_frag,
                 weighted=weighted,
+                use_pdl=use_pdl,
+                direct=direct,
+                broadcast_slots=broadcast_slots,
             ),
             yw,
             slots,
@@ -178,6 +236,10 @@ def moe_finalize(
     tile_t: int = 8,
     n_frag: int = 1,
     weights: Tensor | None = None,
+    use_pdl: bool = False,
+    direct: bool = False,
+    num_threads: int = 256,
+    broadcast_slots: bool = False,
 ) -> None:
     """out[t] = sum over this token's (non-negative) slots of yw rows.
 
@@ -188,19 +250,35 @@ def moe_finalize(
     per-token fp32 add order never changes).
     """
     assert yw.stride(-1) == 1 and out.stride(-1) == 1
-    assert slots.dtype == torch.int32 and slots.numel() == out.shape[0] * topk
+    if direct:
+        assert out.shape[0] == 1 and yw.shape[0] == topk
+        assert weights is not None and n_frag == 2
+        slots_arg = None
+    else:
+        assert slots.dtype == torch.int32 and slots.numel() == out.shape[0] * topk
+        slots_arg = slots
     if weights is not None:
         assert weights.dtype == torch.float32 and weights.numel() == yw.shape[0]
         assert weights.is_contiguous()
     dtype = torch2cute_dtype_map[yw.dtype]
+    if num_threads not in (128, 256, 512, 768):
+        raise ValueError("num_threads must be 128, 256, 512, or 768")
     vec = 128 // dtype.width
     assert out.shape[1] % vec == 0, f"d must be a multiple of {vec}"
     assert yw.stride(0) % vec == 0 and out.stride(0) % vec == 0, (
         "row strides must keep 128-bit vector alignment"
     )
-    MoEFinalizeKernel.compile(dtype, topk, tile_t, 256, n_frag, weights is not None)(
-        yw, slots, out, weights
-    )
+    MoEFinalizeKernel.compile(
+        dtype,
+        topk,
+        tile_t,
+        num_threads,
+        n_frag,
+        weights is not None,
+        use_pdl,
+        direct,
+        broadcast_slots,
+    )(yw, slots_arg, out, weights)
 
 
 class MoEFinalizeBwdKernel:

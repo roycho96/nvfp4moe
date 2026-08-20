@@ -1,14 +1,16 @@
-"""Training-capable NVFP4 MoE expert kernels for NVIDIA B200."""
+"""NVFP4 GEMM and MoE inference/training kernels for NVIDIA B200."""
 
 from importlib import import_module
 
 __all__ = [
+    "InferenceMoE",
     "MoEDispatch",
     "MoEExpertLayer",
 ]
 __version__ = "0.1.0"
 
 _EXPORTS = {
+    "InferenceMoE": (".inference", "InferenceMoE"),
     "MoEDispatch": (".kernels.dispatch", "MoEDispatch"),
     "MoEExpertLayer": (".layer", "MoEExpertLayer"),
 }
