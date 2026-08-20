@@ -25,6 +25,7 @@ backend's name.
 | Prepacked GEMM | one GEMM call writing the stated output contract | input creation, compilation, autotuning, NVFP4 packing |
 | Dynamic GEMM | BF16 activation quantization and GEMM | compilation, weight packing |
 | Inference MoE | dispatch, BF16 input quantization, FC1 + gated activation + requantization, FC2, probability weighting, combine | routing logits/top-k, calibration, compilation, weight packing |
+| Full-model serving | one warmed `LLM.generate` call, including scheduling, TP collectives, attention, MoE, and sampling | checkpoint load, JIT, dataset loading, tokenization |
 | Full MoE training | dispatch, FC1, activation, FC2, probability weighting, combine, input/router/expert-weight gradients | optimizer, master-weight refresh, EP/TP communication |
 | Distributed EP | gather, NCCL dispatch, local expert layer, reverse NCCL dispatch, probability weighting, combine; backward when selected | router logits/top-k, optimizer, master-weight refresh |
 | Public API | `plan.run(...)` on the same plan, tensors, and output as the direct call | construction, JIT, packing, allocation |
@@ -58,6 +59,32 @@ nonempty expert with an FP32 GEMM formed from the same BF16 sources. The
 inference plan additionally has a BF16 reference cosine gate, repeated-run
 bitwise gate, and CUDA Graph replay test. These are operator checks, not a
 convergence claim.
+
+## Full-model vLLM serving
+
+The full `nvidia/DeepSeek-V4-Flash-NVFP4` checkpoint was served with vLLM
+0.27.1 on eight B200s using TP8 and an FP8 KV cache. It has 284B total and 13B
+active parameters, with 256 experts, top-6 routing, and a bounded SwiGLU. The
+native arm replaces only the NVFP4 MoE backend; vLLM scheduling, attention,
+collectives, and all other model operators are unchanged. The comparison arm
+is FlashInfer 0.6.16.post3's TRT-LLM generated NVFP4 MoE backend.
+
+Prompts come from SWE-bench Verified revision
+`78f471bf655a3137b2e8a75af1501690ec009ec3`. Each arm used 21 measured runs
+after a stable warmup, in native → FlashInfer → native canary order.
+
+| Workload | Fixed batch | Native A p50 [IQR] | FlashInfer p50 [IQR] | Native canary p50 [IQR] | FlashInfer / native |
+|---|---:|---:|---:|---:|---:|
+| Prefill | 8 × 1,024 input → 1 output | 221.670 [2.869] ms | 250.464 [4.300] ms | 226.927 [1.803] ms | 1.10–1.13× |
+| Decode | 32 × 256 input → 256 output | 2.5014 [0.0053] s | 2.6079 [0.1274] s | 2.4960 [0.0029] s | 1.043–1.045× |
+
+Decode produced 8,192 tokens per run. Native delivered 3,275 and 3,282
+tokens/s in the two arms versus 3,141 tokens/s for FlashInfer; median TPOT was
+8.898 and 8.894 ms versus 9.266 ms. Prefill canary drift was 2.37% and decode
+canary drift was 0.22%. The largest relative IQR was 1.72% for prefill and
+4.88% for decode. Every timed sample recorded a 1,965 MHz SM clock. Decode used
+one fixed token trajectory and produced identical input and output hashes in
+all three arms. Prefill generated one greedy token that was never fed back.
 
 ## Inference MoE
 
