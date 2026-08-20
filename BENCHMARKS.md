@@ -93,6 +93,8 @@ and deterministic combine. FlashInfer 0.6.17 uses its CuTeDSL fused MoE with
 atomic finalize. `FI prequant` starts from an already packed NVFP4 activation;
 native still starts from BF16, so this is the stricter performance baseline.
 `FI BF16` includes FlashInfer input quantization. Values are CUDA-event medians.
+`T` is the input-token count for one MoE call; the expert GEMMs receive
+`T * top-k` routed rows.
 
 This is an operator-plan comparison at EP-shard expert counts. It does not
 establish end-to-end serving performance.
