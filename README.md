@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://www.python.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-13-76B900.svg)](https://developer.nvidia.com/cuda-toolkit)
 ![GPU](https://img.shields.io/badge/GPU-Blackwell%20SM100-76B900.svg)
-[![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://github.com/roycho96/lightmoe/blob/main/LICENSE)
 
 LightMoE provides standalone dense and grouped GEMM, a reusable-workspace MoE
 inference layer, and deterministic training kernels for dispatch, combine,
@@ -20,11 +20,11 @@ input gradients, weight gradients, and router gradients.
 | `lightmoe.MoEExpertLayer` | Expert training layer |
 
 Exact timing boundaries, model shapes, and measured results are documented in
-[BENCHMARKS.md](BENCHMARKS.md).
+[BENCHMARKS.md](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md).
 
 ## 📈 Performance
 
-[![LightMoE performance on NVIDIA B200](assets/performance.svg)](BENCHMARKS.md)
+[![LightMoE performance on NVIDIA B200](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/performance.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md)
 
 ## ⚡ Highlights
 
@@ -50,8 +50,7 @@ Exact timing boundaries, model shapes, and measured results are documented in
 The reference environment is `nvcr.io/nvidia/pytorch:26.07-py3`.
 
 ```bash
-python -m pip install .
-python -m pip install '.[test]'
+python -m pip install lightmoe
 ```
 
 The first call compiles the selected kernel geometry. Keep construction,
@@ -211,17 +210,23 @@ not exported from the package root.
 
 ## 📊 Benchmarks
 
+From a source checkout:
+
 ```bash
 python -m benchmarks.nvfp4_gemm --list --suite full
 python -m benchmarks.moe --list --suite full
 ```
 
 Comparison backends are used only when their packages are already installed.
-See [BENCHMARKS.md](BENCHMARKS.md) for measurement rules and results.
+See [BENCHMARKS.md](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md)
+for measurement rules and results.
 
 ## 🧪 Development
 
 ```bash
+git clone https://github.com/roycho96/lightmoe.git
+cd lightmoe
+python -m pip install -e '.[test]'
 ruff check lightmoe benchmarks tests
 ruff format --check lightmoe benchmarks tests
 python -m pytest -q
@@ -230,4 +235,5 @@ python -m pytest -q
 ## 📄 License
 
 LightMoE is Apache-2.0 licensed. A small set of kernel source files retains
-upstream BSD-3-Clause or Apache-2.0 notices; see [NOTICE](NOTICE).
+upstream BSD-3-Clause or Apache-2.0 notices; see
+[NOTICE](https://github.com/roycho96/lightmoe/blob/main/NOTICE).
