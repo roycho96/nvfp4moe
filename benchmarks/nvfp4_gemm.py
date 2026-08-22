@@ -1485,9 +1485,14 @@ def _case_dict(case: GemmCase) -> dict[str, object]:
 def listing_payload(args: argparse.Namespace) -> dict[str, object]:
     models = parse_models(args.models)
     tokens = parse_ints(args.tokens, args.suite)
+    routing_selection = (
+        (QUICK_ROUTINGS if args.suite == "quick" else FULL_ROUTINGS)
+        if args.routing == "all"
+        else args.routing
+    )
     routings = parse_names(
-        args.routing,
-        QUICK_ROUTINGS if args.suite == "quick" else FULL_ROUTINGS,
+        routing_selection,
+        FULL_ROUTINGS,
         "routing",
     )
     projections = parse_names(args.projections, ("gate_up", "down"), "projection")

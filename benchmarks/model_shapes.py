@@ -16,6 +16,7 @@ class ModelShape:
     key: str
     name: str
     model_id: str
+    revision: str
     hidden: int
     intermediate: int
     experts: int
@@ -23,6 +24,8 @@ class ModelShape:
     ep_sizes: tuple[int, ...]
     quick_ep: int
     activation: str = "swiglu"
+    layer_supported: bool = True
+    layer_exclusion: str = ""
 
     def __post_init__(self):
         if self.experts % self.quick_ep:
@@ -52,82 +55,100 @@ MODEL_SHAPES = {
     spec.key: spec
     for spec in (
         ModelShape(
-            "qwen3_30b_a3b",
-            "Qwen3-30B-A3B",
-            "Qwen/Qwen3-30B-A3B",
+            "qwen3_5_35b_a3b",
+            "Qwen3.5-35B-A3B",
+            "Qwen/Qwen3.5-35B-A3B-FP8",
+            "9d1823d2dee688a6b25e77009dc727688c44936e",
             2048,
-            768,
-            128,
+            512,
+            256,
             8,
-            (1, 8, 16, 32),
+            (1, 8, 16, 32, 64),
             16,
         ),
         ModelShape(
-            "qwen3_235b_a22b",
-            "Qwen3-235B-A22B",
-            "Qwen/Qwen3-235B-A22B",
+            "qwen3_5_397b_a17b",
+            "Qwen3.5-397B-A17B",
+            "Qwen/Qwen3.5-397B-A17B-FP8",
+            "ea5b4f81096f3901c91dea97f81324302495781d",
             4096,
-            1536,
-            128,
-            8,
-            (1, 8, 16, 32),
-            16,
-        ),
-        ModelShape(
-            "gemma4_26b_a4b",
-            "Gemma 4 26B A4B",
-            "google/gemma-4-26B-A4B",
-            2816,
-            704,
-            128,
-            8,
-            (1, 8, 16, 32),
-            16,
-            "geglu",
-        ),
-        ModelShape(
-            "deepseek_v3_2",
-            "DeepSeek-V3.2",
-            "deepseek-ai/DeepSeek-V3.2",
-            7168,
-            2048,
-            256,
-            8,
-            (4, 8, 32, 64),
+            1024,
+            512,
+            10,
+            (1, 8, 16, 32, 64),
             32,
         ),
         ModelShape(
-            "kimi_k2_7",
-            "Kimi-K2.7",
-            "moonshotai/Kimi-K2.7-Code",
-            7168,
+            "deepseek_v4_flash",
+            "DeepSeek-V4-Flash",
+            "nvidia/DeepSeek-V4-Flash-NVFP4",
+            "e3cd60e7de98e9867116860d522499a728de1cf9",
+            4096,
             2048,
-            384,
-            8,
-            (3, 24, 48, 96),
-            48,
+            256,
+            6,
+            (4, 8, 32, 64),
+            32,
+            "swiglu",
+            False,
+            "bounded SwiGLU backward is not implemented",
         ),
         ModelShape(
-            "minimax_m2",
-            "MiniMax-M2",
-            "MiniMaxAI/MiniMax-M2",
+            "kimi_k3",
+            "Kimi-K3",
+            "moonshotai/Kimi-K3",
+            "a590ce090cb049c93a33dfe8c208ec652aa20503",
+            3584,
             3072,
-            1536,
-            256,
-            8,
-            (4, 8, 32, 64),
+            896,
+            16,
+            (1, 8, 16, 32, 64, 128),
             32,
+            "situ_glu",
+            False,
+            "latent projections and SiTU-GLU are outside the grouped expert core",
         ),
         ModelShape(
-            "llama4_scout",
-            "Llama 4 Scout",
-            "meta-llama/Llama-4-Scout-17B-16E",
-            5120,
-            8192,
+            "glm_5_2",
+            "GLM-5.2",
+            "zai-org/GLM-5.2",
+            "b4734de4facf877f85769a911abafc5283eab3d9",
+            6144,
+            2048,
+            256,
+            8,
+            (1, 8, 16, 32, 64),
             16,
-            1,
-            (1, 2, 4, 8),
-            2,
+        ),
+        ModelShape(
+            "minimax_m3",
+            "MiniMax-M3",
+            "MiniMaxAI/MiniMax-M3",
+            "f0e1c1e04d40177e4673a22097036854f536e9c0",
+            6144,
+            3072,
+            128,
+            4,
+            (1, 8, 16, 32),
+            16,
+            "swiglu_oai",
+            False,
+            "SwiGLU-OAI is not implemented",
+        ),
+        ModelShape(
+            "nemotron_3_5_30b_a3b",
+            "Nemotron-3.5-Lightning-30B-A3B",
+            "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+            "e8f3c7c4de75ad84fe1bcef95d38eca76214480b",
+            2688,
+            1856,
+            128,
+            6,
+            (1, 8, 16, 32),
+            16,
+            "relu2",
+            False,
+            "ReLU-squared is not implemented",
         ),
     )
 }
@@ -184,16 +205,25 @@ class MoeCase:
         )
 
 
-def parse_models(value: str | Iterable[str]) -> tuple[str, ...]:
+def parse_models(value: str | Iterable[str], layer_only: bool = False) -> tuple[str, ...]:
+    allowed = {key for key, spec in MODEL_SHAPES.items() if not layer_only or spec.layer_supported}
     if isinstance(value, str):
         requested = tuple(item.strip() for item in value.split(",") if item.strip())
     else:
         requested = tuple(value)
     if not requested or requested == ("all",):
-        return tuple(MODEL_SHAPES)
-    unknown = sorted(set(requested) - MODEL_SHAPES.keys())
+        return tuple(key for key in MODEL_SHAPES if key in allowed)
+    excluded = [
+        key
+        for key in requested
+        if key in MODEL_SHAPES and layer_only and not MODEL_SHAPES[key].layer_supported
+    ]
+    if excluded:
+        details = "; ".join(f"{key}: {MODEL_SHAPES[key].layer_exclusion}" for key in excluded)
+        raise ValueError(f"unsupported routed-expert layer model: {details}")
+    unknown = sorted(set(requested) - allowed)
     if unknown:
-        raise ValueError(f"unknown models {unknown}; choose from {sorted(MODEL_SHAPES)}")
+        raise ValueError(f"unsupported models {unknown}; choose from {sorted(allowed)}")
     return requested
 
 
@@ -283,6 +313,8 @@ def generate_moe_cases(
     rows = []
     for key in models:
         spec = MODEL_SHAPES[key]
+        if not spec.layer_supported:
+            raise ValueError(f"{key}: {spec.layer_exclusion}")
         # A trace represents one local EP shard.
         if source == "trace":
             ep_grid = (spec.quick_ep,)

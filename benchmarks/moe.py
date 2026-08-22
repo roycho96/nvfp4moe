@@ -1,8 +1,7 @@
-"""NVFP4 MoE layer benchmark with synthetic routing or captured trace replay.
+"""NVFP4 routed-expert benchmark with synthetic routing or captured trace replay.
 
-The timed layer includes dispatch, expert compute, routing-weight application, and
-combine. Router logits and top-k selection are excluded so every backend receives
-the same assignments.
+The timed boundary includes dispatch, routed expert compute, routing-weight
+application, and combine. Every backend receives the same assignments.
 """
 
 from __future__ import annotations
@@ -882,7 +881,7 @@ def _case_dict(case: MoeCase) -> dict[str, object]:
 
 
 def listing_payload(args: argparse.Namespace) -> dict[str, object]:
-    models = parse_models(args.models)
+    models = parse_models(args.models, layer_only=True)
     if args.source == "trace" and len(models) != 1:
         raise ValueError("trace replay accepts exactly one --models key")
     tokens = (
@@ -897,15 +896,19 @@ def listing_payload(args: argparse.Namespace) -> dict[str, object]:
     )
     cases = generate_moe_cases(models, tokens, args.suite, routings, args.source)
     return {
-        "benchmark": "lightmoe_layer",
+        "benchmark": "routed_expert_layer",
         "suite": args.suite,
         "source": {
             "kind": args.source,
             "trace": str(Path(args.trace).expanduser()) if args.trace else None,
         },
         "boundaries": {
-            "full-layer": ("dispatch, expert compute, routing-weight application, and combine"),
-            "excluded": "router logits and top-k selection",
+            "full-layer": (
+                "dispatch, routed expert compute, routing-weight application, and combine"
+            ),
+            "excluded": (
+                "router logits, top-k selection, shared experts, and model-specific outer projections"
+            ),
         },
         "models": {key: asdict(MODEL_SHAPES[key]) for key in models},
         "backends": {name: asdict(status) for name, status in detect_backends().items()},

@@ -24,7 +24,10 @@ Exact timing boundaries, model shapes, and measured results are documented in
 
 ## 📈 Performance
 
-[![LightMoE performance on NVIDIA B200](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/performance.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md)
+[![LightMoE performance on NVIDIA Blackwell](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/performance.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md)
+
+The current model-derived matrix covers Qwen3.5, DeepSeek V4, Kimi K3,
+GLM-5.2, MiniMax-M3, and Nemotron 3.5 expert shapes.
 
 ## ⚡ Highlights
 

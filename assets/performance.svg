@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
-  <title id="title">LightMoE performance on NVIDIA B200</title>
-  <desc id="desc">Complete MoE inference layer speedup over FlashInfer and complete training forward-backward latency reduction versus Transformer Engine.</desc>
+  <title id="title">LightMoE performance on NVIDIA Blackwell</title>
+  <desc id="desc">Model-derived grouped NVFP4 GEMM speedup over the fastest runnable baseline, routed-expert training latency reduction versus Transformer Engine, and DeepSeek V4 full-model serving speedup.</desc>
   <defs>
     <style>
       text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -8,23 +8,25 @@
       .panel { fill: #ffffff; stroke: #e2e8f0; }
       .band { fill: #eef2ff; }
       .title { fill: #0f172a; font-size: 32px; font-weight: 600; }
-      .subtitle { fill: #64748b; font-size: 15px; font-weight: 400; }
+      .subtitle { fill: #64748b; font-size: 15px; }
       .panel-title { fill: #0f172a; font-size: 20px; font-weight: 600; }
-      .panel-subtitle { fill: #64748b; font-size: 13px; font-weight: 400; }
-      .label { fill: #334155; font-size: 13px; font-weight: 500; }
-      .tick { fill: #64748b; font-size: 12px; font-weight: 400; }
-      .value { fill: #0f172a; font-size: 14px; font-weight: 600; }
+      .panel-subtitle { fill: #64748b; font-size: 13px; }
+      .label { fill: #334155; font-size: 12px; font-weight: 500; }
+      .tick { fill: #64748b; font-size: 11px; }
+      .value { fill: #0f172a; font-size: 12px; font-weight: 600; }
       .grid { stroke: #e2e8f0; stroke-width: 1; }
       .baseline { stroke: #94a3b8; stroke-width: 1.5; }
       .track { fill: #e2e8f0; }
-      .inference-bar { fill: #10b981; }
+      .gemm-bar { fill: #10b981; }
       .training-bar { fill: #6366f1; }
-      .range { stroke: #312e81; stroke-width: 2; }
-      .range-dot { fill: #312e81; }
+      .range { stroke: #0f766e; stroke-width: 2; }
+      .range-dot { fill: #0f766e; }
+      .training-range { stroke: #312e81; stroke-width: 2; }
+      .training-dot { fill: #312e81; }
       .band-title { fill: #312e81; font-size: 14px; font-weight: 600; }
-      .band-label { fill: #64748b; font-size: 12px; font-weight: 400; }
+      .band-label { fill: #64748b; font-size: 12px; }
       .band-value { fill: #312e81; font-size: 16px; font-weight: 600; }
-      .footer { fill: #64748b; font-size: 12px; font-weight: 400; }
+      .footer { fill: #64748b; font-size: 12px; }
       @media (prefers-color-scheme: dark) {
         .background { fill: #0b1220; }
         .panel { fill: #111827; stroke: #273449; }
@@ -35,10 +37,12 @@
         .grid { stroke: #273449; }
         .baseline { stroke: #64748b; }
         .track { fill: #273449; }
-        .inference-bar { fill: #34d399; }
+        .gemm-bar { fill: #34d399; }
         .training-bar { fill: #818cf8; }
-        .range { stroke: #a5b4fc; }
-        .range-dot { fill: #a5b4fc; }
+        .range { stroke: #5eead4; }
+        .range-dot { fill: #5eead4; }
+        .training-range { stroke: #a5b4fc; }
+        .training-dot { fill: #a5b4fc; }
         .band-title, .band-value { fill: #c7d2fe; }
       }
     </style>
@@ -46,100 +50,130 @@
 
   <rect class="background" width="1200" height="720" rx="24"/>
 
-  <text class="title" x="56" y="61">LightMoE performance on NVIDIA B200</text>
-  <text class="subtitle" x="56" y="88">Complete MoE layer measurements · same-session medians</text>
+  <text class="title" x="56" y="61">LightMoE on NVIDIA Blackwell</text>
+  <text class="subtitle" x="56" y="88">Grouped NVFP4 GEMM · routed-expert training · full-model serving</text>
 
-  <rect class="panel" x="40" y="116" width="552" height="458" rx="18"/>
-  <text class="panel-title" x="64" y="154">Inference</text>
-  <text class="panel-subtitle" x="64" y="178">Speedup over FlashInfer CuTe DSL · higher is better</text>
+  <rect class="panel" x="40" y="116" width="650" height="458" rx="18"/>
+  <text class="panel-title" x="64" y="154">Grouped NVFP4 GEMM</text>
+  <text class="panel-subtitle" x="64" y="178">Gate/up and down range vs fastest runnable baseline · higher is better</text>
 
-  <line class="baseline" x1="285" y1="207" x2="285" y2="500"/>
-  <line class="grid" x1="375" y1="207" x2="375" y2="500"/>
-  <line class="grid" x1="465" y1="207" x2="465" y2="500"/>
-  <line class="grid" x1="555" y1="207" x2="555" y2="500"/>
+  <line class="baseline" x1="350" y1="200" x2="350" y2="486"/>
+  <line class="grid" x1="402" y1="200" x2="402" y2="486"/>
+  <line class="grid" x1="454" y1="200" x2="454" y2="486"/>
+  <line class="grid" x1="506" y1="200" x2="506" y2="486"/>
+  <line class="grid" x1="558" y1="200" x2="558" y2="486"/>
+  <line class="grid" x1="610" y1="200" x2="610" y2="486"/>
 
-  <text class="label" x="64" y="250">DeepSeek-V3.2 · decode T=1</text>
-  <rect class="track" x="285" y="235" width="270" height="18" rx="9"/>
-  <rect class="inference-bar" x="285" y="235" width="236" height="18" rx="9"/>
-  <text class="value" x="530" y="250">2.31×</text>
+  <text class="label" x="64" y="229">Qwen3.5-35B-A3B</text>
+  <rect class="track" x="350" y="217" width="260" height="14" rx="7"/>
+  <rect class="gemm-bar" x="350" y="217" width="126" height="14" rx="7"/>
+  <line class="range" x1="352" y1="224" x2="476" y2="224"/>
+  <circle class="range-dot" cx="352" cy="224" r="3"/>
+  <circle class="range-dot" cx="476" cy="224" r="3"/>
+  <text class="value" x="674" y="229" text-anchor="end">1.00–1.24×</text>
 
-  <text class="label" x="64" y="306">Kimi-K2.7 · decode T=1</text>
-  <rect class="track" x="285" y="291" width="270" height="18" rx="9"/>
-  <rect class="inference-bar" x="285" y="291" width="205" height="18" rx="9"/>
-  <text class="value" x="499" y="306">2.14×</text>
+  <text class="label" x="64" y="269">Qwen3.5-397B-A17B</text>
+  <rect class="track" x="350" y="257" width="260" height="14" rx="7"/>
+  <rect class="gemm-bar" x="350" y="257" width="83" height="14" rx="7"/>
+  <line class="range" x1="431" y1="264" x2="433" y2="264"/>
+  <circle class="range-dot" cx="431" cy="264" r="3"/>
+  <circle class="range-dot" cx="433" cy="264" r="3"/>
+  <text class="value" x="674" y="269" text-anchor="end">1.16×</text>
 
-  <text class="label" x="64" y="362">DeepSeek-V3.2 · prefill T=2,048</text>
-  <rect class="track" x="285" y="347" width="270" height="18" rx="9"/>
-  <rect class="inference-bar" x="285" y="347" width="167" height="18" rx="9"/>
-  <text class="value" x="461" y="362">1.93×</text>
+  <text class="label" x="64" y="309">DeepSeek-V4-Flash</text>
+  <rect class="track" x="350" y="297" width="260" height="14" rx="7"/>
+  <rect class="gemm-bar" x="350" y="297" width="81" height="14" rx="7"/>
+  <line class="range" x1="407" y1="304" x2="431" y2="304"/>
+  <circle class="range-dot" cx="407" cy="304" r="3"/>
+  <circle class="range-dot" cx="431" cy="304" r="3"/>
+  <text class="value" x="674" y="309" text-anchor="end">1.11–1.16×</text>
 
-  <text class="label" x="64" y="418">DeepSeek-V3.2 · decode T=32</text>
-  <rect class="track" x="285" y="403" width="270" height="18" rx="9"/>
-  <rect class="inference-bar" x="285" y="403" width="90" height="18" rx="9"/>
-  <text class="value" x="384" y="418">1.50×</text>
+  <text class="label" x="64" y="349">Kimi-K3</text>
+  <rect class="track" x="350" y="337" width="260" height="14" rx="7"/>
+  <rect class="gemm-bar" x="350" y="337" width="256" height="14" rx="7"/>
+  <line class="range" x1="551" y1="344" x2="606" y2="344"/>
+  <circle class="range-dot" cx="551" cy="344" r="3"/>
+  <circle class="range-dot" cx="606" cy="344" r="3"/>
+  <text class="value" x="674" y="349" text-anchor="end">1.39–1.49×</text>
 
-  <text class="label" x="64" y="474">Kimi-K2.7 · prefill T=2,048</text>
-  <rect class="track" x="285" y="459" width="270" height="18" rx="9"/>
-  <rect class="inference-bar" x="285" y="459" width="67" height="18" rx="9"/>
-  <text class="value" x="361" y="474">1.37×</text>
+  <text class="label" x="64" y="389">GLM-5.2</text>
+  <rect class="track" x="350" y="377" width="260" height="14" rx="7"/>
+  <rect class="gemm-bar" x="350" y="377" width="53" height="14" rx="7"/>
+  <line class="range" x1="389" y1="384" x2="403" y2="384"/>
+  <circle class="range-dot" cx="389" cy="384" r="3"/>
+  <circle class="range-dot" cx="403" cy="384" r="3"/>
+  <text class="value" x="674" y="389" text-anchor="end">1.08–1.10×</text>
 
-  <text class="tick" x="285" y="526" text-anchor="middle">1.0×</text>
-  <text class="tick" x="375" y="526" text-anchor="middle">1.5×</text>
-  <text class="tick" x="465" y="526" text-anchor="middle">2.0×</text>
-  <text class="tick" x="555" y="526" text-anchor="middle">2.5×</text>
-  <text class="panel-subtitle" x="285" y="551">FlashInfer baseline</text>
+  <text class="label" x="64" y="429">MiniMax-M3</text>
+  <rect class="track" x="350" y="417" width="260" height="14" rx="7"/>
+  <rect class="gemm-bar" x="350" y="417" width="54" height="14" rx="7"/>
+  <line class="range" x1="397" y1="424" x2="404" y2="424"/>
+  <circle class="range-dot" cx="397" cy="424" r="3"/>
+  <circle class="range-dot" cx="404" cy="424" r="3"/>
+  <text class="value" x="674" y="429" text-anchor="end">1.09–1.10×</text>
 
-  <rect class="panel" x="608" y="116" width="552" height="458" rx="18"/>
-  <text class="panel-title" x="632" y="154">Training</text>
-  <text class="panel-subtitle" x="632" y="178">Fwd+bwd latency reduction vs Transformer Engine NVFP4</text>
+  <text class="label" x="64" y="469">Nemotron-3.5 30B-A3B</text>
+  <rect class="track" x="350" y="457" width="260" height="14" rx="7"/>
+  <rect class="gemm-bar" x="350" y="457" width="79" height="14" rx="7"/>
+  <line class="range" x1="354" y1="464" x2="429" y2="464"/>
+  <circle class="range-dot" cx="354" cy="464" r="3"/>
+  <circle class="range-dot" cx="429" cy="464" r="3"/>
+  <text class="value" x="674" y="469" text-anchor="end">1.01–1.15×</text>
 
-  <line class="baseline" x1="770" y1="207" x2="770" y2="500"/>
-  <line class="grid" x1="845" y1="207" x2="845" y2="500"/>
-  <line class="grid" x1="920" y1="207" x2="920" y2="500"/>
-  <line class="grid" x1="995" y1="207" x2="995" y2="500"/>
-  <line class="grid" x1="1070" y1="207" x2="1070" y2="500"/>
+  <text class="tick" x="350" y="508" text-anchor="middle">1.0×</text>
+  <text class="tick" x="402" y="508" text-anchor="middle">1.1×</text>
+  <text class="tick" x="454" y="508" text-anchor="middle">1.2×</text>
+  <text class="tick" x="506" y="508" text-anchor="middle">1.3×</text>
+  <text class="tick" x="558" y="508" text-anchor="middle">1.4×</text>
+  <text class="tick" x="610" y="508" text-anchor="middle">1.5×</text>
+  <text class="panel-subtitle" x="64" y="545">8,192 tokens per EP rank · balanced routing</text>
 
-  <text class="label" x="632" y="250">Qwen3-30B</text>
-  <rect class="track" x="770" y="235" width="300" height="18" rx="9"/>
-  <rect class="training-bar" x="770" y="235" width="270" height="18" rx="9"/>
-  <line class="range" x1="1034" y1="244" x2="1045" y2="244"/>
-  <circle class="range-dot" cx="1034" cy="244" r="3"/>
-  <circle class="range-dot" cx="1045" cy="244" r="3"/>
-  <text class="value" x="1052" y="250">35–37%</text>
+  <rect class="panel" x="710" y="116" width="450" height="458" rx="18"/>
+  <text class="panel-title" x="734" y="154">Routed-expert training</text>
+  <text class="panel-subtitle" x="734" y="178">Fwd+bwd latency reduction vs Transformer Engine NVFP4</text>
 
-  <text class="label" x="632" y="320">MiniMax-M2</text>
-  <rect class="track" x="770" y="305" width="300" height="18" rx="9"/>
-  <rect class="training-bar" x="770" y="305" width="265" height="18" rx="9"/>
-  <text class="value" x="1043" y="320">35.3%</text>
+  <line class="baseline" x1="860" y1="207" x2="860" y2="460"/>
+  <line class="grid" x1="931" y1="207" x2="931" y2="460"/>
+  <line class="grid" x1="1003" y1="207" x2="1003" y2="460"/>
+  <line class="grid" x1="1074" y1="207" x2="1074" y2="460"/>
 
-  <text class="label" x="632" y="390">DeepSeek-V3.2</text>
-  <rect class="track" x="770" y="375" width="300" height="18" rx="9"/>
-  <rect class="training-bar" x="770" y="375" width="185" height="18" rx="9"/>
-  <line class="range" x1="954" y1="384" x2="955" y2="384"/>
-  <text class="value" x="963" y="390">24.5–24.7%</text>
+  <text class="label" x="734" y="253">Qwen3.5-35B</text>
+  <rect class="track" x="860" y="239" width="250" height="16" rx="8"/>
+  <rect class="training-bar" x="860" y="239" width="224" height="16" rx="8"/>
+  <line class="training-range" x1="1076" y1="247" x2="1084" y2="247"/>
+  <circle class="training-dot" cx="1076" cy="247" r="3"/>
+  <circle class="training-dot" cx="1084" cy="247" r="3"/>
+  <text class="value" x="1138" y="253" text-anchor="end">30.2–31.4%</text>
 
-  <text class="label" x="632" y="460">Kimi-K2.7</text>
-  <rect class="track" x="770" y="445" width="300" height="18" rx="9"/>
-  <rect class="training-bar" x="770" y="445" width="161" height="18" rx="9"/>
-  <line class="range" x1="928" y1="454" x2="933" y2="454"/>
-  <circle class="range-dot" cx="928" cy="454" r="3"/>
-  <circle class="range-dot" cx="933" cy="454" r="3"/>
-  <text class="value" x="941" y="460">21.1–21.7%</text>
+  <text class="label" x="734" y="338">Qwen3.5-397B</text>
+  <rect class="track" x="860" y="324" width="250" height="16" rx="8"/>
+  <rect class="training-bar" x="860" y="324" width="199" height="16" rx="8"/>
+  <line class="training-range" x1="1057" y1="332" x2="1059" y2="332"/>
+  <circle class="training-dot" cx="1057" cy="332" r="3"/>
+  <circle class="training-dot" cx="1059" cy="332" r="3"/>
+  <text class="value" x="1138" y="338" text-anchor="end">27.6–27.9%</text>
 
-  <text class="tick" x="770" y="526" text-anchor="middle">0%</text>
-  <text class="tick" x="845" y="526" text-anchor="middle">10%</text>
-  <text class="tick" x="920" y="526" text-anchor="middle">20%</text>
-  <text class="tick" x="995" y="526" text-anchor="middle">30%</text>
-  <text class="tick" x="1070" y="526" text-anchor="middle">40%</text>
-  <text class="panel-subtitle" x="770" y="551">8,192 input tokens · balanced and imbalanced routing</text>
+  <text class="label" x="734" y="423">GLM-5.2</text>
+  <rect class="track" x="860" y="409" width="250" height="16" rx="8"/>
+  <rect class="training-bar" x="860" y="409" width="168" height="16" rx="8"/>
+  <line class="training-range" x1="1025" y1="417" x2="1028" y2="417"/>
+  <circle class="training-dot" cx="1025" cy="417" r="3"/>
+  <circle class="training-dot" cx="1028" cy="417" r="3"/>
+  <text class="value" x="1138" y="423" text-anchor="end">23.1–23.5%</text>
+
+  <text class="tick" x="860" y="484" text-anchor="middle">0%</text>
+  <text class="tick" x="931" y="484" text-anchor="middle">10%</text>
+  <text class="tick" x="1003" y="484" text-anchor="middle">20%</text>
+  <text class="tick" x="1074" y="484" text-anchor="middle">30%</text>
+  <text class="panel-subtitle" x="734" y="545">8,192 tokens · balanced and imbalanced routing</text>
 
   <rect class="band" x="40" y="594" width="1120" height="72" rx="14"/>
-  <text class="band-title" x="64" y="622">DeepSeek V4 full-model serving · 8×B200 · vLLM</text>
+  <text class="band-title" x="64" y="622">DeepSeek V4 full-model serving · vLLM</text>
   <text class="band-label" x="64" y="646">Only the NVFP4 MoE backend changes</text>
   <text class="band-label" x="720" y="622">Prefill</text>
   <text class="band-value" x="720" y="647">1.10–1.13×</text>
   <text class="band-label" x="930" y="622">Decode</text>
   <text class="band-value" x="930" y="647">1.043–1.045×</text>
 
-  <text class="footer" x="56" y="696">BF16 input; router logits and top-k selection excluded. Full methodology in BENCHMARKS.md.</text>
+  <text class="footer" x="56" y="696">Median ranges; exact hardware, boundaries, IQRs, and validity gates are in BENCHMARKS.md.</text>
 </svg>
