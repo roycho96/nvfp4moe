@@ -1,390 +1,167 @@
 # B200 benchmarks
 
-Single-GPU results were measured on one NVIDIA B200 (`sm100`, 148 SMs); the
-distributed section uses eight B200s in one node. Both use
-`nvcr.io/nvidia/pytorch:26.07-py3` with PyTorch
-`2.13.0a0+9186a08b2c.nv26.07`, CUDA 13.3, and driver 580.95.05. The grouped
-GEMM comparison uses CUTLASS DSL 4.7.0 and FlashInfer 0.6.17. The training
-comparison uses Transformer Engine 2.17.
+This document reports the release results and the boundary measured by each
+table. Operator benchmarks use one NVIDIA B200 (`sm100`, 148 SMs). Distributed
+benchmarks use eight B200s in one node.
 
-Five entry points cover the release:
+Single-GPU and EP runs use `nvcr.io/nvidia/pytorch:26.07-py3`, PyTorch
+`2.13.0a0+9186a08b2c.nv26.07`, CUDA 13.3, driver 580.95.05, CUTLASS DSL 4.7.0,
+FlashInfer 0.6.17, and Transformer Engine 2.17. The full-model vLLM run uses
+vLLM 0.27.1, PyTorch 2.13.0+cu130, and FlashInfer 0.6.16.post3.
 
-1. `benchmarks/nvfp4_gemm.py` measures dense and grouped NVFP4 GEMM.
-2. `benchmarks/nvfp4_moe.py` measures the complete MoE layer.
-3. `benchmarks/inference_moe.py` measures the inference-only MoE plan.
-4. `benchmarks/api_overhead.py` isolates the public GEMM call boundary.
-5. `benchmarks/distributed_ep.py` measures the end-to-end EP expert boundary.
+## Measurement rules
 
-Missing backends are reported as skipped. No fallback is timed under another
-backend's name.
-
-## Measurement contract
-
-| Scope | Timed | Not timed |
+| Scope | Timed | Excluded |
 |---|---|---|
-| Prepacked GEMM | one GEMM call writing the stated output contract | input creation, compilation, autotuning, NVFP4 packing |
-| Dynamic GEMM | BF16 activation quantization and GEMM | compilation, weight packing |
-| Inference MoE | dispatch, BF16 input quantization, FC1 + gated activation + requantization, FC2, probability weighting, combine | routing logits/top-k, calibration, compilation, weight packing |
-| Full-model serving | one warmed `LLM.generate` call, including scheduling, TP collectives, attention, MoE, and sampling | checkpoint load, JIT, dataset loading, tokenization |
-| Full MoE training | dispatch, FC1, activation, FC2, probability weighting, combine, input/router/expert-weight gradients | optimizer, master-weight refresh, EP/TP communication |
-| Distributed EP | gather, NCCL dispatch, local expert layer, reverse NCCL dispatch, probability weighting, combine; backward when selected | router logits/top-k, optimizer, master-weight refresh |
-| Public API | `plan.run(...)` on the same plan, tensors, and output as the direct call | construction, JIT, packing, allocation |
+| Grouped GEMM | one prepacked GEMM call | allocation, compilation, autotuning, packing |
+| Inference MoE | dispatch, BF16 quantization, FC1, activation, requantization, FC2, weighting, combine | routing logits/top-k, calibration, compilation, weight packing |
+| Full-model serving | one warmed `LLM.generate` call | model load, JIT, dataset loading, tokenization |
+| Training | full MoE forward and backward | optimizer, master-weight refresh, communication unless marked EP |
+| Distributed EP | NCCL dispatch, local MoE, reverse dispatch, weighting, combine | routing logits/top-k, optimizer |
 
-Prepacked native and FlashInfer grouped calls write a preallocated output.
-PyTorch `scaled_grouped_mm` allocates its result because it has no `out=` API.
-The tables therefore compare measured API latency, not identical allocation
-contracts.
+- Alternatives are measured in the same GPU session with fixed inputs.
+  Operator arms are interleaved; full-model serving uses native → baseline →
+  native canary in separate engine processes.
+- Tables report CUDA-event median latency, except full-model serving, which
+  reports `LLM.generate` wall time. IQR and p10/p90 are retained in JSONL.
+- A result is rejected when native canary drift exceeds 5% or wall time divided
+  by enclosed GPU time exceeds 1.5.
+- Missing backends are skipped. No fallback is reported under another name.
+- Outputs must be finite and pass the stated FP32 or BF16 reference check.
+  Precision results are operator checks, not convergence results.
 
-Every backend starts from the same seeded BF16 sources. Compilation, input
-creation, calibration, and weight packing finish before timing unless a case
-is explicitly marked `dynamic`.
+`T` is the input-token count for one MoE call. Expert GEMMs receive
+`T * top-k` routed rows. A grouped problem is jagged when expert row counts
+differ; zero-row experts are valid and `sum(M_e) = T * top-k` is preserved.
+Balanced routing spreads rows evenly, hotspot routing favors expert 0, and tail
+routing exercises alignment boundaries and an empty expert.
 
-### Timing and rejection rules
-
-- Runnable arms are shuffled deterministically and interleaved in one GPU
-  session.
-- Grouped release rows use 20 samples after a 1,000 ms stabilization phase.
-  Training rows use 10 samples after three warmups.
-- Tables report CUDA-event median latency. JSONL also records IQR, p10/p90,
-  versions, GPU identity, row counts, FLOPs, TFLOP/s, and peak percentage.
-- Inference JSONL also records active SM clock, P-state, and power during
-  mixed-arm stabilization.
-- The first arm is rerun as a canary. A case is rejected above 5% drift.
-- A run is rejected when wall time divided by the enclosing CUDA-event time
-  exceeds 1.5.
-- Fixed random inputs and routing seeds are shared by every arm.
-
-GEMM accuracy checks require a finite full output and compare up to two rows per
-nonempty expert with an FP32 GEMM formed from the same BF16 sources. The
-inference plan additionally has a BF16 reference cosine gate, repeated-run
-bitwise gate, and CUDA Graph replay test. These are operator checks, not a
-convergence claim.
+Useful GEMM work is `2*M*N*K`, with `M = sum(M_e)`. B200 dense FP4 peak is
+9,000 TFLOP/s per GPU; the 18,000 TFLOP/s figure assumes 2:4 sparsity. Reported
+peak percentages use the 9,000 TFLOP/s dense specification and are not
+clock-normalized.
 
 ## Full-model vLLM serving
 
-The full `nvidia/DeepSeek-V4-Flash-NVFP4` checkpoint was served with vLLM
-0.27.1 on eight B200s using TP8 and an FP8 KV cache. It has 284B total and 13B
-active parameters, with 256 experts, top-6 routing, and a bounded SwiGLU. The
-native arm replaces only the NVFP4 MoE backend; vLLM scheduling, attention,
-collectives, and all other model operators are unchanged. The comparison arm
-is FlashInfer 0.6.16.post3's TRT-LLM generated NVFP4 MoE backend.
+This run serves `nvidia/DeepSeek-V4-Flash-NVFP4` revision
+`e3cd60e7de98e9867116860d522499a728de1cf9` on eight B200s with TP8 and an FP8
+KV cache. The model has 284B total and 13B active parameters, with E256/top-6
+and bounded SwiGLU. The run replaces only the NVFP4 MoE backend; attention,
+vLLM scheduling, collectives, and other operators are unchanged. Prompts are
+fixed samples from SWE-bench Verified revision
+`78f471bf655a3137b2e8a75af1501690ec009ec3`.
 
-Prompts come from SWE-bench Verified revision
-`78f471bf655a3137b2e8a75af1501690ec009ec3`. Each arm used 21 measured runs
-after a stable warmup, in native → FlashInfer → native canary order.
-
-| Workload | Fixed batch | Native A p50 [IQR] | FlashInfer p50 [IQR] | Native canary p50 [IQR] | FlashInfer / native |
+| Workload | Fixed batch | Native A p50 [IQR] | FlashInfer TRT p50 [IQR] | Native canary p50 [IQR] | Baseline/native |
 |---|---:|---:|---:|---:|---:|
 | Prefill | 8 × 1,024 input → 1 output | 221.670 [2.869] ms | 250.464 [4.300] ms | 226.927 [1.803] ms | 1.10–1.13× |
 | Decode | 32 × 256 input → 256 output | 2.5014 [0.0053] s | 2.6079 [0.1274] s | 2.4960 [0.0029] s | 1.043–1.045× |
 
-Decode produced 8,192 tokens per run. Native delivered 3,275 and 3,282
-tokens/s in the two arms versus 3,141 tokens/s for FlashInfer; median TPOT was
-8.898 and 8.894 ms versus 9.266 ms. Prefill canary drift was 2.37% and decode
-canary drift was 0.22%. The largest relative IQR was 1.72% for prefill and
-4.88% for decode. Every timed sample recorded a 1,965 MHz SM clock. Decode used
-one fixed token trajectory and produced identical input and output hashes in
-all three arms. Prefill generated one greedy token that was never fed back.
+Each arm has 21 measured runs after a stable warmup. Prefill and decode canary
+drift are 2.37% and 0.22%; maximum relative IQR is 1.72% and 4.88%. Every timed
+sample records a 1,965 MHz SM clock. Decode produces 8,192 tokens per run:
+native reaches 3,275–3,282 tokens/s and 8.894–8.898 ms TPOT versus 3,141
+tokens/s and 9.266 ms for FlashInfer. Decode input, output, and the forced token
+trajectory match across all arms.
+
+This is a full-model result. The exact DeepSeek V4 E256/top-6 MoE layer has not
+been isolated in the operator tables below.
 
 ## Inference MoE
 
-`InferenceMoE` uses static calibrated activation scales, persistent workspaces,
-and deterministic combine. FlashInfer 0.6.17 uses its CuTeDSL fused MoE with
-atomic finalize. `FI prequant` starts from an already packed NVFP4 activation;
-native still starts from BF16, so this is the stricter performance baseline.
-`FI BF16` includes FlashInfer input quantization. Values are CUDA-event medians.
-`T` is the input-token count for one MoE call; the expert GEMMs receive
-`T * top-k` routed rows.
+These tables measure the complete inference MoE boundary defined above, not
+standalone GEMM. `FI BF16` is FlashInfer's CuTeDSL fused MoE starting from the
+same BF16 input as native.
 
-This is an operator-plan comparison at EP-shard expert counts. It does not
-establish end-to-end serving performance.
-
-| Model case | T / local E / routing | Native BF16 µs | FI prequant µs | FI BF16 µs | FI prequant / native |
-|---|---:|---:|---:|---:|---:|
-| Qwen3-30B decode | 1 / 16 / balanced | **51.25** | 184.94 | 204.29 | 3.61× |
-| Qwen3-30B decode batch | 8 / 16 / hotspot | **60.99** | 187.39 | 205.26 | 3.07× |
-| DeepSeek-V3.2 decode | 1 / 32 / empty | **91.78** | 191.55 | 212.43 | 2.09× |
-| DeepSeek-V3.2 decode batch | 32 / 32 / balanced | **179.47** | 250.18 | 268.93 | 1.39× |
-| Kimi-K2.7 decode | 1 / 48 / hotspot | **98.61** | 192.19 | 210.82 | 1.95× |
-| Qwen3-30B | 128 / 16 / balanced | **191.70** | 623.94 | 687.71 | 3.25× |
-| Qwen3-30B | 8,192 / 16 / balanced | **360.80** | 684.38 | 778.96 | 1.90× |
-| Qwen3-235B | 2,048 / 16 / hotspot | **307.20** | 670.42 | 745.54 | 2.18× |
-| DeepSeek-V3.2 | 2,048 / 32 / balanced | **522.06** | 930.46 | 1,009.49 | 1.78× |
-| Kimi-K2.7 | 2,048 / 48 / hotspot | **633.39** | 841.10 | 870.61 | 1.33× |
-| MiniMax-M2 | 2,048 / 32 / one empty expert | **303.97** | 647.39 | 749.50 | 2.13× |
-| Llama 4 Scout | 2,048 / 2 / balanced | **261.34** | 647.90 | 718.18 | 2.48× |
-
-Every row interleaves the three arms in one B200 session. The main model rows
-use 20 samples after three warmups and 1,000 ms mixed-arm stabilization. Decode
-uses 30 samples under the same setup. Large Kimi uses 30 samples after 10
-warmups and 15,000 ms stabilization. Maximum accepted pre/post native canary
-drift was 4.66%, and the maximum wall/event ratio was 1.29. Compilation, packing,
-calibration, and output allocation are outside timing for every arm.
-The decode session measured P0 at 1,965 MHz during stabilization; the
-power-limited DeepSeek T32 case measured 1,642 MHz at 1,019 W.
-
-Balanced routing assigns routes round-robin with counts differing by at most
-one. Hotspot routing selects expert 0 for every token and cycles the remaining
-routes over other experts. Empty routing never selects the last expert.
-
-Gemma 4 is not in this table because FlashInfer 0.6.17 rejects GeGLU in its
-SM100 CuTeDSL fused MoE API. No SwiGLU timing is reported under the Gemma label.
-
-### TRT-LLM generated decode baseline
-
-This comparison uses FlashInfer's TRT-LLM generated NVFP4 routed-MoE kernel.
-Both BF16 arms include dispatch, activation quantization, two expert
-projections, SwiGLU, weighting, and combine. `TRT prequant` starts after input
-quantization and routing metadata packing, so it has a narrower timed boundary.
-
-| Model case | T / local E | Native BF16 µs | TRT BF16 µs | TRT prequant µs |
+| Model case | T / local E / routing | Native µs | FI BF16 µs | FI/native |
 |---|---:|---:|---:|---:|
-| DeepSeek-V3.2 | 1 / 32 | **28.757** | 43.039 | 21.776 |
-| DeepSeek-V3.2 | 8 / 32 | **86.319** | 127.638 | 125.548 |
-| DeepSeek-V3.2 | 32 / 32 | **130.431** | 132.395 | 129.647 |
+| DeepSeek-V3.2 decode | 1 / 32 / empty | **91.78** | 212.43 | 2.31× |
+| DeepSeek-V3.2 decode batch | 32 / 32 / balanced | **179.47** | 268.93 | 1.50× |
+| Kimi-K2.7 decode | 1 / 48 / hotspot | **98.61** | 210.82 | 2.14× |
+| DeepSeek-V3.2 prefill | 2,048 / 32 / balanced | **522.06** | 1,009.49 | 1.93× |
+| Kimi-K2.7 prefill | 2,048 / 48 / hotspot | **633.39** | 870.61 | 1.37× |
 
-The wide decode matrix uses `H=7,168`, `I=2,048`, 48 local experts, and
-top-k 8. Balanced routing spreads routes evenly; hotspot routing sends one
-route to every local expert before filling expert 0.
+Maximum accepted canary drift is 4.66% and maximum wall/GPU ratio is 1.29.
+Compilation, packing, calibration, and output allocation are excluded.
 
-| Routing | T | Native BF16 µs | TRT BF16 µs | TRT / native |
-|---|---:|---:|---:|---:|
-| balanced | 1 | **28.756** | 43.087 | 1.50x |
-| balanced | 8 | **120.280** | 180.813 | 1.50x |
-| balanced | 16 | **121.210** | 182.582 | 1.51x |
-| balanced | 32 | **123.064** | 186.443 | 1.52x |
-| balanced | 64 | **128.840** | 194.940 | 1.51x |
-| hotspot | 1 | **28.757** | 43.105 | 1.50x |
-| hotspot | 8 | **28.752** | 45.357 | 1.58x |
-| hotspot | 16 | **28.766** | 51.762 | 1.80x |
-| hotspot | 32 | **41.039** | 54.152 | 1.32x |
-| hotspot | 64 | **45.127** | 58.832 | 1.30x |
+### TRT-LLM generated decode
 
-The arms were captured in CUDA Graphs and interleaved in one B200 session.
-Each of 21 samples enclosed 100 replays. Maximum native canary drift was 0.068%, and
-the maximum wall/event ratio was 1.007. The native and `TRT BF16` columns have
-the same input and output boundary; `TRT prequant` is shown only as a kernel
-pipeline reference. At T=64, native also measured 128.840 µs versus 190.785 µs
-for TRT prequant on balanced routing, and 45.127 µs versus 52.362 µs on hotspot
-routing. Each row is a same-session comparison; results are not divided across
-GPU sessions.
+This is the stronger FlashInfer TRT-LLM generated baseline. Both columns start
+from BF16 and include dispatch, quantization, two expert projections, SwiGLU,
+weighting, and combine. The E48 cases use `H=7,168`, `I=2,048`, and top-k 8.
 
-## Public API overhead
+| Shape | Routing | T | Native µs | TRT µs | TRT/native |
+|---|---|---:|---:|---:|---:|
+| local E32 | balanced | 1 | **28.757** | 43.039 | 1.50× |
+| local E32 | balanced | 8 | **86.319** | 127.638 | 1.48× |
+| local E32 | balanced | 32 | **130.431** | 132.395 | 1.015× |
+| local E48 | balanced | 32 | **123.064** | 186.443 | 1.52× |
+| local E48 | hotspot | 16 | **28.766** | 51.762 | 1.80× |
+| local E48 | hotspot | 32 | **41.039** | 54.152 | 1.32× |
 
-`DenseGemm` and `GroupedGemm` are aliases of the native runtime classes.
-`plan.run(...)` and `plan(...)` execute the same Python function body and the
-same compiled kernel. The benchmark isolates the spelling of that call by
-reusing one plan, one set of inputs, and one output allocation.
-
-The accepted B200 session used 30 interleaved samples after a 1,000 ms
-stabilization phase. Each CUDA event enclosed eight identical calls and was
-divided by eight; the canary used the same batching. All outputs were bitwise
-identical. Maximum absolute canary drift was 0.297%, and the maximum
-wall-time/GPU-time ratio was 1.031.
-
-| Case | Direct µs | Public `run` µs | Difference | IQR direct / public µs |
-|---|---:|---:|---:|---:|
-| Qwen3-30B FC2 dense, M=8,192 | 12.620 | 12.624 | +0.032% | 0.020 / 0.015 |
-| DeepSeek-V3 FC1 dense, M=8,192 | 92.570 | 92.568 | -0.002% | 0.178 / 0.153 |
-| Qwen3-30B FC2 grouped, jagged M=65,536 | 84.150 | 84.216 | +0.078% | 0.147 / 0.150 |
-| DeepSeek-V3 FC2 grouped, jagged M=65,536 | 468.652 | 468.384 | -0.057% | 0.481 / 0.329 |
-| DeepSeek-V3 FC2 grouped, one empty expert | 466.716 | 466.598 | -0.025% | 6.189 / 3.206 |
-
-The largest positive difference was 0.078%, below the 2% API regression gate.
-These figures validate the API boundary only; the GEMM performance tables below
-compare the kernels against external implementations.
-
-## FLOPs and peak
-
-Useful GEMM work is `2*M*N*K`; one multiply-add counts as two FLOPs. For
-grouped GEMM, `M = sum(M_e)`, where `M_e` is the row count of expert `e`.
-Padding and fused activation work are not counted.
-
-B200 dense FP4 peak is **9,000 TFLOP/s per GPU**. NVIDIA's 144 PFLOP/s HGX
-B200 figure uses 2:4 structured sparsity; the corresponding eight-GPU dense
-figure is 72 PFLOP/s. Peak utilization in this document is therefore
-`logical TFLOP/s / 9,000`.
-
-This percentage uses the product specification, not a clock-normalized
-roofline. Modal clocks are not locked. Dynamic and full-layer rows include
-non-GEMM work and do not report peak utilization.
-
-## Jagged routing
-
-A grouped problem is **jagged** when expert row counts differ. Expert-major
-rows remain packed in one contiguous tensor, with cumulative offsets marking
-boundaries. A zero row count is a valid empty expert. Every distribution keeps
-`sum(M_e) = tokens * top-k` exactly.
-
-| Routing | Definition |
-|---|---|
-| balanced | every expert has equal weight |
-| jagged | expert `e` has weight `1 + ((17*e + 11) mod 31)` |
-| hotspot | expert 0 has weight `max(1, E/2)`; all others have weight 1 |
-| tail | weights repeat `1,15,16,127,128,129,255,256,257`; the last expert is empty |
-
-Integer row counts use largest-remainder allocation. For the common
-`M=65,536, E=8` shard:
-
-| Routing | Expert row counts | CV | Empty experts |
-|---|---|---:|---:|
-| balanced | 8,192 × 8 | 0.000 | 0 |
-| jagged | 7,350, 17,762, 9,187, 613, 11,025, 2,450, 12,862, 4,287 | 0.653 | 0 |
-| hotspot | 23,831, 5,958, 5,958, 5,958, 5,958, 5,958, 5,958, 5,957 | 0.722 | 0 |
-| tail | 98, 1,465, 1,563, 12,404, 12,502, 12,599, 24,905, 0 | 1.018 | 1 |
-
-Synthetic top-k assignments are sampled without replacement. Every JSONL row
-stores the complete row-count array, min/max, coefficient of variation, empty
-expert count, and 128-row alignment count.
-
-## Model shapes
-
-| Model | Hidden | Intermediate | Global experts | Top-k | GEMM EP size / local E | Training EP size / local E |
-|---|---:|---:|---:|---:|---:|---:|
-| Qwen3-30B-A3B | 2,048 | 768 | 128 | 8 | 16 / 8 | 8 / 16 |
-| Qwen3-235B-A22B | 4,096 | 1,536 | 128 | 8 | 16 / 8 | 8 / 16 |
-| Gemma 4 26B A4B | 2,816 | 704→768 | 128 | 8 | 16 / 8 | 8 / 16 |
-| DeepSeek-V3.2 | 7,168 | 2,048 | 256 | 8 | 32 / 8 | 8 / 32 |
-| Kimi-K2.7 | 7,168 | 2,048 | 384 | 8 | 48 / 8 | 24 / 16 |
-| MiniMax-M2 | 3,072 | 1,536 | 256 | 8 | 32 / 8 | 8 / 32 |
-| Llama 4 Scout | 5,120 | 8,192 | 16 | 1 | 2 / 8 | 8 / 2 |
-
-These are model-derived operator shapes with synthetic activations and
-routing. They are not full checkpoint or dataset runs.
-
-## Distributed expert parallelism
-
-This benchmark uses one 8×B200 node with EP size 8. `B/rank` is the batch size
-on each rank, and each rank contributes `B/rank * S` input tokens. Global input
-tokens multiply that value by eight; routed rows additionally multiply by the
-model's top-k.
-
-Latency is the slowest rank's enclosing CUDA-event time. Token gather, NCCL
-dispatch, expert IDs, the local expert layer, reverse dispatch, probability
-weighting, and combine are timed. Routing logits and top-k selection are not.
-Uneven messages use one fixed-capacity `all_to_all_single`; the table reports
-the padding overhead rather than hiding it. Values are `median [IQR]` in ms.
-
-| Model and case | Native | TE NVFP4 | Torch BF16 | TE/native | BF16/native | Transport / padding |
-|---|---:|---:|---:|---:|---:|---:|
-| Qwen3-30B, B/rank 128 × S1, jagged | 1.373 [0.120] | 2.614 [0.119] | **1.173 [0.072]** | 1.90× | 0.85× | 0.513 / 25.0% |
-| Qwen3-30B, B/rank 1 × S8192, jagged | **3.236 [0.019]** | 4.459 [0.141] | 5.065 [0.015] | 1.38× | 1.56× | 1.727 / 13.5% |
-| Qwen3-235B, B/rank 1 × S2048, jagged | **1.834 [0.006]** | 2.546 [0.059] | 2.968 [0.011] | 1.39× | 1.62× | 0.966 / 13.0% |
-| DeepSeek-V3.2, B/rank 1 × S2048, jagged | **2.989 [0.016]** | 4.507 [0.077] | 5.076 [0.019] | 1.51× | 1.70× | 1.476 / 4.8% |
-| Kimi-K2.7, B/rank 1 × S2048, hotspot | **4.310 [0.020]** | 5.817 [0.054] | 8.073 [0.021] | 1.35× | 1.87× | 2.265 / 87.5% |
-| MiniMax-M2, B/rank 1 × S2048, jagged | **1.492 [0.007]** | 2.426 [0.101] | 2.375 [0.012] | 1.63× | 1.59× | 0.790 / 4.8% |
-| Llama 4 Scout, B/rank 1 × S2048, tail | **1.082 [0.020]** | 1.657 [0.033] | 2.146 [0.017] | 1.53× | 1.98× | 0.613 / 162.1% |
-
-The small Qwen decode case is communication and launch dominated, so native
-does not beat BF16 there. The larger cases amortize that fixed cost and native
-leads both comparison arms.
-
-Forward/backward includes the autograd path and the two reverse collectives.
-
-| Model and case | Native | TE NVFP4 | Torch BF16 | TE/native | BF16/native |
-|---|---:|---:|---:|---:|---:|
-| Qwen3-30B, B/rank 1 × S8192, balanced | **7.225 [0.021]** | 9.125 [0.468] | 10.122 [0.021] | 1.26× | 1.40× |
-| Qwen3-30B, B/rank 1 × S8192, jagged | **7.623 [0.074]** | 9.743 [0.083] | 10.992 [0.044] | 1.28× | 1.44× |
-| DeepSeek-V3.2, B/rank 1 × S2048, jagged | **7.912 [0.153]** | 11.381 [0.040] | 11.585 [0.014] | 1.44× | 1.46× |
-
-Inference rows use 20 samples; training rows use 10. Arms are deterministically
-interleaved in one session. Maximum accepted canary drift was 1.01%, and the
-largest wall/event ratio was 1.055. All eight ranks produced finite outputs and
-gradients. Across the three training rows, native's worst-rank minimum cosine
-against BF16 was 0.97247 for output, 0.96144 for input gradient, 0.97262 for
-router-probability gradient, 0.95992 for gate/up weight gradient, and 0.96600
-for down-weight gradient.
-
-These results cover one node. A two-node B200 run requires 16 GPUs, above the
-current Modal workspace limit of 10 concurrent GPUs, so no multi-node number is
-reported.
+The arms use CUDA Graphs and 21 samples of 100 replays. Maximum canary drift is
+0.068% and maximum wall/GPU ratio is 1.007.
 
 ## Grouped NVFP4 GEMM
 
-The table reports balanced routing at 8,192 tokens. Llama 4 has fewer routed
-rows because its top-k is 1.
+These are prepacked balanced cases at 8,192 tokens. Native and FlashInfer write
+a preallocated output. PyTorch `scaled_grouped_mm` allocates its result because
+it has no `out=` API.
 
-| Model | Routed M | FC1 us / TFLOP/s / peak | FC2 us / TFLOP/s / peak |
+| Model / projection | H × I | Native µs | FlashInfer µs | PyTorch µs | Native TFLOP/s | Dense peak |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3-235B FC1 | 4,096 × 1,536 | **347.5** | 475.4 | 383.4 | 4,746 | 52.7% |
+| Qwen3-235B FC2 | 4,096 × 1,536 | **210.3** | 282.8 | 265.5 | 3,922 | 43.6% |
+| DeepSeek-V3.2 FC1 | 7,168 × 2,048 | **736.8** | 1,086.7 | 788.6 | 5,223 | 58.0% |
+| DeepSeek-V3.2 FC2 | 7,168 × 2,048 | **451.7** | 617.6 | 496.9 | 4,260 | 47.3% |
+| Kimi-K2.7 FC1 | 7,168 × 2,048 | **738.0** | 1,117.5 | 788.7 | 5,214 | 57.9% |
+| Kimi-K2.7 FC2 | 7,168 × 2,048 | **451.8** | 619.2 | 499.5 | 4,259 | 47.3% |
+
+Native IQR is 0.1–1.4% across the release matrix. Published rows pass the
+canary and wall/GPU gates and reach sampled reference cosine of at least
+0.99078. Dense, non-grouped GEMM is not presented as SOTA: cuBLASLt is faster
+overall in the measured matrix. Public `plan.run(...)` overhead is at most
+0.078%, with bitwise-identical outputs.
+
+## Distributed EP
+
+This benchmark uses one node with eight B200s and EP size 8. Latency is the
+slowest rank's CUDA-event median. `B/rank × S` is batch and sequence length per
+rank. Values are median `[IQR]` in ms.
+
+| Scope and case | Native | TE NVFP4 | Torch BF16 |
 |---|---:|---:|---:|
-| Qwen3-30B | 65,536 | 111.8 / 3,687 / 41.0% | 84.6 / 2,438 / 27.1% |
-| Qwen3-235B | 65,536 | 347.5 / 4,746 / 52.7% | 210.3 / 3,922 / 43.6% |
-| Gemma 4 26B | 65,536 | 146.7 / 3,866 / 43.0% | 113.2 / 2,503 / 27.8% |
-| DeepSeek-V3.2 | 65,536 | 736.8 / 5,223 / 58.0% | 451.7 / 4,260 / 47.3% |
-| Kimi-K2.7 | 65,536 | 738.0 / 5,214 / 57.9% | 451.8 / 4,259 / 47.3% |
-| MiniMax-M2 | 65,536 | 278.6 / 4,440 / 49.3% | 163.1 / 3,792 / 42.1% |
-| Llama 4 Scout | 8,192 | 314.8 / 4,367 / 48.5% | 156.9 / 4,379 / 48.7% |
+| Inference, Qwen3-30B, 128 × 1, jagged | 1.373 [0.120] | 2.614 [0.119] | **1.173 [0.072]** |
+| Inference, DeepSeek-V3.2, 1 × 2,048, jagged | **2.989 [0.016]** | 4.507 [0.077] | 5.076 [0.019] |
+| Inference, Kimi-K2.7, 1 × 2,048, hotspot | **4.310 [0.020]** | 5.817 [0.054] | 8.073 [0.021] |
+| Forward/backward, Qwen3-30B, 1 × 8,192, jagged | **7.623 [0.074]** | 9.743 [0.083] | 10.992 [0.044] |
+| Forward/backward, DeepSeek-V3.2, 1 × 2,048, jagged | **7.912 [0.153]** | 11.381 [0.040] | 11.585 [0.014] |
 
-Backend latency is CUDA-event median microseconds for the same balanced cases.
-PyTorch uses `scaled_grouped_mm` and is measured only when every group meets
-its 128-row alignment requirement.
+Maximum canary drift is 1.01% and maximum wall/GPU ratio is 1.055. The small
+Qwen decode case is communication-bound and remains slower than Torch BF16.
+No multi-node result is reported because 16 B200s exceed the current workspace
+limit.
 
-| Model | FC1 native / FlashInfer / PyTorch | FC2 native / FlashInfer / PyTorch |
-|---|---:|---:|
-| Qwen3-30B | **111.8** / 142.4 / 134.6 | **84.6** / 90.5 / 125.4 |
-| Qwen3-235B | **347.5** / 475.4 / 383.4 | **210.3** / 282.8 / 265.5 |
-| Gemma 4 26B | **146.7** / 180.7 / 169.2 | **113.2** / 123.3 / 170.5 |
-| DeepSeek-V3.2 | **736.8** / 1,086.7 / 788.6 | **451.7** / 617.6 / 496.9 |
-| Kimi-K2.7 | **738.0** / 1,117.5 / 788.7 | **451.8** / 619.2 / 499.5 |
-| MiniMax-M2 | **278.6** / 368.9 / 312.7 | **163.1** / 215.5 / 206.2 |
-| Llama 4 Scout | **314.8** / 437.4 / 357.6 | **156.9** / 205.1 / 179.4 |
+## Single-GPU training
 
-Native IQR was 0.1–1.4% of the median across these 14 rows. All shown cases
-passed the canary and wall/GPU gates and reached sampled reference cosine of at
-least 0.99078. A Llama 4 jagged FC1 run drifted 10.9% and was rejected; it is
-not included in either table.
+These rows include the complete MoE forward and backward at 8,192 tokens.
+Ranges cover balanced and jagged routing.
 
-## Dense NVFP4 GEMM
-
-Dense mode measures `C = A @ B.T` without an expert dimension. It compares the
-native kernel with cuBLASLt through `torch.nn.functional.scaled_mm` at
-`M={128,512,2048,8192}` for Qwen3-30B, Qwen3-235B, DeepSeek-V3.2, and Llama 4
-FC1/FC2 shapes.
-
-cuBLASLt was faster overall in the measured matrix. Native led a small subset
-of large-K cases, so dense performance is not presented as a universal SOTA
-claim.
-
-## Single-GPU full MoE training
-
-Times include the complete single-GPU forward and backward boundary defined
-above. Results use 8,192 tokens and top-k sampling without replacement.
-
-| Model / routing | Native NVFP4 | TE fused NVFP4 | Torch BF16 | Native vs TE |
+| Model | Native NVFP4 ms | TE NVFP4 ms | Torch BF16 ms | Native latency vs TE |
 |---|---:|---:|---:|---:|
-| Qwen3-30B / balanced | **2.520 ms** | 3.888 ms | 4.814 ms | 35.2% faster |
-| Qwen3-30B / jagged | **2.482 ms** | 3.921 ms | 4.865 ms | 36.7% faster |
-| DeepSeek-V3.2 / balanced | **7.383 ms** | 9.784 ms | 22.373 ms | 24.5% faster |
-| DeepSeek-V3.2 / jagged | **7.408 ms** | 9.838 ms | 22.443 ms | 24.7% faster |
-| Kimi-K2.7 / balanced | **6.980 ms** | 8.916 ms | 22.112 ms | 21.7% faster |
-| Kimi-K2.7 / jagged | **7.018 ms** | 8.891 ms | 22.359 ms | 21.1% faster |
-| MiniMax-M2 / balanced | **3.584 ms** | 5.538 ms | 9.116 ms | 35.3% faster |
-| MiniMax-M2 / jagged | **3.564 ms** | 5.508 ms | 9.076 ms | 35.3% faster |
+| Qwen3-30B | **2.482–2.520** | 3.888–3.921 | 4.814–4.865 | 35.2–36.7% lower |
+| DeepSeek-V3.2 | **7.383–7.408** | 9.784–9.838 | 22.373–22.443 | 24.5–24.7% lower |
+| Kimi-K2.7 | **6.980–7.018** | 8.891–8.916 | 22.112–22.359 | 21.1–21.7% lower |
+| MiniMax-M2 | **3.564–3.584** | 5.508–5.538 | 9.076–9.116 | 35.3% lower |
 
-Canary drift was 0.19–4.27%, so every published training row passed the 5%
-gate.
-
-## Precision
-
-Against the Torch BF16 layer, native output cosine was 0.9727–0.9735 and input
-gradient cosine was 0.9619–0.9626. Router and expert weight gradients were
-finite in every case. A separate Qwen3-30B FineWeb-Edu trace measured:
-
-| Tensor | Cosine similarity | Relative L2 |
-|---|---:|---:|
-| Output | 0.996526 | 0.08444 |
-| Input gradient | 0.975384 | 0.22193 |
-| Router gradient | 0.992358 | 0.12360 |
-| Gate/up weight gradient | 0.968857 | 0.25141 |
-| Down weight gradient | 0.986734 | 0.16351 |
-
-These are layer checks, not convergence results.
+Canary drift is 0.19–4.27%. Against Torch BF16, output cosine is
+0.9727–0.9735 and input-gradient cosine is 0.9619–0.9626. Router and expert
+weight gradients are finite. A Qwen3-30B FineWeb-Edu trace measured cosine
+0.996526 for output, 0.975384 for input gradient, 0.992358 for router gradient,
+0.968857 for gate/up weight gradient, and 0.986734 for down-weight gradient.
 
 ## Reproduce
 
 ```bash
-python benchmarks/nvfp4_gemm.py --list --suite full
-python benchmarks/nvfp4_moe.py --list --suite full
-
 python benchmarks/nvfp4_gemm.py \
   --models all --tokens 8192 --routing balanced,jagged \
   --backends native,flashinfer_cutedsl,torch_scaled_grouped_mm \
@@ -396,12 +173,8 @@ python benchmarks/nvfp4_moe.py \
   --backends native,te_nvfp4_fused,torch_bf16 \
   --scope full-layer --pass fwd_bwd --interleave-training
 
-modal run benchmarks/modal_ci.py
-modal run benchmarks/modal_ci.py --benchmark-smoke
 modal run benchmarks/modal_ci.py --matrix gemm
 modal run benchmarks/modal_ci.py --matrix moe-training
-modal run benchmarks/modal_ci.py --grouped api
-modal run benchmarks/modal_ci.py::benchmark_distributed --preset inference
 modal run benchmarks/modal_ci.py::benchmark_distributed --preset inference-extended
 modal run benchmarks/modal_ci.py::benchmark_distributed --preset training
 ```
