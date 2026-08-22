@@ -1,7 +1,7 @@
 # B200 benchmark results
 
-Operator results use one NVIDIA B200 (`sm100`, 148 SMs). Expert-parallel
-results use eight B200s in one node.
+Measurements use NVIDIA B200 (`sm100`, 148 SMs). Expert-parallel results use
+eight B200s in one node.
 
 Single-GPU and expert-parallel runs use
 `nvcr.io/nvidia/pytorch:26.07-py3`, PyTorch

@@ -141,5 +141,5 @@
   <text class="band-label" x="930" y="622">Decode</text>
   <text class="band-value" x="930" y="647">1.043–1.045×</text>
 
-  <text class="footer" x="56" y="696">Operator charts use 1×B200. BF16 input; router logits and top-k selection excluded. Full methodology in BENCHMARKS.md.</text>
+  <text class="footer" x="56" y="696">BF16 input; router logits and top-k selection excluded. Full methodology in BENCHMARKS.md.</text>
 </svg>
