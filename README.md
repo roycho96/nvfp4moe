@@ -22,11 +22,17 @@ input gradients, weight gradients, and router gradients.
 Exact timing boundaries, model shapes, and measured results are documented in
 [BENCHMARKS.md](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md).
 
-## 🧩 Model coverage
+## 🧩 Compatibility
 
-The benchmark and configuration registry includes these model-derived expert
-contracts. LightMoE exposes kernels and routed expert layers; it does not load
-or patch model checkpoints.
+LightMoE is shape-configurable, not tied to a model allowlist. Standard
+SwiGLU-based MoE models can use the same kernels without model-specific code,
+subject to the alignment and capacity limits below. Complete inference also
+supports bounded SwiGLU, SwiGLU-OAI, GeGLU, ReGLU, and ReLU²; training supports
+the same set except ReGLU. Standalone GEMM is independent of the activation.
+
+The following model contracts are included as measured benchmark cases, not as
+the complete list of compatible models. LightMoE exposes kernels and routed
+expert layers; it does not load or patch model checkpoints.
 
 | Model | Hidden / intermediate | Experts / top-k | Activation | Coverage |
 |---|---:|---:|---|---|
@@ -42,6 +48,14 @@ Kimi-K3's outer latent projections and SiTU-GLU activation are outside the
 current complete-layer API.
 
 ## 📈 Performance
+
+In same-session B200 measurements, LightMoE wins all 14 reported grouped-GEMM
+projection cases, reaching up to **1.49×** the fastest runnable baseline. At
+8,192 input tokens, the complete MoE layer is **1.18–1.52×** faster than
+FlashInfer across six model contracts, while exact-contract SwiGLU training is
+**1.37–1.91×** faster than Transformer Engine. The eight-B200 DeepSeek-V4
+full-model swap improves prefill by **1.10–1.13×** and decode by
+**1.033–1.037×**.
 
 [![Complete MoE inference latency](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-inference-latency.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md#complete-moe-inference)
 
