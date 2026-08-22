@@ -1,40 +1,24 @@
-nvfp4moe third-party notices
+LightMoE third-party notices
 ============================
 
-nvfp4moe contains modified and adapted NVIDIA Apache-2.0 and BSD-3-Clause software.
-These notices and license terms must remain with source and binary redistributions.
+The following files retain upstream copyright and license notices.
 
-NVIDIA grouped weight-gradient kernel
---------------------------------------
+BSD-3-Clause
+------------
 
-nvfp4moe/kernels/wgrad contains an adapted grouped block-scaled GEMM
-weight-gradient implementation originating from NVIDIA cuDNN Frontend
-examples. The files retain NVIDIA copyright and SPDX Apache-2.0 headers.
+- lightmoe/kernels/dense/kernel.py
+- lightmoe/kernels/grouped/kernel.py
+- lightmoe/kernels/grouped/pipeline.py
 
-Upstream: https://github.com/NVIDIA/cudnn-frontend
-
-NVIDIA grouped forward GEMM
----------------------------
-
-nvfp4moe/kernels/gemm_kernel.py derives from NVIDIA CUTLASS's Blackwell
-grouped block-scaled CuTe DSL example. The file retains NVIDIA's BSD-3-Clause
-copyright notice and license text.
-
+These files are based on NVIDIA CUTLASS CuTe DSL examples.
 Upstream: https://github.com/NVIDIA/cutlass
 
-NVIDIA dense forward GEMM
--------------------------
+Apache-2.0
+----------
 
-nvfp4moe/kernels/dense_gemm_kernel.py adapts NVIDIA CUTLASS's Blackwell
-dense block-scaled CuTe DSL example at commit
-dcf215af68a2d08d305076c152a06f201728cd53. The file retains NVIDIA's
-BSD-3-Clause copyright notice and license text.
+- lightmoe/kernels/grouped/scheduler.py
+- lightmoe/kernels/grouped/wgrad_kernel.py
+- lightmoe/kernels/grouped/wgrad_tma.py
 
-Upstream: https://github.com/NVIDIA/cutlass/blob/dcf215af68a2d08d305076c152a06f201728cd53/examples/python/CuTeDSL/cute/blackwell/kernel/blockscaled_gemm/dense_blockscaled_gemm_persistent.py
-
-External runtime and benchmark dependencies
--------------------------------------------
-
-PyTorch, NVIDIA CUTLASS DSL, Transformer Engine, DeepGEMM, Modal, and the model
-or dataset artifacts used by the benchmarks are not redistributed by this
-project. They remain governed by their respective licenses and terms.
+These files are based on NVIDIA cuDNN Frontend examples.
+Upstream: https://github.com/NVIDIA/cudnn-frontend

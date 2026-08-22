@@ -21,17 +21,17 @@ import torch.distributed as dist
 
 try:
     from .model_shapes import MODEL_SHAPES, ModelShape
-    from .moe_backends import Nvfp4MoeExpert, TEFusedExpert
-    from .nvfp4_moe import _TorchGroupedExperts
+    from .moe import _TorchGroupedExperts
+    from .moe_backends import LightMoEExpert, TEFusedExpert
 except ImportError:
     from model_shapes import MODEL_SHAPES, ModelShape
-    from moe_backends import Nvfp4MoeExpert, TEFusedExpert
-    from nvfp4_moe import _TorchGroupedExperts
+    from moe import _TorchGroupedExperts
+    from moe_backends import LightMoEExpert, TEFusedExpert
 
 
-BACKENDS = ("native", "te_nvfp4_fused", "torch_bf16")
+BACKENDS = ("lightmoe", "transformer_engine_nvfp4_fused", "pytorch_bf16")
 PASSES = ("fwd", "fwd_bwd")
-ROUTINGS = ("balanced", "jagged", "hotspot", "tail")
+ROUTINGS = ("balanced", "imbalanced", "single_expert_skew", "alignment_stress")
 
 
 @dataclass(frozen=True)
@@ -49,8 +49,9 @@ class DistributedCase:
     @property
     def label(self) -> str:
         return (
-            f"{self.model}:b{self.batch_per_rank}:s{self.sequence_length}:"
-            f"{self.routing}:{self.benchmark_pass}"
+            f"{self.model}:batch_per_rank={self.batch_per_rank}:"
+            f"sequence_length={self.sequence_length}:routing={self.routing}:"
+            f"pass={self.benchmark_pass}"
         )
 
 
@@ -65,11 +66,11 @@ class RoutePlan:
     peer_capacity: int
 
     @property
-    def send_rows(self) -> int:
+    def send_assignment_count(self) -> int:
         return self.send_token.numel()
 
     @property
-    def recv_rows(self) -> int:
+    def received_assignment_count(self) -> int:
         return self.recv_local_expert.numel()
 
 
@@ -139,11 +140,11 @@ def parse_case(value: str) -> DistributedCase:
 def _routing_weights(experts: int, routing: str) -> torch.Tensor:
     if routing == "balanced":
         values = [1.0] * experts
-    elif routing == "jagged":
+    elif routing == "imbalanced":
         values = [float(1 + ((expert * 17 + 11) % 31)) for expert in range(experts)]
-    elif routing == "hotspot":
+    elif routing == "single_expert_skew":
         values = [float(max(1, experts // 2)), *([1.0] * (experts - 1))]
-    elif routing == "tail":
+    elif routing == "alignment_stress":
         edge = (1, 15, 16, 127, 128, 129, 255, 256, 257)
         values = [float(edge[expert % len(edge)]) for expert in range(experts)]
         if experts > 1:
@@ -260,7 +261,7 @@ class _DistributedArm:
         self.step += 1
         topi = recv_expert[:, None]
         topv = torch.ones(topi.shape, dtype=torch.float32, device=topi.device)
-        if self.name == "torch_bf16":
+        if self.name == "pytorch_bf16":
             return self.backend.full_layer(recv_x, topi, topv)
         return self.backend(recv_x, topi, topv, self.step)
 
@@ -310,7 +311,7 @@ class _DistributedArm:
             "input": self.x.grad,
             "router_prob": self.prob.grad,
         }
-        if self.name == "torch_bf16":
+        if self.name == "pytorch_bf16":
             gradients.update(
                 {
                     "gate_up_weight": self.backend.w1.grad.transpose(1, 2),
@@ -331,11 +332,11 @@ class _DistributedArm:
 
 
 def _make_backend(name, spec, trace):
-    if name == "native":
-        return Nvfp4MoeExpert(spec, trace)
-    if name == "te_nvfp4_fused":
+    if name == "lightmoe":
+        return LightMoEExpert(spec, trace)
+    if name == "transformer_engine_nvfp4_fused":
         return TEFusedExpert(spec, trace)
-    if name == "torch_bf16":
+    if name == "pytorch_bf16":
         return _TorchGroupedExperts(spec, trace)
     raise ValueError(name)
 
@@ -372,7 +373,7 @@ def _summary(events, walls):
         "event_ms_p90": ordered[int(0.90 * (len(ordered) - 1))],
         "event_ms_iqr": q75 - q25,
         "wall_ms_p50": statistics.median(walls),
-        "wall_to_event_ratio": ratio,
+        "host_wall_to_cuda_event_ratio": ratio,
         "health_valid": ratio <= 1.5,
         "iterations": len(events),
     }
@@ -436,10 +437,14 @@ def _transport(route, x):
 def _run_case(case, backend_names, warmup, iterations, stabilize_ms, rank, world):
     global_spec = MODEL_SHAPES[case.model]
     route = _build_route(case, global_spec, rank, world)
-    recv_rows = torch.tensor(route.recv_rows, dtype=torch.int64, device="cuda")
-    recv_grid = [torch.empty_like(recv_rows) for _ in range(world)]
-    dist.all_gather(recv_grid, recv_rows)
-    recv_rows_all = [int(value) for value in recv_grid]
+    received_assignments = torch.tensor(
+        route.received_assignment_count,
+        dtype=torch.int64,
+        device="cuda",
+    )
+    received_grid = [torch.empty_like(received_assignments) for _ in range(world)]
+    dist.all_gather(received_grid, received_assignments)
+    received_assignments_by_rank = [int(value) for value in received_grid]
     if rank == 0:
         print(
             json.dumps(
@@ -447,7 +452,7 @@ def _run_case(case, backend_names, warmup, iterations, stabilize_ms, rank, world
                     "event": "distributed_ep_case_start",
                     "case": case.label,
                     "backends": backend_names,
-                    "recv_rows_by_rank": recv_rows_all,
+                    "received_token_expert_assignments_by_rank": received_assignments_by_rank,
                     "peer_capacity": route.peer_capacity,
                 }
             ),
@@ -455,7 +460,7 @@ def _run_case(case, backend_names, warmup, iterations, stabilize_ms, rank, world
         )
     local_experts = global_spec.experts // world
     local_spec = replace(global_spec, experts=local_experts, topk=1, ep_sizes=(1,), quick_ep=1)
-    trace = _make_trace(local_spec, route.recv_rows, rank)
+    trace = _make_trace(local_spec, route.received_assignment_count, rank)
     torch.manual_seed(20260818 + rank)
     x = torch.randn(
         case.tokens_per_rank,
@@ -509,19 +514,19 @@ def _run_case(case, backend_names, warmup, iterations, stabilize_ms, rank, world
             wall_samples[name].append(wall)
 
     first = names[0]
-    canary_events, canary_walls = [], []
-    canary_rng = random.Random(20260817)
+    repeat_events, repeat_walls = [], []
+    repeat_rng = random.Random(20260817)
     for _ in range(iterations):
         order = names.copy()
-        canary_rng.shuffle(order)
+        repeat_rng.shuffle(order)
         for name in order:
             event, wall = _sample(lambda arm=arms[name]: arm.call(dout))
             if name == first:
-                canary_events.append(event)
-                canary_walls.append(wall)
-    canary = _summary(canary_events, canary_walls)
+                repeat_events.append(event)
+                repeat_walls.append(wall)
+    repeat = _summary(repeat_events, repeat_walls)
     initial_p50 = statistics.median(event_samples[first])
-    canary_drift = abs(canary["event_ms_p50"] / initial_p50 - 1.0)
+    initial_to_repeat_median_deviation = abs(repeat["event_ms_p50"] / initial_p50 - 1.0)
 
     validation_outputs = {}
     validation_gradients = {}
@@ -530,22 +535,23 @@ def _run_case(case, backend_names, warmup, iterations, stabilize_ms, rank, world
         validation_outputs[name] = arm.output.clone()
         if case.benchmark_pass == "fwd_bwd":
             validation_gradients[name] = arm.gradients()
-    reference = validation_outputs.get("torch_bf16")
+    reference = validation_outputs.get("pytorch_bf16")
     accuracy = {}
     if reference is not None:
         for name in arms:
-            if name != "torch_bf16":
+            if name != "pytorch_bf16":
                 accuracy[name] = _error(validation_outputs[name], reference)
     pairwise_accuracy = None
-    if "native" in validation_outputs and "te_nvfp4_fused" in validation_outputs:
+    if "lightmoe" in validation_outputs and "transformer_engine_nvfp4_fused" in validation_outputs:
         pairwise_accuracy = _error(
-            validation_outputs["native"], validation_outputs["te_nvfp4_fused"]
+            validation_outputs["lightmoe"],
+            validation_outputs["transformer_engine_nvfp4_fused"],
         )
     gradient_accuracy = {}
-    gradient_reference = validation_gradients.get("torch_bf16")
+    gradient_reference = validation_gradients.get("pytorch_bf16")
     if gradient_reference is not None:
         for name, gradients in validation_gradients.items():
-            if name != "torch_bf16":
+            if name != "pytorch_bf16":
                 gradient_accuracy[name] = _gradient_error(gradients, gradient_reference)
 
     transport = _summary(transport_events, transport_walls)
@@ -558,17 +564,18 @@ def _run_case(case, backend_names, warmup, iterations, stabilize_ms, rank, world
         )
         results[name] = {
             "timing": timing,
-            "accuracy_vs_torch_bf16": accuracy.get(name),
-            "gradient_accuracy_vs_torch_bf16": gradient_accuracy.get(name),
+            "accuracy_vs_pytorch_bf16": accuracy.get(name),
+            "gradient_accuracy_vs_pytorch_bf16": gradient_accuracy.get(name),
         }
     valid = (
-        canary_drift <= 0.05
+        initial_to_repeat_median_deviation <= 0.05
         and transport["health_valid"]
         and all(result["timing"]["health_valid"] for result in results.values())
     )
     useful_transport_bytes = [
-        (route.send_rows + recv_rows) * 2 * global_spec.hidden + route.send_rows * 4
-        for recv_rows in recv_rows_all
+        (route.send_assignment_count + received_count) * 2 * global_spec.hidden
+        + route.send_assignment_count * 4
+        for received_count in received_assignments_by_rank
     ]
     padded_transport_bytes = route.peer_capacity * world * (4 * global_spec.hidden + 4)
     payload = {
@@ -579,11 +586,11 @@ def _run_case(case, backend_names, warmup, iterations, stabilize_ms, rank, world
         "local_experts": local_experts,
         "tokens_per_rank": case.tokens_per_rank,
         "global_input_tokens": case.tokens_per_rank * world,
-        "routed_rows_per_source_rank": route.send_rows,
-        "recv_rows_by_rank": recv_rows_all,
+        "token_expert_assignments_per_source_rank": route.send_assignment_count,
+        "received_token_expert_assignments_by_rank": received_assignments_by_rank,
         "forward_transport": {
             "collective": "capacity-padded NCCL all_to_all_single",
-            "peer_capacity_rows": route.peer_capacity,
+            "peer_capacity_assignments": route.peer_capacity,
             "useful_bytes_by_rank": useful_transport_bytes,
             "padded_bytes_per_rank": padded_transport_bytes,
             "padding_overhead_vs_global_mean": (
@@ -592,13 +599,13 @@ def _run_case(case, backend_names, warmup, iterations, stabilize_ms, rank, world
             "timing": transport,
         },
         "backends": results,
-        "native_vs_te_accuracy": pairwise_accuracy,
+        "lightmoe_vs_transformer_engine_accuracy": pairwise_accuracy,
         "backend_errors": errors,
-        "canary": {
+        "repeat": {
             "backend": first,
-            "event_ms_p50": canary["event_ms_p50"],
-            "drift": canary_drift,
-            "drift_valid": canary_drift <= 0.05,
+            "event_ms_p50": repeat["event_ms_p50"],
+            "initial_to_repeat_median_deviation": initial_to_repeat_median_deviation,
+            "repeat_deviation_valid": initial_to_repeat_median_deviation <= 0.05,
         },
         "valid": valid,
     }
@@ -627,7 +634,10 @@ def _environment(rank, world):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", action="append", type=parse_case, required=True)
-    parser.add_argument("--backends", default="native,te_nvfp4_fused,torch_bf16")
+    parser.add_argument(
+        "--backends",
+        default="lightmoe,transformer_engine_nvfp4_fused,pytorch_bf16",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--stabilize-ms", type=float, default=1000)
@@ -649,7 +659,7 @@ def main(argv=None):
                     "event": "distributed_ep_contract",
                     "timed": (
                         "cached route gather, NCCL dispatch, local expert layer, reverse NCCL "
-                        "dispatch, probability weighting, combine"
+                        "dispatch, routing-weight application, combine"
                     ),
                     "excluded": "router logits, top-k selection, optimizer, weight refresh",
                     "latency": "maximum rank CUDA-event time",

@@ -12,9 +12,9 @@ from dataclasses import dataclass
 
 import torch
 
-from nvfp4moe.gemm import DenseGemm, GroupedGemm, quantize, quantize_grouped
-from nvfp4moe.kernels.dense_gemm import DenseNvfp4Gemm
-from nvfp4moe.kernels.gemm import GroupedNvfp4Gemm
+from lightmoe.gemm import DenseGemm, GroupedGemm, quantize, quantize_grouped
+from lightmoe.kernels.dense.runtime import DenseNvfp4Gemm
+from lightmoe.kernels.grouped.runtime import GroupedNvfp4Gemm
 
 try:
     from .model_shapes import routing_counts
@@ -36,11 +36,41 @@ class Case:
 
 
 CASES = (
-    Case("qwen3-30b-fc2-dense", "dense", 8192, 2048, 768, 256, 256),
-    Case("deepseek-v3-fc1-dense", "dense", 8192, 4096, 7168, 256, 256),
-    Case("qwen3-30b-fc2-grouped-jagged", "grouped", 65536, 2048, 768, 256, 256, 8, "jagged"),
-    Case("deepseek-v3-fc2-grouped-jagged", "grouped", 65536, 7168, 2048, 256, 256, 8, "jagged"),
-    Case("deepseek-v3-fc2-grouped-empty", "grouped", 65536, 7168, 2048, 256, 256, 8, "tail"),
+    Case("qwen3-30b-down-dense", "dense", 8192, 2048, 768, 256, 256),
+    Case("deepseek-v3-gate-up-dense", "dense", 8192, 4096, 7168, 256, 256),
+    Case(
+        "qwen3-30b-down-grouped-imbalanced",
+        "grouped",
+        65536,
+        2048,
+        768,
+        256,
+        256,
+        8,
+        "imbalanced",
+    ),
+    Case(
+        "deepseek-v3-down-grouped-imbalanced",
+        "grouped",
+        65536,
+        7168,
+        2048,
+        256,
+        256,
+        8,
+        "imbalanced",
+    ),
+    Case(
+        "deepseek-v3-down-grouped-alignment-stress",
+        "grouped",
+        65536,
+        7168,
+        2048,
+        256,
+        256,
+        8,
+        "alignment_stress",
+    ),
 )
 
 
@@ -118,7 +148,7 @@ def _measure(
     return results, wall_ms / total_gpu_ms
 
 
-def _canary(
+def _repeat_measurement(
     function: Callable[[], object],
     iterations: int,
     stabilize_ms: float,
@@ -160,15 +190,19 @@ def _finish(
     bitwise_equal = bool(torch.equal(direct_output, output))
     direct_ms = timing["direct"]["event_ms_p50"]
     public_ms = timing["public"]["event_ms_p50"]
-    canary_ms = _canary(
+    repeat_ms = _repeat_measurement(
         functions["direct"],
         max(10, iterations // 2),
         stabilize_ms,
         repeats,
     )
-    canary_drift = canary_ms / direct_ms - 1.0
+    initial_to_repeat_median_deviation = repeat_ms / direct_ms - 1.0
     event_regression = public_ms / direct_ms - 1.0
-    valid = health_ratio <= 1.5 and abs(canary_drift) <= 0.05 and event_regression <= 0.02
+    valid = (
+        health_ratio <= 1.5
+        and abs(initial_to_repeat_median_deviation) <= 0.05
+        and event_regression <= 0.02
+    )
     return {
         "event": "api_overhead",
         "case": case.__dict__,
@@ -178,9 +212,9 @@ def _finish(
         "submit_regression": (
             timing["public"]["submit_us_p50"] / timing["direct"]["submit_us_p50"] - 1.0
         ),
-        "canary_ms": canary_ms,
-        "canary_drift": canary_drift,
-        "wall_over_gpu": health_ratio,
+        "repeat_ms": repeat_ms,
+        "initial_to_repeat_median_deviation": initial_to_repeat_median_deviation,
+        "host_wall_to_cuda_event_ratio": health_ratio,
         "calls_per_sample": repeats,
         "bitwise_equal": bitwise_equal,
         "valid": valid and bitwise_equal,
@@ -332,8 +366,12 @@ def main(argv: list[str] | None = None) -> int:
                 "event": "api_overhead_summary",
                 "valid": valid,
                 "max_event_regression": max(result["event_regression"] for result in results),
-                "max_abs_canary_drift": max(abs(result["canary_drift"]) for result in results),
-                "max_wall_over_gpu": max(result["wall_over_gpu"] for result in results),
+                "max_abs_initial_to_repeat_median_deviation": max(
+                    abs(result["initial_to_repeat_median_deviation"]) for result in results
+                ),
+                "max_host_wall_to_cuda_event_ratio": max(
+                    result["host_wall_to_cuda_event_ratio"] for result in results
+                ),
             }
         ),
         flush=True,

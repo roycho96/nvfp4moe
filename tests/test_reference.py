@@ -2,7 +2,7 @@
 
 import torch
 
-import nvfp4moe.reference as ref
+from benchmarks import reference as ref
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -56,9 +56,9 @@ def test_fused_reference_layout_consistency():
     torch.manual_seed(3)
     tokens, hidden, experts, topk = 512, 256, 4, 2
     x = torch.randn(tokens, hidden, device=DEVICE, dtype=torch.bfloat16)
-    routed_rows = tokens * topk
-    gather = torch.randint(0, tokens, (routed_rows,), device=DEVICE, dtype=torch.int32)
-    counts = torch.tensor([routed_rows // experts] * experts, dtype=torch.int32)
+    num_assignments = tokens * topk
+    gather = torch.randint(0, tokens, (num_assignments,), device=DEVICE, dtype=torch.int32)
+    counts = torch.tensor([num_assignments // experts] * experts, dtype=torch.int32)
     cu = torch.cat((torch.zeros(1, dtype=torch.int32), counts.cumsum(0).to(torch.int32)))
     scale = ref.per_tensor_scale_from_amax(x.abs().max())
 

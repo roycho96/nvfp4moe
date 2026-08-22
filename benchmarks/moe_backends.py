@@ -30,7 +30,7 @@ def _pad_weights(gate_up: torch.Tensor, down: torch.Tensor, padded_i: int):
 
 
 def _interleave_gate_up(gate_up: torch.Tensor) -> torch.Tensor:
-    """[gate block; up block] -> [g0,u0,g1,u1,...] used by nvfp4moe."""
+    """[gate block; up block] -> [g0,u0,g1,u1,...] used by LightMoE."""
     gate, up = gate_up.chunk(2, dim=1)
     return torch.stack((gate, up), dim=2).flatten(1, 2).contiguous()
 
@@ -96,8 +96,8 @@ class BackendInfo:
     includes_dispatch: bool = True
 
 
-class Nvfp4MoeExpert(nn.Module):
-    info = BackendInfo("nvfp4moe", "NVFP4 x NVFP4", True)
+class LightMoEExpert(nn.Module):
+    info = BackendInfo("lightmoe", "NVFP4 x NVFP4", True)
 
     def __init__(
         self,
@@ -107,7 +107,7 @@ class Nvfp4MoeExpert(nn.Module):
         use_dynamic_sched=True,
     ):
         super().__init__()
-        from nvfp4moe import MoEDispatch, MoEExpertLayer
+        from lightmoe import MoEDispatch, MoEExpertLayer
 
         i_pad = spec.padded_intermediate
         gate_up, down = _pad_weights(trace["gate_up_weight"], trace["down_weight"], i_pad)
@@ -152,8 +152,8 @@ class TEExpert(nn.Module):
         from transformer_engine.common import recipe as te_recipe
 
         self.info = BackendInfo(
-            "te_nvfp4_2x64" if nvfp4 else "te_bf16",
-            "TE NVFP4" if nvfp4 else "BF16",
+            "transformer_engine_nvfp4_2x64" if nvfp4 else "transformer_engine_bf16",
+            "Transformer Engine NVFP4" if nvfp4 else "Transformer Engine BF16",
             True,
         )
         gate_up, down = _pad_weights(
@@ -166,9 +166,8 @@ class TEExpert(nn.Module):
         self.nvfp4 = nvfp4
         self.align = 64 if nvfp4 else 16
         self.recipe = te_recipe.NVFP4BlockScaling() if nvfp4 else None
-        # TE 2.17's NVFP4 grouped RHT kernel accepts at most 64 tensors per
-        # launch. Preserve the real E=128 model by using two grouped launches,
-        # not by shrinking the checkpoint geometry.
+        # Transformer Engine 2.17 accepts at most 64 tensors per grouped launch.
+        # Split larger checkpoints across launches without changing geometry.
         self.group_width = 64 if nvfp4 else spec.experts
         group_sizes = [
             min(self.group_width, spec.experts - start)
@@ -226,7 +225,7 @@ class TEExpert(nn.Module):
             outputs.append(self._gl(module, x[row_start:row_end], local_splits))
             row_start = row_end
         if row_start != x.shape[0]:
-            raise RuntimeError("TE grouped shard rows do not cover permuted input")
+            raise RuntimeError("Transformer Engine shards do not cover the permuted input")
         return torch.cat(outputs, dim=0)
 
     def forward(self, x, topi, topv, step=0):
@@ -271,12 +270,16 @@ class TEExpert(nn.Module):
 
 
 class TEFusedExpert(nn.Module):
-    info = BackendInfo("te_nvfp4_fused", "TE fused NVFP4", True)
+    info = BackendInfo(
+        "transformer_engine_nvfp4_fused",
+        "Transformer Engine fused NVFP4",
+        True,
+    )
 
     def __init__(self, spec, trace):
         super().__init__()
         if spec.activation != "swiglu":
-            raise ValueError("TE fused NVFP4 benchmark currently supports SwiGLU")
+            raise ValueError("Transformer Engine fused NVFP4 currently supports SwiGLU")
         import transformer_engine.pytorch as te
         import transformer_engine.pytorch.ops as te_ops
         from transformer_engine.common.recipe import NVFP4BlockScaling
@@ -452,9 +455,9 @@ class _DeepGEMMTrainFn(torch.autograd.Function):
 
 
 class TEDeepGEMMTrainExpert(nn.Module):
-    """TE permutation/finalize + DeepGEMM fwd, dgrad and wgrad."""
+    """Transformer Engine permutation/finalize with DeepGEMM training kernels."""
 
-    info = BackendInfo("te_deepgemm_bf16", "BF16", True)
+    info = BackendInfo("transformer_engine_deepgemm_bf16", "BF16", True)
 
     def __init__(self, spec, trace):
         super().__init__()
@@ -548,9 +551,9 @@ def _dg_m_fp8_fp4(a, b, m_indices):
 
 
 class TEDeepGEMMFP8FP4Expert(nn.Module):
-    """TE dispatch plus grouped DeepGEMM FP8xFP4 forward."""
+    """Transformer Engine dispatch with grouped DeepGEMM FP8xFP4 forward."""
 
-    info = BackendInfo("te_deepgemm_fp8_fp4", "FP8 x FP4", False)
+    info = BackendInfo("transformer_engine_deepgemm_fp8_fp4", "FP8 x FP4", False)
 
     def __init__(self, spec, trace):
         super().__init__()
@@ -603,7 +606,7 @@ class TEDeepGEMMFP8FP4Expert(nn.Module):
 
 __all__ = [
     "BackendInfo",
-    "Nvfp4MoeExpert",
+    "LightMoEExpert",
     "TEDeepGEMMFP8FP4Expert",
     "TEDeepGEMMTrainExpert",
     "TEExpert",

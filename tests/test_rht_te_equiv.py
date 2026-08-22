@@ -34,13 +34,13 @@ def main():
 
     print(f"TE version: {te.__version__}")
 
-    import nvfp4moe.reference as nref
-    from nvfp4moe.kernels.quantize import (
+    from benchmarks import reference as nref
+    from lightmoe._quantization import TensorScale
+    from lightmoe.kernels.quantize import (
         nvfp4_quantize_colwise,
         nvfp4_quantize_rowwise,
         nvfp4_rht_amax,
     )
-    from nvfp4moe.recipe import TensorScale
 
     torch.manual_seed(0)
     M, F = 4096, 2048  # single segment, M % 128 == 0 (no padding ambiguity)

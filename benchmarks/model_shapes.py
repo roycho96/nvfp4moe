@@ -7,8 +7,8 @@ from dataclasses import dataclass
 
 QUICK_TOKENS = (128, 8192)
 FULL_TOKENS = (1, 128, 512, 2048, 8192, 16384)
-QUICK_ROUTINGS = ("balanced", "jagged")
-FULL_ROUTINGS = ("balanced", "jagged", "hotspot", "tail")
+QUICK_ROUTINGS = ("balanced", "imbalanced")
+FULL_ROUTINGS = ("balanced", "imbalanced", "single_expert_skew", "alignment_stress")
 
 
 @dataclass(frozen=True)
@@ -41,9 +41,9 @@ class ModelShape:
 
     def gemm_shape(self, projection: str) -> tuple[int, int]:
         """Return (N, K) for B[E, N, K] in the grouped GEMM convention."""
-        if projection == "fc1":
+        if projection == "gate_up":
             return 2 * self.padded_intermediate, self.hidden
-        if projection == "fc2":
+        if projection == "down":
             return self.hidden, self.padded_intermediate
         raise ValueError(f"unknown projection {projection!r}")
 
@@ -138,7 +138,7 @@ class GemmCase:
     model: str
     projection: str
     tokens: int
-    routed_rows: int
+    token_expert_assignments: int
     global_experts: int
     local_experts: int
     ep_size: int
@@ -149,13 +149,14 @@ class GemmCase:
 
     @property
     def flops(self) -> int:
-        return 2 * self.routed_rows * self.n * self.k
+        return 2 * self.token_expert_assignments * self.n * self.k
 
     @property
     def label(self) -> str:
         return (
-            f"{self.model}:{self.projection}:t{self.tokens}:ep{self.ep_size}:"
-            f"m{self.routed_rows}:e{self.local_experts}:{self.routing}"
+            f"{self.model}:projection={self.projection}:input_tokens={self.tokens}:"
+            f"ep_size={self.ep_size}:assignments={self.token_expert_assignments}:"
+            f"local_experts={self.local_experts}:routing={self.routing}"
         )
 
 
@@ -163,7 +164,7 @@ class GemmCase:
 class MoeCase:
     model: str
     tokens: int
-    routed_rows: int
+    token_expert_assignments: int
     global_experts: int
     local_experts: int
     ep_size: int
@@ -177,8 +178,9 @@ class MoeCase:
     @property
     def label(self) -> str:
         return (
-            f"{self.model}:t{self.tokens}:ep{self.ep_size}:m{self.routed_rows}:"
-            f"e{self.local_experts}:{self.source}:{self.routing}"
+            f"{self.model}:input_tokens={self.tokens}:ep_size={self.ep_size}:"
+            f"assignments={self.token_expert_assignments}:local_experts={self.local_experts}:"
+            f"source={self.source}:routing={self.routing}"
         )
 
 
@@ -235,7 +237,7 @@ def generate_gemm_cases(
     tokens: Iterable[int],
     suite: str,
     routings: Iterable[str] | None = None,
-    projections: Iterable[str] = ("fc1", "fc2"),
+    projections: Iterable[str] = ("gate_up", "down"),
 ) -> list[GemmCase]:
     routing_grid = tuple(routings or (QUICK_ROUTINGS if suite == "quick" else FULL_ROUTINGS))
     rows = []
@@ -244,7 +246,7 @@ def generate_gemm_cases(
         for ep_size in _ep_grid(spec, suite):
             local_experts = spec.local_experts(ep_size)
             for token_count in tokens:
-                routed_rows = token_count * spec.topk
+                token_expert_assignments = token_count * spec.topk
                 for projection in projections:
                     n, k = spec.gemm_shape(projection)
                     for routing in routing_grid:
@@ -253,7 +255,7 @@ def generate_gemm_cases(
                                 key,
                                 projection,
                                 token_count,
-                                routed_rows,
+                                token_expert_assignments,
                                 spec.experts,
                                 local_experts,
                                 ep_size,
@@ -310,17 +312,17 @@ def generate_moe_cases(
     return rows
 
 
-def routing_counts(rows: int, experts: int, routing: str) -> tuple[int, ...]:
-    """Build deterministic expert counts while preserving exactly ``rows``."""
-    if rows < 0 or experts <= 0:
-        raise ValueError("rows must be non-negative and experts must be positive")
+def routing_counts(assignments: int, experts: int, routing: str) -> tuple[int, ...]:
+    """Build deterministic expert loads for a fixed assignment count."""
+    if assignments < 0 or experts <= 0:
+        raise ValueError("assignments must be non-negative and experts must be positive")
     if routing == "balanced":
         weights = [1] * experts
-    elif routing == "jagged":
+    elif routing == "imbalanced":
         weights = [1 + ((expert * 17 + 11) % 31) for expert in range(experts)]
-    elif routing == "hotspot":
+    elif routing == "single_expert_skew":
         weights = [max(1, experts // 2)] + [1] * (experts - 1)
-    elif routing == "tail":
+    elif routing == "alignment_stress":
         edge = (1, 15, 16, 127, 128, 129, 255, 256, 257)
         weights = [edge[expert % len(edge)] for expert in range(experts)]
         if experts > 1:
@@ -328,11 +330,11 @@ def routing_counts(rows: int, experts: int, routing: str) -> tuple[int, ...]:
     else:
         raise ValueError(f"unknown routing {routing!r}")
     total_weight = sum(weights)
-    counts = [rows * weight // total_weight for weight in weights]
-    remainder = rows - sum(counts)
+    counts = [assignments * weight // total_weight for weight in weights]
+    remainder = assignments - sum(counts)
     order = sorted(
         range(experts),
-        key=lambda expert: (rows * weights[expert]) % total_weight,
+        key=lambda expert: (assignments * weights[expert]) % total_weight,
         reverse=True,
     )
     for expert in order[:remainder]:

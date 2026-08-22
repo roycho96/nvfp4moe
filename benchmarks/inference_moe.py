@@ -31,7 +31,7 @@ def _routing(tokens: int, experts: int, topk: int, kind: str):
     positions = torch.arange(tokens * topk, dtype=torch.int64).view(tokens, topk)
     if kind == "balanced":
         ids = positions.remainder(experts)
-    elif kind == "hotspot":
+    elif kind == "single_expert_skew":
         ids = torch.empty(tokens, topk, dtype=torch.int64)
         ids[:, 0] = 0
         ids[:, 1:] = 1 + torch.arange(tokens * (topk - 1)).view(tokens, topk - 1).remainder(
@@ -42,7 +42,7 @@ def _routing(tokens: int, experts: int, topk: int, kind: str):
             raise ValueError("empty routing requires top-k smaller than the expert count")
         ids = positions.remainder(experts - 1)
     else:
-        raise ValueError("routing must be balanced, hotspot, or empty")
+        raise ValueError("routing must be balanced, single_expert_skew, or empty")
     ids = ids.to(device="cuda", dtype=torch.int32)
     weights = torch.rand(tokens, topk, generator=generator, dtype=torch.float32)
     weights.div_(weights.sum(dim=1, keepdim=True))
@@ -140,7 +140,7 @@ def _summary(values, walls):
             "iqr_ms": q75 - q25,
             "p10_ms": ordered[int(0.10 * (len(ordered) - 1))],
             "p90_ms": ordered[int(0.90 * (len(ordered) - 1))],
-            "wall_to_event": sum(walls[name]) / sum(samples),
+            "host_wall_to_cuda_event_ratio": sum(walls[name]) / sum(samples),
         }
     return records
 
@@ -149,7 +149,7 @@ def _summary(values, walls):
 def run_case(case: Case, warmup: int, iterations: int, stabilize_ms: int):
     from flashinfer import cute_dsl_fused_moe_nvfp4
 
-    from nvfp4moe import InferenceMoE
+    from lightmoe import InferenceMoE
 
     spec = MODEL_SHAPES[case.model]
     if spec.activation != "swiglu":
@@ -157,7 +157,7 @@ def run_case(case: Case, warmup: int, iterations: int, stabilize_ms: int):
             "event": "inference_moe",
             "case": asdict(case),
             "status": "skipped",
-            "reason": "FlashInfer 0.6.17 CuTeDSL fused MoE does not support GeGLU",
+            "reason": "FlashInfer 0.6.17 CuTe DSL fused MoE does not support GeGLU",
         }
         print(json.dumps(result, sort_keys=True), flush=True)
         return result
@@ -175,7 +175,7 @@ def run_case(case: Case, warmup: int, iterations: int, stabilize_ms: int):
     down = (torch.randn(experts, hidden, intermediate, device="cuda") / 10).to(torch.bfloat16)
     topk_ids, topk_weights = _routing(case.tokens, experts, topk, case.routing)
 
-    native = InferenceMoE(
+    lightmoe_plan = InferenceMoE(
         hidden,
         intermediate,
         experts,
@@ -183,34 +183,36 @@ def run_case(case: Case, warmup: int, iterations: int, stabilize_ms: int):
         case.tokens,
         activation=spec.activation,
     )
-    native.load_weights(gate, up, down)
-    native.calibrate(x, topk_ids, topk_weights)
-    native.warmup(x, topk_ids, topk_weights)
+    lightmoe_plan.load_weights(gate, up, down)
+    lightmoe_plan.calibrate(x, topk_ids, topk_weights)
+    lightmoe_plan.warmup(x, topk_ids, topk_weights)
 
     # FlashInfer stores the linear branch before the gate branch.
-    fi_w1 = torch.cat((up, gate), dim=1)
-    fi_weights = _prepare_flashinfer_weights(fi_w1, down, experts, hidden, intermediate)
-    fi_input_scale = torch.ones(1, dtype=torch.float32, device="cuda")
-    fi_x, fi_x_sf = _quantize_flashinfer(x, fi_input_scale)
-    fi_out = torch.empty_like(x)
+    flashinfer_w1 = torch.cat((up, gate), dim=1)
+    flashinfer_weights = _prepare_flashinfer_weights(
+        flashinfer_w1, down, experts, hidden, intermediate
+    )
+    flashinfer_input_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    flashinfer_x, flashinfer_x_sf = _quantize_flashinfer(x, flashinfer_input_scale)
+    flashinfer_out = torch.empty_like(x)
 
     def flashinfer_prepacked():
         return cute_dsl_fused_moe_nvfp4(
-            x=fi_x,
-            x_sf=fi_x_sf,
+            x=flashinfer_x,
+            x_sf=flashinfer_x_sf,
             token_selected_experts=topk_ids,
             token_final_scales=topk_weights,
             num_experts=experts,
             top_k=topk,
             num_local_experts=experts,
-            moe_output=fi_out,
+            moe_output=flashinfer_out,
             use_fused_finalize=True,
             enable_pdl=True,
-            **fi_weights,
+            **flashinfer_weights,
         )
 
     def flashinfer_dynamic():
-        q, sf = _quantize_flashinfer(x, fi_input_scale)
+        q, sf = _quantize_flashinfer(x, flashinfer_input_scale)
         return cute_dsl_fused_moe_nvfp4(
             x=q,
             x_sf=sf,
@@ -219,55 +221,60 @@ def run_case(case: Case, warmup: int, iterations: int, stabilize_ms: int):
             num_experts=experts,
             top_k=topk,
             num_local_experts=experts,
-            moe_output=fi_out,
+            moe_output=flashinfer_out,
             use_fused_finalize=True,
             enable_pdl=True,
-            **fi_weights,
+            **flashinfer_weights,
         )
 
     flashinfer_prepacked()
     flashinfer_dynamic()
     torch.cuda.synchronize()
-    if not torch.isfinite(native.output[: case.tokens]).all() or not torch.isfinite(fi_out).all():
+    if (
+        not torch.isfinite(lightmoe_plan.output[: case.tokens]).all()
+        or not torch.isfinite(flashinfer_out).all()
+    ):
         raise RuntimeError("non-finite output")
 
     arms = {
-        "native_bf16_input": lambda: native(x, topk_ids, topk_weights),
+        "lightmoe_bf16_input": lambda: lightmoe_plan(x, topk_ids, topk_weights),
         "flashinfer_bf16_input": flashinfer_dynamic,
         "flashinfer_prequantized_input": flashinfer_prepacked,
     }
     telemetry = _prepare(arms, warmup, stabilize_ms)
-    canary_iterations = max(5, iterations // 2)
-    pre_values, pre_walls = _samples(
-        {"native_bf16_input": arms["native_bf16_input"]}, canary_iterations
+    repeat_iterations = max(5, iterations // 2)
+    initial_values, initial_walls = _samples(
+        {"lightmoe_bf16_input": arms["lightmoe_bf16_input"]}, repeat_iterations
     )
-    pre_canary = _summary(pre_values, pre_walls)["native_bf16_input"]
+    initial = _summary(initial_values, initial_walls)["lightmoe_bf16_input"]
     values, walls = _samples(arms, iterations)
     timing = _summary(values, walls)
 
-    post_values, post_walls = _samples(
-        {"native_bf16_input": arms["native_bf16_input"]}, canary_iterations
+    repeat_values, repeat_walls = _samples(
+        {"lightmoe_bf16_input": arms["lightmoe_bf16_input"]}, repeat_iterations
     )
-    post_canary = _summary(post_values, post_walls)["native_bf16_input"]
-    drift = abs(post_canary["p50_ms"] / pre_canary["p50_ms"] - 1)
-    valid = drift <= 0.05 and all(item["wall_to_event"] <= 1.5 for item in timing.values())
+    repeat = _summary(repeat_values, repeat_walls)["lightmoe_bf16_input"]
+    initial_to_repeat_median_deviation = abs(repeat["p50_ms"] / initial["p50_ms"] - 1)
+    valid = initial_to_repeat_median_deviation <= 0.05 and all(
+        item["host_wall_to_cuda_event_ratio"] <= 1.5 for item in timing.values()
+    )
     result = {
         "event": "inference_moe",
         "case": asdict(case),
         "shape": {
             "hidden": hidden,
             "intermediate": intermediate,
-            "topk": topk,
-            "routed_rows": case.tokens * topk,
+            "top_k": topk,
+            "token_expert_assignments": case.tokens * topk,
         },
         "timing": timing,
-        "native_pre_canary_ms": pre_canary["p50_ms"],
-        "native_post_canary_ms": post_canary["p50_ms"],
-        "native_canary_drift": drift,
+        "lightmoe_initial_p50_ms": initial["p50_ms"],
+        "lightmoe_repeat_p50_ms": repeat["p50_ms"],
+        "initial_to_repeat_median_deviation": initial_to_repeat_median_deviation,
         "valid": valid,
         "gpu": torch.cuda.get_device_name(),
         "gpu_telemetry": telemetry,
-        "torch": torch.__version__,
+        "pytorch": torch.__version__,
     }
     print(json.dumps(result, sort_keys=True), flush=True)
     return result

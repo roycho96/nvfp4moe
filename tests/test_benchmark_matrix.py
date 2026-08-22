@@ -3,7 +3,7 @@ import json
 import pytest
 import torch
 
-from benchmarks import nvfp4_gemm, nvfp4_moe
+from benchmarks import moe, nvfp4_gemm
 from benchmarks.distributed_ep import _global_assignments, parse_case
 from benchmarks.model_shapes import (
     FULL_ROUTINGS,
@@ -45,8 +45,8 @@ def test_model_registry_contains_release_matrix():
 @pytest.mark.parametrize("key", MODEL_SHAPES)
 def test_projection_shapes_and_ep_math(key):
     spec = MODEL_SHAPES[key]
-    assert spec.gemm_shape("fc1") == (2 * spec.padded_intermediate, spec.hidden)
-    assert spec.gemm_shape("fc2") == (spec.hidden, spec.padded_intermediate)
+    assert spec.gemm_shape("gate_up") == (2 * spec.padded_intermediate, spec.hidden)
+    assert spec.gemm_shape("down") == (spec.hidden, spec.padded_intermediate)
     for ep in spec.ep_sizes:
         assert spec.local_experts(ep) * ep == spec.experts
 
@@ -55,16 +55,19 @@ def test_quick_and_full_gemm_case_grids():
     quick = generate_gemm_cases(("qwen3_30b_a3b",), QUICK_TOKENS, "quick", QUICK_ROUTINGS)
     assert len(quick) == 1 * 2 * 2 * 2
     assert {case.local_experts for case in quick} == {8}
-    assert {case.routed_rows for case in quick} == {1024, 65536}
-    assert {case.projection for case in quick} == {"fc1", "fc2"}
+    assert {case.token_expert_assignments for case in quick} == {1024, 65536}
+    assert {case.projection for case in quick} == {"gate_up", "down"}
 
     full = generate_gemm_cases(("qwen3_30b_a3b",), FULL_TOKENS, "full", FULL_ROUTINGS)
     assert len(full) == 4 * 6 * 2 * 4
     assert {case.ep_size for case in full} == {1, 8, 16, 32}
-    assert all(case.flops == 2 * case.routed_rows * case.n * case.k for case in full)
+    assert all(case.flops == 2 * case.token_expert_assignments * case.n * case.k for case in full)
 
 
-@pytest.mark.parametrize("routing", ("balanced", "jagged", "hotspot", "tail"))
+@pytest.mark.parametrize(
+    "routing",
+    ("balanced", "imbalanced", "single_expert_skew", "alignment_stress"),
+)
 @pytest.mark.parametrize("rows,experts", ((0, 8), (7, 8), (1024, 8), (65536, 128)))
 def test_routing_counts_preserve_rows(rows, experts, routing):
     counts = routing_counts(rows, experts, routing)
@@ -79,7 +82,7 @@ def test_moe_matrix_distinguishes_synthetic_and_trace_sources():
     assert len(synthetic) == 1
     assert synthetic[0].ep_size == 8
     assert synthetic[0].local_experts == 32
-    assert synthetic[0].routed_rows == 65536
+    assert synthetic[0].token_expert_assignments == 65536
 
     replay = generate_moe_cases(("deepseek_v3_2",), (8192,), "quick", ("balanced",), "trace")
     assert len(replay) == 1
@@ -107,19 +110,19 @@ def test_gemm_list_is_cpu_safe(monkeypatch, capsys):
             "--routing",
             "balanced",
             "--projections",
-            "fc2",
+            "down",
         ]
     )
     payload = json.loads(capsys.readouterr().out)
     assert result == 0
     assert payload["benchmark"] == "standalone_nvfp4_grouped_gemm"
     assert payload["case_count"] == 1
-    assert payload["cases"][0]["routed_rows"] == 65536
+    assert payload["cases"][0]["token_expert_assignments"] == 65536
     assert payload["cases"][0]["logical_flops"] == 2 * 65536 * 2048 * 768
-    assert payload["cases"][0]["expert_row_counts"] == [8192] * 8
+    assert payload["cases"][0]["expert_assignment_counts"] == [8192] * 8
     assert payload["cases"][0]["routing_statistics"]["coefficient_of_variation"] == 0.0
     assert payload["definitions"]["prepacked"].startswith("resident NVFP4")
-    assert payload["definitions"]["logical_flops"].startswith("2*routed_rows")
+    assert payload["definitions"]["logical_flops"].startswith("2*token_expert_assignments")
 
 
 def test_dense_gemm_list_is_cpu_safe(capsys):
@@ -133,7 +136,7 @@ def test_dense_gemm_list_is_cpu_safe(capsys):
             "--tokens",
             "128,8192",
             "--projections",
-            "fc2",
+            "down",
         ]
     )
     payload = json.loads(capsys.readouterr().out)
@@ -146,7 +149,7 @@ def test_dense_gemm_list_is_cpu_safe(capsys):
     assert payload["cases"][1]["logical_flops"] == 2 * 8192 * 2048 * 768
 
 
-def test_jagged_definition_and_statistics_are_reproducible(monkeypatch):
+def test_imbalanced_definition_and_statistics_are_reproducible(monkeypatch):
     monkeypatch.setattr(nvfp4_gemm, "detect_backends", dict)
     args = nvfp4_gemm.build_parser().parse_args(
         [
@@ -156,17 +159,26 @@ def test_jagged_definition_and_statistics_are_reproducible(monkeypatch):
             "--tokens",
             "8192",
             "--routing",
-            "jagged",
+            "imbalanced",
             "--projections",
-            "fc1",
+            "gate_up",
         ]
     )
     payload = nvfp4_gemm.listing_payload(args)
     case = payload["cases"][0]
-    assert case["expert_row_counts"] == (7350, 17762, 9187, 613, 11025, 2450, 12862, 4287)
-    assert case["routing_statistics"]["min_rows"] == 613
-    assert case["routing_statistics"]["max_rows"] == 17762
-    assert case["routing_statistics"]["empty_experts"] == 0
+    assert case["expert_assignment_counts"] == (
+        7350,
+        17762,
+        9187,
+        613,
+        11025,
+        2450,
+        12862,
+        4287,
+    )
+    assert case["routing_statistics"]["min_assignments"] == 613
+    assert case["routing_statistics"]["max_assignments"] == 17762
+    assert case["routing_statistics"]["zero_assignment_experts"] == 0
     assert case["routing_statistics"]["coefficient_of_variation"] == pytest.approx(
         0.6527901966326125
     )
@@ -206,8 +218,8 @@ def test_tile_rounded_flops_exposes_padding_work():
 
 
 def test_moe_list_is_cpu_safe(monkeypatch, capsys):
-    monkeypatch.setattr(nvfp4_moe, "detect_backends", dict)
-    result = nvfp4_moe.main(
+    monkeypatch.setattr(moe, "detect_backends", dict)
+    result = moe.main(
         [
             "--list",
             "--models",
@@ -215,39 +227,42 @@ def test_moe_list_is_cpu_safe(monkeypatch, capsys):
             "--tokens",
             "8192",
             "--routing",
-            "jagged",
+            "imbalanced",
             "--source",
             "trace",
         ]
     )
     payload = json.loads(capsys.readouterr().out)
     assert result == 0
-    assert payload["benchmark"] == "nvfp4_moe_layer"
+    assert payload["benchmark"] == "lightmoe_layer"
     assert payload["case_count"] == 1
     assert payload["cases"][0]["source"] == "trace"
     assert payload["boundaries"]["excluded"] == "router logits and top-k selection"
 
 
 def test_trace_listing_defaults_to_primary_8192_shape(monkeypatch):
-    monkeypatch.setattr(nvfp4_moe, "detect_backends", dict)
-    args = nvfp4_moe.build_parser().parse_args(
-        ["--list", "--models", "kimi_k2_7", "--source", "trace"]
-    )
-    payload = nvfp4_moe.listing_payload(args)
+    monkeypatch.setattr(moe, "detect_backends", dict)
+    args = moe.build_parser().parse_args(["--list", "--models", "kimi_k2_7", "--source", "trace"])
+    payload = moe.listing_payload(args)
     assert payload["case_count"] == 1
     assert payload["cases"][0]["tokens"] == 8192
     assert payload["cases"][0]["routing"] == "captured"
 
 
 def test_distributed_case_names_batch_and_sequence_explicitly():
-    case = parse_case("qwen3_30b_a3b:2:4096:jagged:fwd_bwd")
+    case = parse_case("qwen3_30b_a3b:2:4096:imbalanced:fwd_bwd")
     assert case.batch_per_rank == 2
     assert case.sequence_length == 4096
     assert case.tokens_per_rank == 8192
-    assert case.label == "qwen3_30b_a3b:b2:s4096:jagged:fwd_bwd"
+    assert case.label == (
+        "qwen3_30b_a3b:batch_per_rank=2:sequence_length=4096:routing=imbalanced:pass=fwd_bwd"
+    )
 
 
-@pytest.mark.parametrize("routing", ("balanced", "jagged", "hotspot", "tail"))
+@pytest.mark.parametrize(
+    "routing",
+    ("balanced", "imbalanced", "single_expert_skew", "alignment_stress"),
+)
 def test_distributed_assignments_are_unique_and_seeded(routing):
     case = parse_case(f"qwen3_30b_a3b:2:64:{routing}:fwd")
     spec = MODEL_SHAPES[case.model]

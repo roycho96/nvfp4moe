@@ -9,13 +9,13 @@ def test_dual_quantize_matches_separate(rounding):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 10:
         pytest.skip("SM100 is required")
 
-    from nvfp4moe.kernels.quantize import (
+    from lightmoe._quantization import TensorScale
+    from lightmoe.kernels.quantize import (
         nvfp4_quantize_colwise,
-        nvfp4_quantize_row_col,
+        nvfp4_quantize_row_colwise,
         nvfp4_quantize_rowwise,
         nvfp4_rht_amax,
     )
-    from nvfp4moe.recipe import TensorScale
 
     torch.manual_seed(20260812)
     counts = torch.tensor([300, 0, 137, 253], dtype=torch.int32, device="cuda")
@@ -66,6 +66,7 @@ def test_dual_quantize_matches_separate(rounding):
         rounding=rounding,
         seed=17,
         padded_offsets=off_pad,
+        te_math=True,
     )
     nvfp4_quantize_colwise(
         x,
@@ -74,12 +75,12 @@ def test_dual_quantize_matches_separate(rounding):
         col_q,
         col_sf,
         rounding=rounding,
-        seed=29,
+        seed=17,
         rht=True,
         amax_out=col_amax,
         padded_offsets=off_pad,
     )
-    nvfp4_quantize_row_col(
+    nvfp4_quantize_row_colwise(
         x,
         cu,
         row_scale.pair,
@@ -89,9 +90,7 @@ def test_dual_quantize_matches_separate(rounding):
         dual_col_q,
         dual_col_sf,
         rounding=rounding,
-        row_seed=17,
-        col_seed=29,
-        rht=True,
+        seed=17,
         amax_out=dual_col_amax,
         padded_offsets=off_pad,
     )

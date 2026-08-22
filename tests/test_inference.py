@@ -23,7 +23,7 @@ def _reference(x, topk_ids, topk_weights, gate, up, down):
 
 
 def test_inference_plan_is_repeatable_and_allocation_free():
-    from nvfp4moe import InferenceMoE
+    from lightmoe import InferenceMoE
 
     torch.manual_seed(20260819)
     tokens, hidden, intermediate, experts, topk = 17, 256, 128, 4, 2
@@ -80,8 +80,8 @@ def test_inference_plan_is_repeatable_and_allocation_free():
 
 
 def test_routed_and_full_paths_match():
-    from nvfp4moe import InferenceMoE
-    from nvfp4moe.kernels.finalize import moe_finalize
+    from lightmoe import InferenceMoE
+    from lightmoe.kernels.routing.combine import moe_finalize
 
     torch.manual_seed(20260820)
     tokens, hidden, intermediate, experts, topk = 8, 256, 128, 4, 2
@@ -115,7 +115,7 @@ def test_routed_and_full_paths_match():
 
 
 def test_batch_one_decode_matches_prefill():
-    from nvfp4moe import InferenceMoE
+    from lightmoe import InferenceMoE
 
     torch.manual_seed(20260822)
     hidden, intermediate, experts, topk = 256, 128, 4, 2
@@ -139,7 +139,7 @@ def test_batch_one_decode_matches_prefill():
 
 
 def test_clamped_swiglu_matches_across_decode_and_prefill():
-    from nvfp4moe import InferenceMoE
+    from lightmoe import InferenceMoE
 
     torch.manual_seed(20260824)
     tokens, hidden, intermediate, experts, topk = 8, 256, 128, 4, 2
@@ -172,9 +172,9 @@ def test_clamped_swiglu_matches_across_decode_and_prefill():
     assert not torch.equal(prefill, plain)
 
 
-@pytest.mark.parametrize("routing", ("balanced", "hotspot"))
+@pytest.mark.parametrize("routing", ("balanced", "single_expert_skew"))
 def test_fast_decode_plan_matches_prefill(routing):
-    from nvfp4moe import InferenceMoE
+    from lightmoe import InferenceMoE
 
     torch.manual_seed(20260823)
     tokens, hidden, intermediate, experts, topk = 8, 2048, 128, 16, 2
@@ -185,7 +185,7 @@ def test_fast_decode_plan_matches_prefill(routing):
     token = torch.arange(tokens, dtype=torch.int32, device="cuda")[:, None]
     route = torch.arange(topk, dtype=torch.int32, device="cuda")[None, :]
     topk_ids = ((token * topk + route) % experts).contiguous()
-    if routing == "hotspot":
+    if routing == "single_expert_skew":
         topk_ids = route.expand(tokens, -1).contiguous()
     topk_weights = torch.rand(tokens, topk, dtype=torch.float32, device="cuda")
     topk_weights /= topk_weights.sum(dim=1, keepdim=True)
@@ -202,7 +202,7 @@ def test_fast_decode_plan_matches_prefill(routing):
 
 
 def test_decode_uses_static_scheduler_by_default():
-    from nvfp4moe import InferenceMoE
+    from lightmoe import InferenceMoE
 
     default = InferenceMoE(4096, 128, 4, 2, 1)
     decode = default._new_gemm("fc1", 2, torch.float4_e2m1fn_x2, decode=True)
@@ -216,14 +216,14 @@ def test_decode_uses_static_scheduler_by_default():
 
 
 def test_swapped_fc2_is_limited_to_short_decode():
-    from nvfp4moe.inference import _use_swapped_fc2
+    from lightmoe.inference import _use_swapped_fc2
 
     assert _use_swapped_fc2(8)
     assert not _use_swapped_fc2(9)
 
 
 def test_decode_tile_rows_selects_wide_kimi_shapes():
-    from nvfp4moe.inference import _decode_tile_rows
+    from lightmoe.inference import _decode_tile_rows
 
     assert _decode_tile_rows(16, 7168, 2048, 48) == 16
     assert _decode_tile_rows(64, 7168, 2048, 48) == 32
@@ -234,7 +234,7 @@ def test_decode_tile_rows_selects_wide_kimi_shapes():
 
 @pytest.mark.parametrize("experts", (48, 128, 256))
 def test_wide_dispatch_matches_stable_sort(experts):
-    from nvfp4moe import MoEDispatch
+    from lightmoe import MoEDispatch
 
     torch.manual_seed(20260821)
     tokens, topk = 65, 8
@@ -258,8 +258,8 @@ def test_wide_dispatch_matches_stable_sort(experts):
 
 
 def test_sparse_large_dispatch_quantize():
-    from nvfp4moe.kernels.dispatch import B_MAX, moe_dispatch
-    from nvfp4moe.kernels.quantize import nvfp4_quantize_rowwise
+    from lightmoe.kernels.quantize import nvfp4_quantize_rowwise
+    from lightmoe.kernels.routing.dispatch import B_MAX, moe_dispatch
 
     tokens, hidden, experts, topk = 1024, 2048, 128, 8
     rows = tokens * topk
@@ -320,8 +320,8 @@ def test_sparse_large_dispatch_quantize():
 
 
 def test_large_inference_plans_sparse_routing():
-    from nvfp4moe import InferenceMoE
-    from nvfp4moe.inference import InferenceWorkspace
+    from lightmoe import InferenceMoE
+    from lightmoe.inference import InferenceWorkspace
 
     tokens, hidden, intermediate, experts, topk = 1024, 2048, 768, 128, 8
     active_sets = (
@@ -411,7 +411,7 @@ def test_large_inference_plans_sparse_routing():
 
 
 def test_grouped_gemm_accepts_per_expert_alpha():
-    from nvfp4moe.gemm import GroupedGemm, quantize_grouped
+    from lightmoe.gemm import GroupedGemm, quantize_grouped
 
     torch.manual_seed(20260822)
     experts, n, k = 4, 128, 256

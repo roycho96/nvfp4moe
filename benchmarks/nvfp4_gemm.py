@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
-from nvfp4moe.gemm import quantize
+from lightmoe.gemm import quantize
 
 try:
     from .model_shapes import (
@@ -47,14 +47,14 @@ except ImportError:
     )
 
 BACKEND_NAMES = (
-    "native",
+    "lightmoe",
     "flashinfer_cutedsl",
     "torch_scaled_grouped_mm",
-    "te_nvfp4",
+    "transformer_engine_nvfp4",
     "cutlass",
     "cublaslt",
 )
-DENSE_BACKEND_NAMES = ("native", "native_grouped", "cublaslt")
+DENSE_BACKEND_NAMES = ("lightmoe", "lightmoe_grouped", "cublaslt")
 DIRECTIONS = ("fwd", "dgrad", "wgrad")
 MODES = ("prepacked", "dynamic")
 B200_DENSE_FP4_PEAK_TFLOPS = 9_000.0
@@ -190,19 +190,19 @@ def detect_backends() -> dict[str, BackendStatus]:
     cuda_reason = "" if cuda_ready else "CUDA is not available"
     arch_reason = "" if blackwell else "compute capability 10.x or newer is required"
 
-    native_callable = False
-    native_reason = cuda_reason or ("" if sm100 else "native kernel requires SM100")
+    lightmoe_callable = False
+    lightmoe_reason = cuda_reason or ("" if sm100 else "LightMoE requires SM100")
     if cuda_ready and sm100:
         try:
-            module = importlib.import_module("nvfp4moe.kernels.gemm")
-            quant = importlib.import_module("nvfp4moe.kernels.quantize")
-            native_callable = callable(getattr(module, "grouped_nvfp4_gemm", None)) and callable(
+            module = importlib.import_module("lightmoe.kernels.grouped.runtime")
+            quant = importlib.import_module("lightmoe.kernels.quantize")
+            lightmoe_callable = callable(getattr(module, "grouped_nvfp4_gemm", None)) and callable(
                 getattr(quant, "nvfp4_quantize_rowwise", None)
             )
-            if not native_callable:
-                native_reason = "native GEMM or quantizer callable is missing"
+            if not lightmoe_callable:
+                lightmoe_reason = "LightMoE GEMM or quantizer callable is missing"
         except Exception as exc:  # noqa: BLE001
-            native_reason = f"native import failed: {type(exc).__name__}: {exc}"
+            lightmoe_reason = f"LightMoE import failed: {type(exc).__name__}: {exc}"
 
     scaled = getattr(torch.nn.functional, "scaled_grouped_mm", None)
     torch_discovered = callable(scaled)
@@ -245,7 +245,7 @@ def detect_backends() -> dict[str, BackendStatus]:
             )
             te_runnable = te_discovered and cuda_ready and blackwell
             if not te_discovered:
-                te_reason = "TE GroupedLinear or NVFP4BlockScaling is missing"
+                te_reason = "Transformer Engine GroupedLinear or NVFP4BlockScaling is missing"
             elif te_runnable:
                 te_reason = "Transformer Engine dynamic NVFP4 GroupedLinear"
         except Exception as exc:  # noqa: BLE001
@@ -292,13 +292,13 @@ def detect_backends() -> dict[str, BackendStatus]:
             continue
 
     return {
-        "native": BackendStatus(
-            "native",
-            native_callable,
-            native_callable and cuda_ready and sm100,
+        "lightmoe": BackendStatus(
+            "lightmoe",
+            lightmoe_callable,
+            lightmoe_callable and cuda_ready and sm100,
             MODES,
             DIRECTIONS,
-            native_reason or "native grouped NVFP4 kernels",
+            lightmoe_reason or "LightMoE grouped NVFP4 kernels",
         ),
         "flashinfer_cutedsl": BackendStatus(
             "flashinfer_cutedsl",
@@ -316,8 +316,8 @@ def detect_backends() -> dict[str, BackendStatus]:
             ("fwd",),
             torch_reason,
         ),
-        "te_nvfp4": BackendStatus(
-            "te_nvfp4",
+        "transformer_engine_nvfp4": BackendStatus(
+            "transformer_engine_nvfp4",
             te_discovered,
             te_runnable,
             ("dynamic",),
@@ -388,8 +388,8 @@ def _summarize_cuda_samples(
         "event_ms_iqr": p75 - p25,
         "event_ms_min": min(samples),
         "wall_ms": wall_ms,
-        "summed_gpu_ms": gpu_ms,
-        "wall_to_gpu": wall_ms / health_gpu_ms,
+        "summed_cuda_event_ms": gpu_ms,
+        "host_wall_to_cuda_event_ratio": wall_ms / health_gpu_ms,
         "health_valid": wall_ms / health_gpu_ms <= 1.5,
         "iterations": len(samples),
     }
@@ -462,7 +462,7 @@ def _measure_cuda_interleaved(
     }
 
 
-def _native_case(
+def _lightmoe_case(
     case: GemmCase,
     mode: str,
     direction: str,
@@ -471,18 +471,17 @@ def _native_case(
 ) -> dict[str, object]:
     import torch
 
-    from nvfp4moe.kernels.gemm import grouped_nvfp4_gemm
-    from nvfp4moe.kernels.quantize import (
+    from lightmoe._quantization import _DEN, TensorScale, quantize_expert_stack
+    from lightmoe.kernels.grouped.runtime import grouped_nvfp4_gemm
+    from lightmoe.kernels.grouped.wgrad import GroupedWgrad
+    from lightmoe.kernels.quantize import (
         nvfp4_quantize_colwise,
         nvfp4_quantize_rowwise,
     )
-    from nvfp4moe.kernels.wgrad import GroupedWgrad
-    from nvfp4moe.layer import _quant_expert_stack
-    from nvfp4moe.recipe import _DEN, TensorScale
 
     if direction == "wgrad":
         torch.manual_seed(20260811)
-        counts_cpu = routing_counts(case.routed_rows, case.local_experts, case.routing)
+        counts_cpu = routing_counts(case.token_expert_assignments, case.local_experts, case.routing)
         counts = torch.tensor(counts_cpu, dtype=torch.int32, device="cuda")
         cu = torch.cat(
             (
@@ -492,8 +491,8 @@ def _native_case(
         )
         off_pad = (((counts + 127) // 128) * 128).cumsum(0).to(torch.int32)
         mp_total = int(off_pad[-1].item())
-        dy = torch.randn(case.routed_rows, case.n, dtype=torch.bfloat16, device="cuda")
-        x = torch.randn(case.routed_rows, case.k, dtype=torch.bfloat16, device="cuda")
+        dy = torch.randn(case.token_expert_assignments, case.n, dtype=torch.bfloat16, device="cuda")
+        x = torch.randn(case.token_expert_assignments, case.k, dtype=torch.bfloat16, device="cuda")
         sy, sx = TensorScale(), TensorScale()
         sy.update(dy)
         sx.update(x)
@@ -538,10 +537,10 @@ def _native_case(
     else:
         gemm_n, gemm_k = case.k, case.n
     if gemm_k % 64 or gemm_n % 128:
-        return {"status": "skipped", "reason": "native N/K alignment is not satisfied"}
+        return {"status": "skipped", "reason": "LightMoE N/K alignment is not satisfied"}
 
     torch.manual_seed(20260811)
-    counts_cpu = routing_counts(case.routed_rows, case.local_experts, case.routing)
+    counts_cpu = routing_counts(case.token_expert_assignments, case.local_experts, case.routing)
     counts = torch.tensor(counts_cpu, dtype=torch.int32, device="cuda")
     cu = torch.cat(
         (
@@ -549,7 +548,7 @@ def _native_case(
             counts.cumsum(0, dtype=torch.int32),
         )
     )
-    a = torch.randn(case.routed_rows, gemm_k, dtype=torch.bfloat16, device="cuda")
+    a = torch.randn(case.token_expert_assignments, gemm_k, dtype=torch.bfloat16, device="cuda")
     b = torch.randn(
         case.local_experts,
         gemm_n,
@@ -560,8 +559,10 @@ def _native_case(
     pts_a = (a.abs().amax().float() / _DEN).clamp_min(1e-30).reshape(1)
     pts_b = (b.abs().amax().float() / _DEN).clamp_min(1e-30).reshape(1)
     pair_a = torch.cat((pts_a, pts_a.reciprocal()))
-    qa_u8 = torch.empty(case.routed_rows, gemm_k // 2, dtype=torch.uint8, device="cuda")
-    sf_rows = -(-case.routed_rows // 128) + case.local_experts
+    qa_u8 = torch.empty(
+        case.token_expert_assignments, gemm_k // 2, dtype=torch.uint8, device="cuda"
+    )
+    sf_rows = -(-case.token_expert_assignments // 128) + case.local_experts
     sfa = torch.zeros(
         1,
         sf_rows,
@@ -573,9 +574,9 @@ def _native_case(
         device="cuda",
     )
     nvfp4_quantize_rowwise(a, cu, pair_a, qa_u8, sfa)
-    qb, sfb = _quant_expert_stack([b[expert] for expert in range(case.local_experts)], pts_b)
+    qb, sfb = quantize_expert_stack([b[expert] for expert in range(case.local_experts)], pts_b)
     qa = qa_u8.view(torch.float4_e2m1fn_x2)
-    out = torch.empty(case.routed_rows, gemm_n, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(case.token_expert_assignments, gemm_n, dtype=torch.bfloat16, device="cuda")
     alpha = (pts_a * pts_b).reshape(1)
     tile_n = 256 if gemm_n % 256 == 0 else 128
     gemm = grouped_nvfp4_gemm(
@@ -601,7 +602,11 @@ def _native_case(
         "status": "ok",
         "timing": timing,
         "finite": bool(torch.isfinite(out).all()),
-        "actual_shape": {"m": case.routed_rows, "n": gemm_n, "k": gemm_k},
+        "actual_shape": {
+            "m": case.token_expert_assignments,
+            "n": gemm_n,
+            "k": gemm_k,
+        },
     }
 
 
@@ -643,13 +648,12 @@ def _prepare_grouped_frontier(
 ) -> tuple[dict[str, _GroupedArm], dict[str, dict[str, str]]]:
     import torch
 
-    from nvfp4moe.kernels.gemm import grouped_nvfp4_gemm
-    from nvfp4moe.kernels.quantize import nvfp4_quantize_rowwise
-    from nvfp4moe.layer import _quant_expert_stack
-    from nvfp4moe.recipe import _DEN
+    from lightmoe._quantization import _DEN, quantize_expert_stack
+    from lightmoe.kernels.grouped.runtime import grouped_nvfp4_gemm
+    from lightmoe.kernels.quantize import nvfp4_quantize_rowwise
 
     torch.manual_seed(20260812)
-    counts_cpu = routing_counts(case.routed_rows, case.local_experts, case.routing)
+    counts_cpu = routing_counts(case.token_expert_assignments, case.local_experts, case.routing)
     counts = torch.tensor(counts_cpu, dtype=torch.int32, device="cuda")
     cu = torch.cat((counts.new_zeros(1), counts.cumsum(0, dtype=torch.int32)))
     scale = case.k**-0.5
@@ -673,9 +677,11 @@ def _prepare_grouped_frontier(
     arms: dict[str, _GroupedArm] = {}
     failures: dict[str, dict[str, str]] = {}
 
-    if "native" in selected:
-        qa_u8 = torch.empty(case.routed_rows, case.k // 2, dtype=torch.uint8, device="cuda")
-        sf_rows = -(-case.routed_rows // 128) + case.local_experts
+    if "lightmoe" in selected:
+        qa_u8 = torch.empty(
+            case.token_expert_assignments, case.k // 2, dtype=torch.uint8, device="cuda"
+        )
+        sf_rows = -(-case.token_expert_assignments // 128) + case.local_experts
         sfa = torch.zeros(
             1,
             sf_rows,
@@ -693,12 +699,14 @@ def _prepare_grouped_frontier(
             qa_u8,
             sfa,
         )
-        qb, sfb = _quant_expert_stack(
+        qb, sfb = quantize_expert_stack(
             [weights[expert] for expert in range(case.local_experts)],
             pts_b,
         )
         qa = qa_u8.view(torch.float4_e2m1fn_x2)
-        out = torch.empty(case.routed_rows, case.n, dtype=torch.bfloat16, device="cuda")
+        out = torch.empty(
+            case.token_expert_assignments, case.n, dtype=torch.bfloat16, device="cuda"
+        )
         tile_ms = (args.tile_m,) if args.tile_m else (128, 256)
         tile_ns = (args.tile_n,) if args.tile_n else ((128, 256) if case.n % 256 == 0 else (128,))
         runtimes = {
@@ -713,13 +721,13 @@ def _prepare_grouped_frontier(
             for tile_n in tile_ns
         }
 
-        def native_call(runtime):
+        def lightmoe_call(runtime):
             runtime(qa, qb, out, cu, sfa, sfb, pts_a * pts_b)
             return out
 
         candidate_timings = _measure_cuda_interleaved(
             {
-                f"{tile_m}x{tile_n}": (lambda runtime=runtime: native_call(runtime))
+                f"{tile_m}x{tile_n}": (lambda runtime=runtime: lightmoe_call(runtime))
                 for (tile_m, tile_n), runtime in runtimes.items()
             },
             1,
@@ -738,8 +746,8 @@ def _prepare_grouped_frontier(
             tile_m,
             tile_n,
         )
-        arms["native"] = _GroupedArm(
-            lambda: native_call(runtime),
+        arms["lightmoe"] = _GroupedArm(
+            lambda: lightmoe_call(runtime),
             {
                 "status": "ok",
                 "config": {
@@ -752,7 +760,7 @@ def _prepare_grouped_frontier(
                     "tile_rounded_flops": tile_flops,
                     "tile_padding_overhead_pct": 100.0 * (tile_flops / case.flops - 1.0),
                 },
-                **_grouped_accuracy(native_call(runtime), a_groups, weights),
+                **_grouped_accuracy(lightmoe_call(runtime), a_groups, weights),
             },
         )
 
@@ -922,42 +930,44 @@ def _run_grouped_frontier_case(
             result["timing"] = timing
         print(json.dumps({**base, **result}), flush=True)
 
-    if "native" in arms:
-        canary = _measure_cuda_interleaved(
+    if "lightmoe" in arms:
+        repeat = _measure_cuda_interleaved(
             functions,
             args.warmup,
             args.iterations,
             args.stabilize_ms,
-        )["native"]
-        first = timings["native"]
+        )["lightmoe"]
+        initial = timings["lightmoe"]
         _annotate_throughput(
-            canary,
+            repeat,
             case.flops,
             theoretical_peak_tflops,
             gemm_only=True,
         )
-        drift = float(canary["event_ms_p50"]) / float(first["event_ms_p50"]) - 1.0
+        initial_to_repeat_median_deviation = (
+            float(repeat["event_ms_p50"]) / float(initial["event_ms_p50"]) - 1.0
+        )
         print(
             json.dumps(
                 {
-                    "event": "canary",
-                    "backend": "native",
+                    "event": "repeat",
+                    "backend": "lightmoe",
                     "mode": "prepacked",
                     "direction": "fwd",
                     "case": _case_dict(case),
-                    "drift": drift,
-                    "drift_valid": abs(drift) <= 0.05,
+                    "initial_to_repeat_median_deviation": (initial_to_repeat_median_deviation),
+                    "repeat_deviation_valid": abs(initial_to_repeat_median_deviation) <= 0.05,
                     "status": "ok",
-                    "timing": canary,
-                    "config": arms["native"].result["config"],
+                    "timing": repeat,
+                    "config": arms["lightmoe"].result["config"],
                 }
             ),
             flush=True,
         )
         return (
             no_backend_errors
-            and bool(canary["health_valid"])
-            and abs(drift) <= 0.05
+            and bool(repeat["health_valid"])
+            and abs(initial_to_repeat_median_deviation) <= 0.05
             and all(bool(timing["health_valid"]) for timing in timings.values())
         )
     return no_backend_errors and all(bool(timing["health_valid"]) for timing in timings.values())
@@ -975,14 +985,20 @@ def _te_case(
     from transformer_engine.common.recipe import NVFP4BlockScaling
 
     if mode != "dynamic":
-        return {"status": "skipped", "reason": "TE GroupedLinear owns dynamic quantization"}
+        return {
+            "status": "skipped",
+            "reason": "Transformer Engine GroupedLinear owns dynamic quantization",
+        }
     if direction != "fwd":
         return {
             "status": "skipped",
-            "reason": "TE exposes dgrad and wgrad as one autograd backward; use nvfp4_moe.py fwd_bwd",
+            "reason": (
+                "Transformer Engine exposes input and weight gradients through one autograd "
+                "backward; use moe.py with --pass fwd_bwd"
+            ),
         }
     torch.manual_seed(20260811)
-    counts = routing_counts(case.routed_rows, case.local_experts, case.routing)
+    counts = routing_counts(case.token_expert_assignments, case.local_experts, case.routing)
     alignment = 64
     padded_counts = tuple(((count + alignment - 1) // alignment) * alignment for count in counts)
     padded_rows = sum(padded_counts)
@@ -1042,18 +1058,18 @@ def _te_case(
     return {
         "status": "ok",
         "timing": timing,
-        "actual_routed_rows": padded_rows,
+        "actual_token_expert_assignments": padded_rows,
         "row_alignment": alignment,
     }
 
 
-RUNNERS = {"native": _native_case, "te_nvfp4": _te_case}
+RUNNERS = {"lightmoe": _lightmoe_case, "transformer_engine_nvfp4": _te_case}
 
 
 def _dense_cases(args: argparse.Namespace) -> list[DenseCase]:
     models = parse_models(args.models)
     rows = parse_ints(args.tokens, args.suite)
-    projections = parse_names(args.projections, ("fc1", "fc2"), "projection")
+    projections = parse_names(args.projections, ("gate_up", "down"), "projection")
     return [
         DenseCase(model, projection, m, *MODEL_SHAPES[model].gemm_shape(projection))
         for model in models
@@ -1099,7 +1115,7 @@ class _DenseArm:
     auxiliary: dict[str, Callable[[], object]]
 
 
-def _prepare_dense_native(
+def _prepare_dense_lightmoe(
     case: DenseCase,
     mode: str,
     args: argparse.Namespace,
@@ -1107,7 +1123,7 @@ def _prepare_dense_native(
 ) -> _DenseArm:
     import torch
 
-    from nvfp4moe.kernels.dense_gemm import DenseNvfp4Gemm
+    from lightmoe.kernels.dense.runtime import DenseNvfp4Gemm
 
     a, b, qa, qb, sfa, sfb, one = inputs
 
@@ -1171,7 +1187,7 @@ def _prepare_dense_grouped(
 ) -> _DenseArm:
     import torch
 
-    from nvfp4moe.kernels.gemm import GroupedNvfp4Gemm
+    from lightmoe.kernels.grouped.runtime import GroupedNvfp4Gemm
 
     a, b, qa, qb, sfa, sfb, one = inputs
     out = torch.empty(case.m, case.n, dtype=torch.bfloat16, device="cuda")
@@ -1276,9 +1292,9 @@ def _prepare_dense_arm(
     args: argparse.Namespace,
     inputs,
 ) -> _DenseArm | None:
-    if backend == "native":
-        return _prepare_dense_native(case, mode, args, inputs)
-    if backend == "native_grouped":
+    if backend == "lightmoe":
+        return _prepare_dense_lightmoe(case, mode, args, inputs)
+    if backend == "lightmoe_grouped":
         return _prepare_dense_grouped(case, mode, args, inputs)
     if backend == "cublaslt":
         return _prepare_dense_cublas(case, mode, inputs)
@@ -1291,7 +1307,7 @@ def _dense_main(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
     try:
         cases = _dense_cases(args)
         selected = parse_names(
-            args.backends or "native,cublaslt",
+            args.backends or "lightmoe,cublaslt",
             DENSE_BACKEND_NAMES,
             "backend",
         )
@@ -1302,8 +1318,8 @@ def _dense_main(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
     runtime = None if args.list else _runtime_metadata(args.theoretical_peak_tflops)
     theoretical_peak_tflops = None if runtime is None else runtime["theoretical_peak_tflops"]
     available = {
-        "native": _module_exists("nvfp4moe"),
-        "native_grouped": _module_exists("nvfp4moe"),
+        "lightmoe": _module_exists("lightmoe"),
+        "lightmoe_grouped": _module_exists("lightmoe"),
         "cublaslt": _dense_cublas_available(),
     }
     payload = {
@@ -1362,10 +1378,10 @@ def _dense_main(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
                     }
 
             functions = {backend: arm.call for backend, arm in prepared.items()}
-            native = prepared.get("native")
-            if native is not None:
+            lightmoe = prepared.get("lightmoe")
+            if lightmoe is not None:
                 functions.update(
-                    {f"native_{name}": call for name, call in native.auxiliary.items()}
+                    {f"lightmoe_{name}": call for name, call in lightmoe.auxiliary.items()}
                 )
             timings = (
                 _measure_cuda_interleaved(
@@ -1398,9 +1414,9 @@ def _dense_main(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
                         gemm_only=mode == "prepacked",
                     )
                     result["timing"] = timing
-                    if backend == "native":
-                        for name in native.auxiliary:
-                            auxiliary_timing = timings[f"native_{name}"]
+                    if backend == "lightmoe":
+                        for name in lightmoe.auxiliary:
+                            auxiliary_timing = timings[f"lightmoe_{name}"]
                             _annotate_throughput(
                                 auxiliary_timing,
                                 case.flops,
@@ -1411,38 +1427,45 @@ def _dense_main(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
                 run_valid &= result.get("status") != "error"
                 print(json.dumps({**base, **result}), flush=True)
 
-            if native is not None:
-                canary_timings = _measure_cuda_interleaved(
+            if lightmoe is not None:
+                repeat_timings = _measure_cuda_interleaved(
                     functions,
                     args.warmup,
                     args.iterations,
                     0.0,
                 )
-                canary_timing = canary_timings["native"]
+                repeat_timing = repeat_timings["lightmoe"]
                 _annotate_throughput(
-                    canary_timing,
+                    repeat_timing,
                     case.flops,
                     theoretical_peak_tflops,
                     gemm_only=mode == "prepacked",
                 )
-                first_timing = timings["native"]
-                drift = (
-                    float(canary_timing["event_ms_p50"]) / float(first_timing["event_ms_p50"]) - 1.0
+                initial_timing = timings["lightmoe"]
+                initial_to_repeat_median_deviation = (
+                    float(repeat_timing["event_ms_p50"]) / float(initial_timing["event_ms_p50"])
+                    - 1.0
                 )
-                run_valid &= bool(canary_timing["health_valid"]) and abs(drift) <= 0.05
+                run_valid &= bool(repeat_timing["health_valid"]) and (
+                    abs(initial_to_repeat_median_deviation) <= 0.05
+                )
                 print(
                     json.dumps(
                         {
-                            "event": "canary",
-                            "backend": "native",
+                            "event": "repeat",
+                            "backend": "lightmoe",
                             "mode": mode,
                             "case": asdict(case)
                             | {"label": case.label, "logical_flops": case.flops},
-                            "drift": drift,
-                            "drift_valid": abs(drift) <= 0.05,
+                            "initial_to_repeat_median_deviation": (
+                                initial_to_repeat_median_deviation
+                            ),
+                            "repeat_deviation_valid": (
+                                abs(initial_to_repeat_median_deviation) <= 0.05
+                            ),
                             "status": "ok",
-                            "timing": canary_timing,
-                            "config": native.result["config"],
+                            "timing": repeat_timing,
+                            "config": lightmoe.result["config"],
                         }
                     ),
                     flush=True,
@@ -1458,16 +1481,16 @@ def _case_dict(case: GemmCase) -> dict[str, object]:
     row = asdict(case)
     row["label"] = case.label
     row["logical_flops"] = case.flops
-    counts = routing_counts(case.routed_rows, case.local_experts, case.routing)
+    counts = routing_counts(case.token_expert_assignments, case.local_experts, case.routing)
     mean = statistics.mean(counts)
-    row["expert_row_counts"] = counts
+    row["expert_assignment_counts"] = counts
     row["routing_statistics"] = {
-        "min_rows": min(counts),
-        "max_rows": max(counts),
-        "mean_rows": mean,
+        "min_assignments": min(counts),
+        "max_assignments": max(counts),
+        "mean_assignments": mean,
         "coefficient_of_variation": statistics.pstdev(counts) / mean if mean else 0.0,
-        "empty_experts": sum(count == 0 for count in counts),
-        "aligned_128_experts": sum(count % 128 == 0 for count in counts),
+        "zero_assignment_experts": sum(count == 0 for count in counts),
+        "experts_aligned_to_128_assignments": sum(count % 128 == 0 for count in counts),
     }
     return row
 
@@ -1480,7 +1503,7 @@ def listing_payload(args: argparse.Namespace) -> dict[str, object]:
         QUICK_ROUTINGS if args.suite == "quick" else FULL_ROUTINGS,
         "routing",
     )
-    projections = parse_names(args.projections, ("fc1", "fc2"), "projection")
+    projections = parse_names(args.projections, ("gate_up", "down"), "projection")
     cases = generate_gemm_cases(models, tokens, args.suite, routings, projections)
     statuses = detect_backends()
     return {
@@ -1489,18 +1512,24 @@ def listing_payload(args: argparse.Namespace) -> dict[str, object]:
         "definitions": {
             "prepacked": "resident NVFP4 operands and scales; grouped GEMM only",
             "dynamic": "BF16 activation quantization plus GEMM; weights stay resident/prepacked",
-            "routed_rows": "tokens * top-k before any capacity padding",
-            "logical_flops": "2*routed_rows*N*K; one multiply-add is two FLOPs",
-            "tile_rounded_flops": "native MMA work after per-expert M and N/K tile rounding",
+            "token_expert_assignments": "input tokens * top-k before capacity padding",
+            "logical_flops": "2*token_expert_assignments*N*K; one multiply-add is two FLOPs",
+            "tile_rounded_flops": "MMA work after per-expert M and N/K tile rounding",
             "throughput": "logical FLOPs divided by CUDA-event median latency",
             "peak": "single-GPU dense FP4 specification; structured sparsity is excluded",
             "timing": "runnable prepacked forward backends are shuffled per iteration in one session",
             "routing": {
                 "balanced": "all expert weights are 1",
-                "jagged": "expert e has weight 1 + ((17*e + 11) mod 31)",
-                "hotspot": "expert 0 weight is max(1, E/2); every other weight is 1",
-                "tail": "weights repeat 1,15,16,127,128,129,255,256,257; last is zero",
-                "allocation": "floor(rows*weight/sum(weights)), then largest remainders first",
+                "imbalanced": "expert e has weight 1 + ((17*e + 11) mod 31)",
+                "single_expert_skew": (
+                    "expert 0 weight is max(1, num_experts/2); every other weight is 1"
+                ),
+                "alignment_stress": (
+                    "weights repeat 1,15,16,127,128,129,255,256,257; last is zero"
+                ),
+                "allocation": (
+                    "floor(assignments*weight/sum(weights)), then largest remainders first"
+                ),
             },
         },
         "models": {key: asdict(MODEL_SHAPES[key]) for key in models},
@@ -1520,7 +1549,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backends", default=None)
     parser.add_argument("--mode", choices=(*MODES, "both"), default="prepacked")
     parser.add_argument("--direction", choices=DIRECTIONS, default="fwd")
-    parser.add_argument("--projections", default="fc1,fc2")
+    parser.add_argument("--projections", default="gate_up,down")
     parser.add_argument("--routing", default="all")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
@@ -1549,7 +1578,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         payload = listing_payload(args)
         selected = parse_names(
-            args.backends or "native,torch_scaled_grouped_mm,te_nvfp4,cutlass,cublaslt",
+            args.backends
+            or "lightmoe,torch_scaled_grouped_mm,transformer_engine_nvfp4,cutlass,cublaslt",
             BACKEND_NAMES,
             "backend",
         )
@@ -1570,7 +1600,7 @@ def main(argv: list[str] | None = None) -> int:
                 not in {
                     "label",
                     "logical_flops",
-                    "expert_row_counts",
+                    "expert_assignment_counts",
                     "routing_statistics",
                 }
             }

@@ -41,7 +41,7 @@ def main():
     if torch.cuda.get_device_capability(0)[0] != 10:
         print("SKIP: requires SM100")
         return 0
-    from nvfp4moe.kernels.finalize import moe_finalize
+    from lightmoe.kernels.routing.combine import moe_finalize
 
     torch.manual_seed(0)
     T, k, d = 1024, 8, 2048

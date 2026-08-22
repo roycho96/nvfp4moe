@@ -1,6 +1,6 @@
 import pytest
 
-from nvfp4moe.kernels.epilogue import (
+from lightmoe.kernels.gated import (
     GatedBackwardEpilogue,
     GatedEpilogue,
     gated_output_n,
