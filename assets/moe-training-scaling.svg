@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="850" viewBox="0 0 1200 850" role="img" aria-labelledby="title desc">
+<title id="title">Complete MoE training scaling</title>
+<desc id="desc">LightMoE complete routed-expert forward and backward latency and exact-contract Transformer Engine speedup across model-derived token counts.</desc>
+<defs><style>
+text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.bg { fill:#f8fafc; } .panel { fill:#fff; stroke:#e2e8f0; stroke-width:1; }
+.title { fill:#0f172a; font-size:30px; font-weight:650; } .subtitle { fill:#64748b; font-size:14px; }
+.panel-title { fill:#0f172a; font-size:16px; font-weight:650; } .axis { fill:#475569; font-size:12px; }
+.tick { fill:#64748b; font-size:11px; } .legend { fill:#334155; font-size:12px; font-weight:550; }
+.grid { stroke:#e2e8f0; stroke-width:1; } .reference { stroke:#64748b; stroke-width:1.5; stroke-dasharray:5 5; }
+.line { fill:none; stroke-width:3; stroke-linecap:round; stroke-linejoin:round; }
+.marker { fill:#fff; stroke-width:2.5; } .footer { fill:#64748b; font-size:11px; }
+.c0{stroke:#2563eb}.c1{stroke:#f97316}.c2{stroke:#10b981}.c3{stroke:#8b5cf6}.c4{stroke:#e11d48}.c5{stroke:#0891b2}
+@media(prefers-color-scheme:dark){
+.bg{fill:#0b1220}.panel{fill:#111827;stroke:#273449}.title,.panel-title{fill:#f1f5f9}
+.subtitle,.tick,.footer{fill:#94a3b8}.axis,.legend{fill:#cbd5e1}.grid{stroke:#273449}.reference{stroke:#64748b}.marker{fill:#111827}
+.c0{stroke:#60a5fa}.c1{stroke:#fb923c}.c2{stroke:#34d399}.c3{stroke:#a78bfa}.c4{stroke:#fb7185}.c5{stroke:#22d3ee}
+}
+</style></defs>
+<rect class="bg" width="1200" height="850" rx="22"/>
+<text class="title" x="55" y="51">Complete MoE training scaling</text>
+<text class="subtitle" x="55" y="78">Dispatch · expert forward and backward · routing weights · deterministic combine</text>
+<line class="line c0" x1="88" y1="116" x2="113" y2="116"/>
+<circle class="marker c0" cx="100.5" cy="116" r="3.5"/>
+<text class="legend" x="124" y="120">Qwen3.5 35B-A3B</text>
+<line class="line c1" x1="453" y1="116" x2="478" y2="116"/>
+<circle class="marker c1" cx="465.5" cy="116" r="3.5"/>
+<text class="legend" x="489" y="120">Qwen3.5 397B-A17B</text>
+<line class="line c2" x1="818" y1="116" x2="843" y2="116"/>
+<circle class="marker c2" cx="830.5" cy="116" r="3.5"/>
+<text class="legend" x="854" y="120">DeepSeek V4 Flash</text>
+<line class="line c3" x1="88" y1="143" x2="113" y2="143"/>
+<circle class="marker c3" cx="100.5" cy="143" r="3.5"/>
+<text class="legend" x="124" y="147">GLM-5.2</text>
+<line class="line c4" x1="453" y1="143" x2="478" y2="143"/>
+<circle class="marker c4" cx="465.5" cy="143" r="3.5"/>
+<text class="legend" x="489" y="147">MiniMax M3</text>
+<line class="line c5" x1="818" y1="143" x2="843" y2="143"/>
+<circle class="marker c5" cx="830.5" cy="143" r="3.5"/>
+<text class="legend" x="854" y="147">Nemotron 3.5 30B-A3B</text>
+<rect class="panel" x="42" y="155" width="1116" height="380" rx="16"/>
+<text class="panel-title" x="70" y="186">LightMoE forward + backward latency · 21-sample median</text>
+<line class="grid" x1="105" y1="500.00" x2="1145" y2="500.00"/>
+<text class="tick" x="91" y="504.00" text-anchor="end">0</text>
+<line class="grid" x1="105" y1="457.86" x2="1145" y2="457.86"/>
+<text class="tick" x="91" y="461.86" text-anchor="end">1</text>
+<line class="grid" x1="105" y1="415.71" x2="1145" y2="415.71"/>
+<text class="tick" x="91" y="419.71" text-anchor="end">2</text>
+<line class="grid" x1="105" y1="373.57" x2="1145" y2="373.57"/>
+<text class="tick" x="91" y="377.57" text-anchor="end">3</text>
+<line class="grid" x1="105" y1="331.43" x2="1145" y2="331.43"/>
+<text class="tick" x="91" y="335.43" text-anchor="end">4</text>
+<line class="grid" x1="105" y1="289.29" x2="1145" y2="289.29"/>
+<text class="tick" x="91" y="293.29" text-anchor="end">5</text>
+<line class="grid" x1="105" y1="247.14" x2="1145" y2="247.14"/>
+<text class="tick" x="91" y="251.14" text-anchor="end">6</text>
+<line class="grid" x1="105" y1="205.00" x2="1145" y2="205.00"/>
+<text class="tick" x="91" y="209.00" text-anchor="end">7</text>
+<line class="grid" x1="105.00" y1="205" x2="105.00" y2="500"/>
+<line class="grid" x1="365.00" y1="205" x2="365.00" y2="500"/>
+<line class="grid" x1="625.00" y1="205" x2="625.00" y2="500"/>
+<line class="grid" x1="885.00" y1="205" x2="885.00" y2="500"/>
+<line class="grid" x1="1145.00" y1="205" x2="1145.00" y2="500"/>
+<text class="axis" transform="translate(64 352.50) rotate(-90)" text-anchor="middle">Latency (ms)</text>
+<path class="line c0" d="M 105.00 409.80 L 365.00 409.27 L 625.00 408.84 L 885.00 408.88 L 1145.00 408.39"/>
+<circle class="marker c0" cx="105.00" cy="409.80" r="4"/>
+<circle class="marker c0" cx="365.00" cy="409.27" r="4"/>
+<circle class="marker c0" cx="625.00" cy="408.84" r="4"/>
+<circle class="marker c0" cx="885.00" cy="408.88" r="4"/>
+<circle class="marker c0" cx="1145.00" cy="408.39" r="4"/>
+<path class="line c1" d="M 105.00 407.77 L 365.00 407.46 L 625.00 406.97 L 885.00 407.57 L 1145.00 328.64"/>
+<circle class="marker c1" cx="105.00" cy="407.77" r="4"/>
+<circle class="marker c1" cx="365.00" cy="407.46" r="4"/>
+<circle class="marker c1" cx="625.00" cy="406.97" r="4"/>
+<circle class="marker c1" cx="885.00" cy="407.57" r="4"/>
+<circle class="marker c1" cx="1145.00" cy="328.64" r="4"/>
+<path class="line c2" d="M 105.00 412.15 L 365.00 413.34 L 625.00 411.90 L 885.00 412.14 L 1145.00 340.25"/>
+<circle class="marker c2" cx="105.00" cy="412.15" r="4"/>
+<circle class="marker c2" cx="365.00" cy="413.34" r="4"/>
+<circle class="marker c2" cx="625.00" cy="411.90" r="4"/>
+<circle class="marker c2" cx="885.00" cy="412.14" r="4"/>
+<circle class="marker c2" cx="1145.00" cy="340.25" r="4"/>
+<path class="line c3" d="M 105.00 407.01 L 365.00 406.79 L 625.00 406.64 L 885.00 396.50 L 1145.00 227.56"/>
+<circle class="marker c3" cx="105.00" cy="407.01" r="4"/>
+<circle class="marker c3" cx="365.00" cy="406.79" r="4"/>
+<circle class="marker c3" cx="625.00" cy="406.64" r="4"/>
+<circle class="marker c3" cx="885.00" cy="396.50" r="4"/>
+<circle class="marker c3" cx="1145.00" cy="227.56" r="4"/>
+<path class="line c4" d="M 105.00 412.82 L 365.00 411.15 L 625.00 410.67 L 885.00 410.41 L 1145.00 304.19"/>
+<circle class="marker c4" cx="105.00" cy="412.82" r="4"/>
+<circle class="marker c4" cx="365.00" cy="411.15" r="4"/>
+<circle class="marker c4" cx="625.00" cy="410.67" r="4"/>
+<circle class="marker c4" cx="885.00" cy="410.41" r="4"/>
+<circle class="marker c4" cx="1145.00" cy="304.19" r="4"/>
+<path class="line c5" d="M 105.00 413.25 L 365.00 413.15 L 625.00 412.93 L 885.00 412.56 L 1145.00 395.48"/>
+<circle class="marker c5" cx="105.00" cy="413.25" r="4"/>
+<circle class="marker c5" cx="365.00" cy="413.15" r="4"/>
+<circle class="marker c5" cx="625.00" cy="412.93" r="4"/>
+<circle class="marker c5" cx="885.00" cy="412.56" r="4"/>
+<circle class="marker c5" cx="1145.00" cy="395.48" r="4"/>
+<rect class="panel" x="42" y="560" width="1116" height="230" rx="16"/>
+<text class="panel-title" x="70" y="591">Transformer Engine / LightMoE · exact standard-SwiGLU contracts</text>
+<line class="reference" x1="105" y1="755.00" x2="1145" y2="755.00"/>
+<text class="tick" x="91" y="759.00" text-anchor="end">1</text>
+<line class="grid" x1="105" y1="720.48" x2="1145" y2="720.48"/>
+<text class="tick" x="91" y="724.48" text-anchor="end">1.25</text>
+<line class="grid" x1="105" y1="685.95" x2="1145" y2="685.95"/>
+<text class="tick" x="91" y="689.95" text-anchor="end">1.5</text>
+<line class="grid" x1="105" y1="651.43" x2="1145" y2="651.43"/>
+<text class="tick" x="91" y="655.43" text-anchor="end">1.75</text>
+<line class="grid" x1="105" y1="616.90" x2="1145" y2="616.90"/>
+<text class="tick" x="91" y="620.90" text-anchor="end">2</text>
+<line class="grid" x1="105.00" y1="610" x2="105.00" y2="755"/>
+<text class="tick" x="105.00" y="778" text-anchor="middle">32</text>
+<line class="grid" x1="365.00" y1="610" x2="365.00" y2="755"/>
+<text class="tick" x="365.00" y="778" text-anchor="middle">128</text>
+<line class="grid" x1="625.00" y1="610" x2="625.00" y2="755"/>
+<text class="tick" x="625.00" y="778" text-anchor="middle">512</text>
+<line class="grid" x1="885.00" y1="610" x2="885.00" y2="755"/>
+<text class="tick" x="885.00" y="778" text-anchor="middle">2,048</text>
+<line class="grid" x1="1145.00" y1="610" x2="1145.00" y2="755"/>
+<text class="tick" x="1145.00" y="778" text-anchor="middle">8,192</text>
+<text class="axis" transform="translate(64 682.50) rotate(-90)" text-anchor="middle">Baseline / LightMoE</text>
+<text class="axis" x="625" y="804" text-anchor="middle">Input tokens per MoE layer (before top-k)</text>
+<path class="line c1" d="M 105.00 640.93 L 365.00 639.08 L 625.00 639.39 L 885.00 634.47 L 1145.00 685.28"/>
+<circle class="marker c1" cx="105.00" cy="640.93" r="4"/>
+<circle class="marker c1" cx="365.00" cy="639.08" r="4"/>
+<circle class="marker c1" cx="625.00" cy="639.39" r="4"/>
+<circle class="marker c1" cx="885.00" cy="634.47" r="4"/>
+<circle class="marker c1" cx="1145.00" cy="685.28" r="4"/>
+<path class="line c3" d="M 105.00 639.23 L 365.00 637.68 L 625.00 638.53 L 885.00 653.53 L 1145.00 704.03"/>
+<circle class="marker c3" cx="105.00" cy="639.23" r="4"/>
+<circle class="marker c3" cx="365.00" cy="637.68" r="4"/>
+<circle class="marker c3" cx="625.00" cy="638.53" r="4"/>
+<circle class="marker c3" cx="885.00" cy="653.53" r="4"/>
+<circle class="marker c3" cx="1145.00" cy="704.03" r="4"/>
+<path class="line c0" d="M 105.00 641.22 L 365.00 640.05 L 625.00 639.43 L 885.00 638.18 L 1145.00 628.73"/>
+<circle class="marker c0" cx="105.00" cy="641.22" r="4"/>
+<circle class="marker c0" cx="365.00" cy="640.05" r="4"/>
+<circle class="marker c0" cx="625.00" cy="639.43" r="4"/>
+<circle class="marker c0" cx="885.00" cy="638.18" r="4"/>
+<circle class="marker c0" cx="1145.00" cy="628.73" r="4"/>
+<text class="footer" x="55" y="833">Balanced deterministic routing · model-derived EP shards · optimizer, communication, and router top-k excluded</text>
+</svg>

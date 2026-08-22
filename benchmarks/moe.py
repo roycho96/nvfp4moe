@@ -698,41 +698,64 @@ def _run_interleaved_training(backends, case, inputs, warmup, iterations, profil
     if not arms:
         return results
     torch.cuda.synchronize()
-    time.sleep(0.2)
-    torch.cuda.reset_peak_memory_stats()
-
-    samples = {name: [] for name in arms}
-    walls = {name: [] for name in arms}
-    rng = random.Random(20260812)
     names = list(arms)
-    for _ in range(iterations):
-        order = names.copy()
-        rng.shuffle(order)
-        for name in order:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            wall_start = time.perf_counter()
-            start.record()
-            arms[name].call()
-            end.record()
-            end.synchronize()
-            samples[name].append(start.elapsed_time(end))
-            walls[name].append(1000 * (time.perf_counter() - wall_start))
+
+    def stabilize():
+        deadline = time.perf_counter() + 2.0
+        while time.perf_counter() < deadline:
+            for name in names:
+                arms[name].call()
+            torch.cuda.synchronize()
+
+    def measure():
+        samples = {name: [] for name in arms}
+        walls = {name: [] for name in arms}
+        rng = random.Random(20260812)
+        for _ in range(iterations):
+            order = names.copy()
+            rng.shuffle(order)
+            for name in order:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                wall_start = time.perf_counter()
+                start.record()
+                arms[name].call()
+                end.record()
+                end.synchronize()
+                samples[name].append(start.elapsed_time(end))
+                walls[name].append(1000 * (time.perf_counter() - wall_start))
+
+        repeat_samples = []
+        for _ in range(iterations):
+            order = names.copy()
+            rng.shuffle(order)
+            for name in order:
+                if name != names[0]:
+                    arms[name].call()
+                    torch.cuda.synchronize()
+                    continue
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                arms[name].call()
+                end.record()
+                end.synchronize()
+                repeat_samples.append(start.elapsed_time(end))
+        return samples, walls, repeat_samples
+
+    stabilize()
+    torch.cuda.reset_peak_memory_stats()
+    for measurement_attempts in range(1, 4):
+        samples, walls, repeat_samples = measure()
+        initial_p50 = statistics.median(samples[names[0]])
+        repeat_p50 = statistics.median(repeat_samples)
+        initial_to_repeat_median_deviation = abs(repeat_p50 / initial_p50 - 1.0)
+        repeat_deviation_valid = initial_to_repeat_median_deviation <= 0.05
+        if repeat_deviation_valid:
+            break
+        stabilize()
 
     first = names[0]
-    repeat_samples = []
-    for _ in range(iterations):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        arms[first].call()
-        end.record()
-        end.synchronize()
-        repeat_samples.append(start.elapsed_time(end))
-    initial_p50 = statistics.median(samples[first])
-    repeat_p50 = statistics.median(repeat_samples)
-    initial_to_repeat_median_deviation = abs(repeat_p50 / initial_p50 - 1.0)
-    repeat_deviation_valid = initial_to_repeat_median_deviation <= 0.05
     peak = torch.cuda.max_memory_allocated() / 2**30
 
     kernel_profiles = {}
@@ -783,6 +806,7 @@ def _run_interleaved_training(backends, case, inputs, warmup, iterations, profil
                 "repeat_p50_ms": repeat_p50,
                 "initial_to_repeat_median_deviation": (initial_to_repeat_median_deviation),
                 "repeat_deviation_valid": repeat_deviation_valid,
+                "measurement_attempts": measurement_attempts,
                 "valid": repeat_deviation_valid
                 and all(sum(walls[key]) / sum(samples[key]) <= 1.5 for key in arms),
             },

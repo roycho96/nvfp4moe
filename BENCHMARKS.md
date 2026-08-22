@@ -12,15 +12,17 @@ uses eight B200s, vLLM 0.27.1, PyTorch 2.13.0+cu130, and FlashInfer
 | Scope | Included | Excluded |
 |---|---|---|
 | Grouped GEMM | one prepacked NVFP4 grouped GEMM launch | quantization, packing, allocation, compilation, autotuning |
+| Complete MoE inference | BF16 input quantization, dispatch, two expert projections, activation, routing weights, combine | router logits, top-k selection, communication, weight packing, compilation |
 | Routed-expert training | dispatch, expert forward and backward, routing weights, combine | router logits, top-k selection, communication, optimizer |
 | Full-model serving | one warmed `LLM.generate` call | model load, JIT compilation, dataset loading, tokenization |
 
-Operator backends run on identical inputs in alternating order. Each row uses
-21 CUDA-event samples after warmup and reports median `[IQR]`. LightMoE is run
-again after its baselines; a row is rejected if the two LightMoE medians differ
-by more than 5%. Runs are also rejected when host wall time divided by enclosed
-CUDA-event time exceeds 1.5. An unavailable backend is marked unavailable, not
-replaced by another implementation.
+Operator backends run on identical shapes and route tensors in randomized,
+alternating order. Each point uses 21 CUDA-event samples and reports median
+`[IQR]`. Training arms run for two seconds before measurement. The complete
+arm sequence is then repeated; a point is rejected after three attempts if the
+two LightMoE medians differ by more than 5%. Runs are also rejected when host
+wall time divided by enclosed CUDA-event time exceeds 1.5. An unavailable
+backend is marked unavailable, not replaced by another implementation.
 
 For expert `e`, `M_e` is its local row count. **Ragged** means that the `M_e`
 values are unequal; a zero-row expert is valid. The stress matrix uses unequal
@@ -71,27 +73,56 @@ routing, including a zero-row expert. PyTorch is unavailable for these rows
 because its NVFP4 grouped GEMM requires every group to have a 128-row-aligned
 size.
 
+## Complete MoE inference
+
+[![Complete MoE inference scaling](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-inference-scaling.svg)](https://github.com/roycho96/lightmoe/blob/main/assets/moe-inference-scaling.svg)
+
+`M` is the number of input tokens before top-k routing; the layer processes
+`M × top-k` token–expert assignments. Each point uses the model-derived local
+EP shard, fixed synthetic BF16 inputs, deterministic balanced routes, prepacked
+weights, preallocated outputs, and CUDA Graph replay. The FlashInfer 0.6.17 arm
+captures `fp4_quantize` and `trtllm_fp4_block_scale_routed_moe` together,
+matching the complete `InferenceMoE` call boundary. Package initialization and
+tactic loading happen before capture.
+
+| Model | `M=1` µs | `M=128` µs | `M=8,192` µs | FlashInfer / LightMoE at `M=8,192` | Lowest ratio in sweep |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.5-35B-A3B | 14.4 | 28.8 | 252.5 | **1.290×** | 0.857× at `M=128` |
+| Qwen3.5-397B-A17B | 20.5 | 53.6 | 770.7 | **1.211×** | 0.907× at `M=32` |
+| DeepSeek-V4-Flash | 20.5 | 48.9 | 679.5 | **1.365×** | 0.828× at `M=32` |
+| GLM-5.2 | 40.5 | 91.4 | 1,364.0 | **1.369×** | 0.920× at `M=128` |
+| MiniMax-M3 | 34.7 | 71.8 | 900.5 | **1.524×** | 0.932× at `M=128` |
+| Nemotron-3.5-Lightning-30B-A3B | 16.4 | 32.7 | 387.3 | **1.175×** | 0.821× at `M=32` |
+
+All 42 points pass the measurement gates. The maximum LightMoE repeat
+deviation is 3.64% and the maximum host/CUDA ratio is 1.054. Ratios below 1.0
+identify short-token points where FlashInfer is faster; they are retained in
+the lower panel.
+
 ## Routed-expert training
 
-This is a routed-expert layer with 8,192 input tokens. The table retains the
-standard SwiGLU rows because the measured Transformer Engine baseline does not
-implement bounded SwiGLU, SwiGLU-OAI, or ReLU² with the same math. LightMoE
-supports those contracts, but does not relabel a different activation as an
-equivalent baseline. SiTU-GLU and model-specific outer projections remain
-outside this layer boundary.
+[![Complete MoE training scaling](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-training-scaling.svg)](https://github.com/roycho96/lightmoe/blob/main/assets/moe-training-scaling.svg)
 
-| Model / routing | Shape `H × I`, experts / top-k / EP size | LightMoE ms `[IQR]` | Transformer Engine ms `[IQR]` | Latency reduction | Output / input-gradient cosine vs BF16 |
-|---|---:|---:|---:|---:|---:|
-| Qwen3.5-35B-A3B balanced | 2,048 × 512, 256 / 8 / 16 | **1.707 [0.021]** | 2.448 [0.007] | 30.2% | 0.9730 / 0.9623 |
-| Qwen3.5-35B-A3B imbalanced | 2,048 × 512, 256 / 8 / 16 | **1.688 [0.017]** | 2.459 [0.011] | 31.4% | 0.9727 / 0.9623 |
-| Qwen3.5-397B-A17B balanced | 4,096 × 1,024, 512 / 10 / 32 | **4.021 [0.060]** | 5.557 [0.057] | 27.6% | 0.9734 / 0.9620 |
-| Qwen3.5-397B-A17B imbalanced | 4,096 × 1,024, 512 / 10 / 32 | **4.001 [0.022]** | 5.546 [0.060] | 27.9% | 0.9731 / 0.9623 |
-| GLM-5.2 balanced | 6,144 × 2,048, 256 / 8 / 16 | **6.353 [0.229]** | 8.299 [0.287] | 23.5% | 0.9732 / 0.9617 |
-| GLM-5.2 imbalanced | 6,144 × 2,048, 256 / 8 / 16 | **6.337 [0.317]** | 8.239 [0.484] | 23.1% | 0.9732 / 0.9622 |
+The complete forward-and-backward curve uses the same model-derived local EP
+shards and deterministic balanced routes as the inference curve. The lower
+panel includes Transformer Engine only for standard SwiGLU models with an
+exact activation contract. Bounded SwiGLU, SwiGLU-OAI, and ReLU² remain in the
+absolute LightMoE panel and are not compared with a different TE activation.
 
-All six rows pass the validity gates. The maximum repeat deviation is 3.68%
-and the maximum host/CUDA ratio is 1.012. Input, router, gate/up-weight, and
-down-weight gradients are present and finite. These are precision checks, not
+| Model | `M=32` ms `[IQR]` | `M=512` ms `[IQR]` | `M=8,192` ms `[IQR]` | TE / LightMoE at `M=8,192` |
+|---|---:|---:|---:|---:|
+| Qwen3.5-35B-A3B | 2.140 [0.037] | 2.163 [0.034] | 2.174 [0.036] | **1.914×** |
+| Qwen3.5-397B-A17B | 2.188 [0.032] | 2.207 [0.042] | 4.066 [0.023] | **1.505×** |
+| DeepSeek-V4-Flash | 2.085 [0.140] | 2.090 [0.118] | 3.791 [0.115] | — |
+| GLM-5.2 | 2.207 [0.046] | 2.215 [0.047] | 6.465 [0.117] | **1.369×** |
+| MiniMax-M3 | 2.069 [0.116] | 2.120 [0.150] | 4.646 [0.046] | — |
+| Nemotron-3.5-Lightning-30B-A3B | 2.058 [0.111] | 2.066 [0.093] | 2.480 [0.028] | — |
+
+All 30 LightMoE points and all 15 exact-contract TE points pass the measurement
+gates. The maximum LightMoE repeat deviation is 1.98% and the maximum
+host/CUDA ratio is 1.014. Input, router, expert-weight, and output gradients
+are finite. Minimum sampled cosine against the BF16 reference is 0.9726 for
+outputs and 0.9617 for input gradients. These are precision checks, not
 training-convergence results.
 
 ## Full-model vLLM serving

@@ -24,10 +24,12 @@ Exact timing boundaries, model shapes, and measured results are documented in
 
 ## 📈 Performance
 
-[![LightMoE performance on NVIDIA Blackwell](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/performance.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md)
+[![Complete MoE inference scaling](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-inference-scaling.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md#complete-moe-inference)
 
-The current model-derived matrix covers Qwen3.5, DeepSeek V4, Kimi K3,
-GLM-5.2, MiniMax-M3, and Nemotron 3.5 expert shapes.
+[![Complete MoE training scaling](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-training-scaling.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md#routed-expert-training)
+
+The grouped GEMM matrix also covers Kimi K3. Complete-layer curves use the six
+exact model contracts shown above.
 
 ## ⚡ Highlights
 
