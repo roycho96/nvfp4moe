@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lightmoe"
 dynamic = ["version"]
-description = "CuTe DSL NVFP4 GEMM and MoE kernels for NVIDIA B200"
+description = "CuTe DSL NVFP4 GEMM and MoE kernels for NVIDIA Blackwell SM100"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"

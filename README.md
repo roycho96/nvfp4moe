@@ -1,11 +1,11 @@
 # LightMoE
 
-> Fast NVFP4 GEMM and Mixture-of-Experts kernels for NVIDIA B200, written in
-> CuTe DSL.
+> Fast NVFP4 GEMM and Mixture-of-Experts kernels for NVIDIA Blackwell SM100,
+> written in CuTe DSL.
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://www.python.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-13-76B900.svg)](https://developer.nvidia.com/cuda-toolkit)
-![GPU](https://img.shields.io/badge/GPU-B200%20(sm100)-76B900.svg)
+![GPU](https://img.shields.io/badge/GPU-Blackwell%20SM100-76B900.svg)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 LightMoE provides standalone dense and grouped GEMM, a reusable-workspace MoE
@@ -41,7 +41,7 @@ Exact timing boundaries, model shapes, and measured results are documented in
 
 | Requirement | Version |
 |---|---|
-| GPU | NVIDIA B200 (`sm100`) |
+| GPU | NVIDIA Blackwell SM100; validated on B200 |
 | Python | 3.12 |
 | CUDA | 13 |
 | PyTorch | 2.11 or newer |
@@ -203,7 +203,7 @@ not exported from the package root.
 
 ## 📐 Limits
 
-- B200 (`sm100`) only
+- NVIDIA Blackwell SM100; validated on B200
 - `K` aligned to 64
 - At most 256 local experts
 - At most 131,072 token–expert assignments in the complete layer

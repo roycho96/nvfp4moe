@@ -1,4 +1,4 @@
-"""CuTe DSL NVFP4 GEMM and MoE kernels for NVIDIA B200."""
+"""CuTe DSL NVFP4 GEMM and MoE kernels for NVIDIA Blackwell SM100."""
 
 from importlib import import_module
 
