@@ -22,6 +22,25 @@ input gradients, weight gradients, and router gradients.
 Exact timing boundaries, model shapes, and measured results are documented in
 [BENCHMARKS.md](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md).
 
+## 🧩 Model coverage
+
+The benchmark and configuration registry includes these model-derived expert
+contracts. LightMoE exposes kernels and routed expert layers; it does not load
+or patch model checkpoints.
+
+| Model | Hidden / intermediate | Experts / top-k | Activation | Coverage |
+|---|---:|---:|---|---|
+| Qwen3.5-35B-A3B | 2048 / 512 | 256 / 8 | SwiGLU | Grouped GEMM and complete MoE layer |
+| Qwen3.5-397B-A17B | 4096 / 1024 | 512 / 10 | SwiGLU | Grouped GEMM and complete MoE layer |
+| DeepSeek-V4-Flash | 4096 / 2048 | 256 / 6 | Bounded SwiGLU | Grouped GEMM and complete MoE layer |
+| GLM-5.2 | 6144 / 2048 | 256 / 8 | SwiGLU | Grouped GEMM and complete MoE layer |
+| MiniMax-M3 | 6144 / 3072 | 128 / 4 | SwiGLU-OAI | Grouped GEMM and complete MoE layer |
+| Nemotron-3.5-Lightning-30B-A3B | 2688 / 1856 | 128 / 6 | ReLU² | Grouped GEMM and complete MoE layer |
+| Kimi-K3 | 3584 / 3072 | 896 / 16 | SiTU-GLU | Grouped latent-expert GEMM |
+
+Kimi-K3's outer latent projections and SiTU-GLU activation are outside the
+current complete-layer API.
+
 ## 📈 Performance
 
 [![Complete MoE inference latency](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-inference-latency.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md#complete-moe-inference)
@@ -31,9 +50,6 @@ Exact timing boundaries, model shapes, and measured results are documented in
 [![Complete MoE training latency](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-training-latency.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md#routed-expert-training)
 
 [![Complete MoE training speedup](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-training-speedup.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md#routed-expert-training)
-
-The grouped GEMM matrix also covers Kimi K3. Complete-layer curves use the six
-exact model contracts shown above.
 
 ## ⚡ Highlights
 
