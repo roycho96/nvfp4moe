@@ -21,30 +21,17 @@ from dataclasses import asdict, dataclass
 
 from lightmoe.gemm import quantize
 
-try:
-    from .model_shapes import (
-        FULL_ROUTINGS,
-        MODEL_SHAPES,
-        QUICK_ROUTINGS,
-        GemmCase,
-        generate_gemm_cases,
-        parse_ints,
-        parse_models,
-        parse_names,
-        routing_counts,
-    )
-except ImportError:
-    from model_shapes import (  # type: ignore[no-redef]
-        FULL_ROUTINGS,
-        MODEL_SHAPES,
-        QUICK_ROUTINGS,
-        GemmCase,
-        generate_gemm_cases,
-        parse_ints,
-        parse_models,
-        parse_names,
-        routing_counts,
-    )
+from .model_shapes import (
+    FULL_ROUTINGS,
+    MODEL_SHAPES,
+    QUICK_ROUTINGS,
+    GemmCase,
+    generate_gemm_cases,
+    parse_ints,
+    parse_models,
+    parse_names,
+    routing_counts,
+)
 
 BACKEND_NAMES = (
     "lightmoe",

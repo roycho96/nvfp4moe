@@ -19,34 +19,20 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-os.environ.setdefault("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+from .model_shapes import (
+    FULL_ROUTINGS,
+    MODEL_SHAPES,
+    QUICK_ROUTINGS,
+    ModelShape,
+    MoeCase,
+    generate_moe_cases,
+    parse_ints,
+    parse_models,
+    parse_names,
+    routing_counts,
+)
 
-try:
-    from .model_shapes import (
-        FULL_ROUTINGS,
-        MODEL_SHAPES,
-        QUICK_ROUTINGS,
-        ModelShape,
-        MoeCase,
-        generate_moe_cases,
-        parse_ints,
-        parse_models,
-        parse_names,
-        routing_counts,
-    )
-except ImportError:
-    from model_shapes import (  # type: ignore[no-redef]
-        FULL_ROUTINGS,
-        MODEL_SHAPES,
-        QUICK_ROUTINGS,
-        ModelShape,
-        MoeCase,
-        generate_moe_cases,
-        parse_ints,
-        parse_models,
-        parse_names,
-        routing_counts,
-    )
+os.environ.setdefault("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
 
 
 BACKEND_NAMES = (

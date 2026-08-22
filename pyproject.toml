@@ -32,14 +32,6 @@ test = [
     "pytest>=8",
     "ruff>=0.12",
 ]
-benchmark = [
-    "accelerate>=1.10",
-    "datasets>=4.0",
-    "huggingface-hub>=0.34",
-    "modal>=1.5",
-    "safetensors>=0.5",
-    "transformers>=5.5,<5.8",
-]
 
 [tool.setuptools.dynamic]
 version = {attr = "lightmoe.__version__"}

@@ -47,7 +47,7 @@ The reference environment is `nvcr.io/nvidia/pytorch:26.07-py3`.
 
 ```bash
 python -m pip install .
-python -m pip install '.[test,benchmark]'
+python -m pip install '.[test]'
 ```
 
 The first call compiles the selected kernel geometry. Keep construction,
@@ -203,21 +203,17 @@ not exported from the package root.
 - `K` aligned to 64
 - At most 256 local experts
 - At most 131,072 token–expert assignments in the complete layer
-- Single-GPU public kernels; the benchmark suite includes a reference NCCL
-  expert-parallel pipeline
+- Public kernels and benchmark runners are single-GPU
 - Precision tables are operator and layer checks, not convergence results
 
 ## 📊 Benchmarks
 
 ```bash
-python benchmarks/nvfp4_gemm.py --list --suite full
-python benchmarks/moe.py --list --suite full
-modal run benchmarks/modal_ci.py --grouped api
-modal run benchmarks/modal_ci.py::benchmark_inference --preset full
-modal run benchmarks/modal_ci.py::benchmark_distributed --preset inference
-modal run benchmarks/modal_ci.py::benchmark_distributed --preset training
+python -m benchmarks.nvfp4_gemm --list --suite full
+python -m benchmarks.moe --list --suite full
 ```
 
+Comparison backends are used only when their packages are already installed.
 See [BENCHMARKS.md](BENCHMARKS.md) for measurement rules and results.
 
 ## 🧪 Development

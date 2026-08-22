@@ -165,25 +165,17 @@ FineWeb-Edu trace measured cosine 0.996526 for output, 0.975384 for input
 gradient, 0.992358 for router gradient, 0.968857 for gate/up weight gradient,
 and 0.986734 for down-weight gradient.
 
-## Reproduce
+## Run
 
 ```bash
-python benchmarks/nvfp4_gemm.py \
+python -m benchmarks.nvfp4_gemm \
   --models all --tokens 8192 --routing balanced,imbalanced \
   --backends lightmoe,flashinfer_cutedsl,torch_scaled_grouped_mm \
   --mode prepacked --warmup 3 --iterations 20
 
-python benchmarks/moe.py \
+python -m benchmarks.moe \
   --models qwen3_30b_a3b,deepseek_v3_2,kimi_k2_7,minimax_m2 \
   --tokens 8192 --routing balanced,imbalanced \
   --backends lightmoe,transformer_engine_nvfp4_fused,pytorch_bf16 \
   --scope full-layer --pass fwd_bwd --interleave-training
-
-modal run benchmarks/modal_ci.py --matrix gemm
-modal run benchmarks/modal_ci.py --matrix moe-training
-modal run benchmarks/modal_ci.py::benchmark_distributed --preset inference-extended
-modal run benchmarks/modal_ci.py::benchmark_distributed --preset training
 ```
-
-Keep the JSONL output, profiler artifacts, environment versions, and git
-revision with every published result.
