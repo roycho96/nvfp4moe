@@ -24,9 +24,13 @@ Exact timing boundaries, model shapes, and measured results are documented in
 
 ## 📈 Performance
 
-[![Complete MoE inference scaling](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-inference-scaling.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md#complete-moe-inference)
+[![Complete MoE inference latency](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-inference-latency.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md#complete-moe-inference)
 
-[![Complete MoE training scaling](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-training-scaling.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md#routed-expert-training)
+[![Complete MoE inference speedup](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-inference-speedup.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md#complete-moe-inference)
+
+[![Complete MoE training latency](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-training-latency.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md#routed-expert-training)
+
+[![Complete MoE training speedup](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-training-speedup.svg)](https://github.com/roycho96/lightmoe/blob/main/BENCHMARKS.md#routed-expert-training)
 
 The grouped GEMM matrix also covers Kimi K3. Complete-layer curves use the six
 exact model contracts shown above.

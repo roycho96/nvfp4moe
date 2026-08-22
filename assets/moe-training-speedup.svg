@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="660" viewBox="0 0 1200 660" role="img" aria-labelledby="title desc">
+<title id="title">Complete MoE training speedup</title>
+<desc id="desc">LightMoE complete routed-expert training speedup over Transformer Engine for exact standard-SwiGLU model contracts.</desc>
+<defs><style>
+text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.bg { fill:#f8fafc; } .panel { fill:#fff; stroke:#e2e8f0; stroke-width:1; }
+.title { fill:#0f172a; font-size:30px; font-weight:650; } .subtitle { fill:#64748b; font-size:14px; }
+.plot-title { fill:#0f172a; font-size:16px; font-weight:650; } .axis { fill:#475569; font-size:12px; }
+.tick { fill:#64748b; font-size:11px; } .legend { fill:#334155; font-size:12px; font-weight:550; }
+.grid { stroke:#e2e8f0; stroke-width:1; } .reference { stroke:#475569; stroke-width:1.8; stroke-dasharray:6 5; }
+.line { fill:none; stroke-width:3; stroke-linecap:round; stroke-linejoin:round; }
+.marker { fill:#fff; stroke-width:2.5; } .footer { fill:#64748b; font-size:11px; }
+.zone-win { fill:#10b981; opacity:.07; } .zone-loss { fill:#e11d48; opacity:.06; }
+.zone-label { fill:#475569; font-size:11px; font-weight:600; } .endpoint { font-size:12px; font-weight:650; }
+.c0{stroke:#2563eb}.c1{stroke:#f97316}.c2{stroke:#10b981}.c3{stroke:#8b5cf6}.c4{stroke:#e11d48}.c5{stroke:#0891b2}
+.fill0{fill:#2563eb}.fill1{fill:#f97316}.fill2{fill:#10b981}.fill3{fill:#8b5cf6}.fill4{fill:#e11d48}.fill5{fill:#0891b2}
+@media(prefers-color-scheme:dark){
+.bg{fill:#0b1220}.panel{fill:#111827;stroke:#273449}.title,.plot-title{fill:#f1f5f9}
+.subtitle,.tick,.footer{fill:#94a3b8}.axis,.legend,.zone-label{fill:#cbd5e1}.grid{stroke:#273449}.reference{stroke:#94a3b8}.marker{fill:#111827}
+.zone-win{fill:#34d399;opacity:.08}.zone-loss{fill:#fb7185;opacity:.07}
+.c0{stroke:#60a5fa}.c1{stroke:#fb923c}.c2{stroke:#34d399}.c3{stroke:#a78bfa}.c4{stroke:#fb7185}.c5{stroke:#22d3ee}
+.fill0{fill:#60a5fa}.fill1{fill:#fb923c}.fill2{fill:#34d399}.fill3{fill:#a78bfa}.fill4{fill:#fb7185}.fill5{fill:#22d3ee}
+}
+</style></defs>
+<rect class="bg" width="1200" height="660" rx="22"/>
+<text class="title" x="55" y="51">Complete MoE training speedup</text>
+<text class="subtitle" x="55" y="78">Transformer Engine latency / LightMoE latency · exact standard-SwiGLU contracts</text>
+<line class="line c0" x1="88" y1="116" x2="113" y2="116"/>
+<circle class="marker c0" cx="100.5" cy="116" r="3.5"/>
+<text class="legend" x="124" y="120">Qwen3.5 35B-A3B</text>
+<line class="line c1" x1="453" y1="116" x2="478" y2="116"/>
+<circle class="marker c1" cx="465.5" cy="116" r="3.5"/>
+<text class="legend" x="489" y="120">Qwen3.5 397B-A17B</text>
+<line class="line c3" x1="818" y1="116" x2="843" y2="116"/>
+<circle class="marker c3" cx="830.5" cy="116" r="3.5"/>
+<text class="legend" x="854" y="120">GLM-5.2</text>
+<rect class="panel" x="42" y="165" width="1116" height="425" rx="16"/>
+<text class="plot-title" x="70" y="190">Speedup over Transformer Engine · 21-sample medians</text>
+<rect class="zone-win" x="105" y="205" width="1040" height="330.00"/>
+<text class="zone-label" x="115" y="223">LightMoE faster</text>
+<line class="reference" x1="105" y1="535.00" x2="1145" y2="535.00"/>
+<text class="tick" x="91" y="539.00" text-anchor="end">1</text>
+<line class="grid" x1="105" y1="456.43" x2="1145" y2="456.43"/>
+<text class="tick" x="91" y="460.43" text-anchor="end">1.25</text>
+<line class="grid" x1="105" y1="377.86" x2="1145" y2="377.86"/>
+<text class="tick" x="91" y="381.86" text-anchor="end">1.5</text>
+<line class="grid" x1="105" y1="299.29" x2="1145" y2="299.29"/>
+<text class="tick" x="91" y="303.29" text-anchor="end">1.75</text>
+<line class="grid" x1="105" y1="220.71" x2="1145" y2="220.71"/>
+<text class="tick" x="91" y="224.71" text-anchor="end">2</text>
+<line class="grid" x1="105.00" y1="205" x2="105.00" y2="535"/>
+<text class="tick" x="105.00" y="558" text-anchor="middle">32</text>
+<line class="grid" x1="365.00" y1="205" x2="365.00" y2="535"/>
+<text class="tick" x="365.00" y="558" text-anchor="middle">128</text>
+<line class="grid" x1="625.00" y1="205" x2="625.00" y2="535"/>
+<text class="tick" x="625.00" y="558" text-anchor="middle">512</text>
+<line class="grid" x1="885.00" y1="205" x2="885.00" y2="535"/>
+<text class="tick" x="885.00" y="558" text-anchor="middle">2,048</text>
+<line class="grid" x1="1145.00" y1="205" x2="1145.00" y2="535"/>
+<text class="tick" x="1145.00" y="558" text-anchor="middle">8,192</text>
+<text class="axis" transform="translate(64 370.00) rotate(-90)" text-anchor="middle">Speedup vs Transformer Engine (×)</text>
+<text class="axis" x="625" y="585" text-anchor="middle">Input tokens per MoE layer (before top-k)</text>
+<path class="line c0" d="M 105.00 276.05 L 365.00 273.39 L 625.00 271.97 L 885.00 269.12 L 1145.00 247.63"/>
+<circle class="marker c0" cx="105.00" cy="276.05" r="4.5"/>
+<circle class="marker c0" cx="365.00" cy="273.39" r="4.5"/>
+<circle class="marker c0" cx="625.00" cy="271.97" r="4.5"/>
+<circle class="marker c0" cx="885.00" cy="269.12" r="4.5"/>
+<circle class="marker c0" cx="1145.00" cy="247.63" r="4.5"/>
+<text class="endpoint fill0" x="1133.00" y="237.63" text-anchor="end">1.91×</text>
+<path class="line c1" d="M 105.00 275.39 L 365.00 271.19 L 625.00 271.89 L 885.00 260.69 L 1145.00 376.32"/>
+<circle class="marker c1" cx="105.00" cy="275.39" r="4.5"/>
+<circle class="marker c1" cx="365.00" cy="271.19" r="4.5"/>
+<circle class="marker c1" cx="625.00" cy="271.89" r="4.5"/>
+<circle class="marker c1" cx="885.00" cy="260.69" r="4.5"/>
+<circle class="marker c1" cx="1145.00" cy="376.32" r="4.5"/>
+<text class="endpoint fill1" x="1133.00" y="366.32" text-anchor="end">1.50×</text>
+<path class="line c3" d="M 105.00 271.53 L 365.00 268.00 L 625.00 269.92 L 885.00 304.06 L 1145.00 418.99"/>
+<circle class="marker c3" cx="105.00" cy="271.53" r="4.5"/>
+<circle class="marker c3" cx="365.00" cy="268.00" r="4.5"/>
+<circle class="marker c3" cx="625.00" cy="269.92" r="4.5"/>
+<circle class="marker c3" cx="885.00" cy="304.06" r="4.5"/>
+<circle class="marker c3" cx="1145.00" cy="418.99" r="4.5"/>
+<text class="endpoint fill3" x="1133.00" y="408.99" text-anchor="end">1.37×</text>
+<text class="footer" x="55" y="638">Only exact standard-SwiGLU contracts are compared · all measured points favor LightMoE</text>
+</svg>

@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="660" viewBox="0 0 1200 660" role="img" aria-labelledby="title desc">
+<title id="title">Complete MoE inference speedup</title>
+<desc id="desc">LightMoE complete routed-expert inference speedup over FlashInfer TensorRT-LLM across model-derived token counts.</desc>
+<defs><style>
+text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.bg { fill:#f8fafc; } .panel { fill:#fff; stroke:#e2e8f0; stroke-width:1; }
+.title { fill:#0f172a; font-size:30px; font-weight:650; } .subtitle { fill:#64748b; font-size:14px; }
+.plot-title { fill:#0f172a; font-size:16px; font-weight:650; } .axis { fill:#475569; font-size:12px; }
+.tick { fill:#64748b; font-size:11px; } .legend { fill:#334155; font-size:12px; font-weight:550; }
+.grid { stroke:#e2e8f0; stroke-width:1; } .reference { stroke:#475569; stroke-width:1.8; stroke-dasharray:6 5; }
+.line { fill:none; stroke-width:3; stroke-linecap:round; stroke-linejoin:round; }
+.marker { fill:#fff; stroke-width:2.5; } .footer { fill:#64748b; font-size:11px; }
+.zone-win { fill:#10b981; opacity:.07; } .zone-loss { fill:#e11d48; opacity:.06; }
+.zone-label { fill:#475569; font-size:11px; font-weight:600; } .endpoint { font-size:12px; font-weight:650; }
+.c0{stroke:#2563eb}.c1{stroke:#f97316}.c2{stroke:#10b981}.c3{stroke:#8b5cf6}.c4{stroke:#e11d48}.c5{stroke:#0891b2}
+.fill0{fill:#2563eb}.fill1{fill:#f97316}.fill2{fill:#10b981}.fill3{fill:#8b5cf6}.fill4{fill:#e11d48}.fill5{fill:#0891b2}
+@media(prefers-color-scheme:dark){
+.bg{fill:#0b1220}.panel{fill:#111827;stroke:#273449}.title,.plot-title{fill:#f1f5f9}
+.subtitle,.tick,.footer{fill:#94a3b8}.axis,.legend,.zone-label{fill:#cbd5e1}.grid{stroke:#273449}.reference{stroke:#94a3b8}.marker{fill:#111827}
+.zone-win{fill:#34d399;opacity:.08}.zone-loss{fill:#fb7185;opacity:.07}
+.c0{stroke:#60a5fa}.c1{stroke:#fb923c}.c2{stroke:#34d399}.c3{stroke:#a78bfa}.c4{stroke:#fb7185}.c5{stroke:#22d3ee}
+.fill0{fill:#60a5fa}.fill1{fill:#fb923c}.fill2{fill:#34d399}.fill3{fill:#a78bfa}.fill4{fill:#fb7185}.fill5{fill:#22d3ee}
+}
+</style></defs>
+<rect class="bg" width="1200" height="660" rx="22"/>
+<text class="title" x="55" y="51">Complete MoE inference speedup</text>
+<text class="subtitle" x="55" y="78">FlashInfer TensorRT-LLM latency / LightMoE latency · above 1.0 means LightMoE is faster</text>
+<line class="line c0" x1="88" y1="116" x2="113" y2="116"/>
+<circle class="marker c0" cx="100.5" cy="116" r="3.5"/>
+<text class="legend" x="124" y="120">Qwen3.5 35B-A3B</text>
+<line class="line c1" x1="453" y1="116" x2="478" y2="116"/>
+<circle class="marker c1" cx="465.5" cy="116" r="3.5"/>
+<text class="legend" x="489" y="120">Qwen3.5 397B-A17B</text>
+<line class="line c2" x1="818" y1="116" x2="843" y2="116"/>
+<circle class="marker c2" cx="830.5" cy="116" r="3.5"/>
+<text class="legend" x="854" y="120">DeepSeek V4 Flash</text>
+<line class="line c3" x1="88" y1="143" x2="113" y2="143"/>
+<circle class="marker c3" cx="100.5" cy="143" r="3.5"/>
+<text class="legend" x="124" y="147">GLM-5.2</text>
+<line class="line c4" x1="453" y1="143" x2="478" y2="143"/>
+<circle class="marker c4" cx="465.5" cy="143" r="3.5"/>
+<text class="legend" x="489" y="147">MiniMax M3</text>
+<line class="line c5" x1="818" y1="143" x2="843" y2="143"/>
+<circle class="marker c5" cx="830.5" cy="143" r="3.5"/>
+<text class="legend" x="854" y="147">Nemotron 3.5 30B-A3B</text>
+<rect class="panel" x="42" y="165" width="1116" height="425" rx="16"/>
+<text class="plot-title" x="70" y="190">Speedup over FlashInfer TensorRT-LLM · 21-sample medians</text>
+<rect class="zone-win" x="105" y="205" width="1040" height="279.84"/>
+<rect class="zone-loss" x="105" y="484.84" width="1040" height="50.16"/>
+<text class="zone-label" x="115" y="223">LightMoE faster</text>
+<text class="zone-label" x="115" y="525">FlashInfer faster</text>
+<line class="grid" x1="105" y1="529.89" x2="1145" y2="529.89"/>
+<text class="tick" x="91" y="533.89" text-anchor="end">0.8</text>
+<line class="reference" x1="105" y1="484.84" x2="1145" y2="484.84"/>
+<text class="tick" x="91" y="488.84" text-anchor="end">1</text>
+<line class="grid" x1="105" y1="439.80" x2="1145" y2="439.80"/>
+<text class="tick" x="91" y="443.80" text-anchor="end">1.25</text>
+<line class="grid" x1="105" y1="403.00" x2="1145" y2="403.00"/>
+<text class="tick" x="91" y="407.00" text-anchor="end">1.5</text>
+<line class="grid" x1="105" y1="344.92" x2="1145" y2="344.92"/>
+<text class="tick" x="91" y="348.92" text-anchor="end">2</text>
+<line class="grid" x1="105" y1="263.07" x2="1145" y2="263.07"/>
+<text class="tick" x="91" y="267.07" text-anchor="end">3</text>
+<line class="grid" x1="105" y1="205.00" x2="1145" y2="205.00"/>
+<text class="tick" x="91" y="209.00" text-anchor="end">4</text>
+<line class="grid" x1="105.00" y1="205" x2="105.00" y2="535"/>
+<text class="tick" x="105.00" y="558" text-anchor="middle">1</text>
+<line class="grid" x1="345.00" y1="205" x2="345.00" y2="535"/>
+<text class="tick" x="345.00" y="558" text-anchor="middle">8</text>
+<line class="grid" x1="505.00" y1="205" x2="505.00" y2="535"/>
+<text class="tick" x="505.00" y="558" text-anchor="middle">32</text>
+<line class="grid" x1="665.00" y1="205" x2="665.00" y2="535"/>
+<text class="tick" x="665.00" y="558" text-anchor="middle">128</text>
+<line class="grid" x1="825.00" y1="205" x2="825.00" y2="535"/>
+<text class="tick" x="825.00" y="558" text-anchor="middle">512</text>
+<line class="grid" x1="985.00" y1="205" x2="985.00" y2="535"/>
+<text class="tick" x="985.00" y="558" text-anchor="middle">2,048</text>
+<line class="grid" x1="1145.00" y1="205" x2="1145.00" y2="535"/>
+<text class="tick" x="1145.00" y="558" text-anchor="middle">8,192</text>
+<text class="axis" transform="translate(64 370.00) rotate(-90)" text-anchor="middle">Speedup vs FlashInfer (×, log scale)</text>
+<text class="axis" x="625" y="585" text-anchor="middle">Input tokens per MoE layer (before top-k)</text>
+<path class="line c0" d="M 105.00 484.83 L 345.00 458.47 L 505.00 463.39 L 665.00 515.90 L 825.00 328.44 L 985.00 421.31 L 1145.00 433.47"/>
+<circle class="marker c0" cx="105.00" cy="484.83" r="4.5"/>
+<circle class="marker c0" cx="345.00" cy="458.47" r="4.5"/>
+<circle class="marker c0" cx="505.00" cy="463.39" r="4.5"/>
+<circle class="marker c0" cx="665.00" cy="515.90" r="4.5"/>
+<circle class="marker c0" cx="825.00" cy="328.44" r="4.5"/>
+<circle class="marker c0" cx="985.00" cy="421.31" r="4.5"/>
+<circle class="marker c0" cx="1145.00" cy="433.47" r="4.5"/>
+<path class="line c1" d="M 105.00 484.46 L 345.00 472.39 L 505.00 504.64 L 665.00 422.46 L 825.00 369.80 L 985.00 438.50 L 1145.00 446.22"/>
+<circle class="marker c1" cx="105.00" cy="484.46" r="4.5"/>
+<circle class="marker c1" cx="345.00" cy="472.39" r="4.5"/>
+<circle class="marker c1" cx="505.00" cy="504.64" r="4.5"/>
+<circle class="marker c1" cx="665.00" cy="422.46" r="4.5"/>
+<circle class="marker c1" cx="825.00" cy="369.80" r="4.5"/>
+<circle class="marker c1" cx="985.00" cy="438.50" r="4.5"/>
+<circle class="marker c1" cx="1145.00" cy="446.22" r="4.5"/>
+<path class="line c2" d="M 105.00 484.02 L 345.00 421.92 L 505.00 522.98 L 665.00 442.02 L 825.00 446.59 L 985.00 422.40 L 1145.00 421.96"/>
+<circle class="marker c2" cx="105.00" cy="484.02" r="4.5"/>
+<circle class="marker c2" cx="345.00" cy="421.92" r="4.5"/>
+<circle class="marker c2" cx="505.00" cy="522.98" r="4.5"/>
+<circle class="marker c2" cx="665.00" cy="442.02" r="4.5"/>
+<circle class="marker c2" cx="825.00" cy="446.59" r="4.5"/>
+<circle class="marker c2" cx="985.00" cy="422.40" r="4.5"/>
+<circle class="marker c2" cx="1145.00" cy="421.96" r="4.5"/>
+<path class="line c3" d="M 105.00 491.81 L 345.00 424.71 L 505.00 488.52 L 665.00 501.60 L 825.00 229.82 L 985.00 364.18 L 1145.00 421.51"/>
+<circle class="marker c3" cx="105.00" cy="491.81" r="4.5"/>
+<circle class="marker c3" cx="345.00" cy="424.71" r="4.5"/>
+<circle class="marker c3" cx="505.00" cy="488.52" r="4.5"/>
+<circle class="marker c3" cx="665.00" cy="501.60" r="4.5"/>
+<circle class="marker c3" cx="825.00" cy="229.82" r="4.5"/>
+<circle class="marker c3" cx="985.00" cy="364.18" r="4.5"/>
+<circle class="marker c3" cx="1145.00" cy="421.51" r="4.5"/>
+<path class="line c4" d="M 105.00 494.52 L 345.00 418.85 L 505.00 491.40 L 665.00 499.03 L 825.00 236.85 L 985.00 350.08 L 1145.00 399.83"/>
+<circle class="marker c4" cx="105.00" cy="494.52" r="4.5"/>
+<circle class="marker c4" cx="345.00" cy="418.85" r="4.5"/>
+<circle class="marker c4" cx="505.00" cy="491.40" r="4.5"/>
+<circle class="marker c4" cx="665.00" cy="499.03" r="4.5"/>
+<circle class="marker c4" cx="825.00" cy="236.85" r="4.5"/>
+<circle class="marker c4" cx="985.00" cy="350.08" r="4.5"/>
+<circle class="marker c4" cx="1145.00" cy="399.83" r="4.5"/>
+<path class="line c5" d="M 105.00 484.70 L 345.00 461.20 L 505.00 524.65 L 665.00 470.14 L 825.00 486.53 L 985.00 460.32 L 1145.00 452.36"/>
+<circle class="marker c5" cx="105.00" cy="484.70" r="4.5"/>
+<circle class="marker c5" cx="345.00" cy="461.20" r="4.5"/>
+<circle class="marker c5" cx="505.00" cy="524.65" r="4.5"/>
+<circle class="marker c5" cx="665.00" cy="470.14" r="4.5"/>
+<circle class="marker c5" cx="825.00" cy="486.53" r="4.5"/>
+<circle class="marker c5" cx="985.00" cy="460.32" r="4.5"/>
+<circle class="marker c5" cx="1145.00" cy="452.36" r="4.5"/>
+<text class="footer" x="55" y="638">Green region favors LightMoE · red region favors FlashInfer · identical complete-layer boundary</text>
+</svg>

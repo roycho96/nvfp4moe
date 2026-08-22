@@ -75,7 +75,9 @@ size.
 
 ## Complete MoE inference
 
-[![Complete MoE inference scaling](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-inference-scaling.svg)](https://github.com/roycho96/lightmoe/blob/main/assets/moe-inference-scaling.svg)
+[![Complete MoE inference latency](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-inference-latency.svg)](https://github.com/roycho96/lightmoe/blob/main/assets/moe-inference-latency.svg)
+
+[![Complete MoE inference speedup](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-inference-speedup.svg)](https://github.com/roycho96/lightmoe/blob/main/assets/moe-inference-speedup.svg)
 
 `M` is the number of input tokens before top-k routing; the layer processes
 `M × top-k` token–expert assignments. Each point uses the model-derived local
@@ -97,17 +99,19 @@ tactic loading happen before capture.
 All 42 points pass the measurement gates. The maximum LightMoE repeat
 deviation is 3.64% and the maximum host/CUDA ratio is 1.054. Ratios below 1.0
 identify short-token points where FlashInfer is faster; they are retained in
-the lower panel.
+the speedup chart.
 
 ## Routed-expert training
 
-[![Complete MoE training scaling](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-training-scaling.svg)](https://github.com/roycho96/lightmoe/blob/main/assets/moe-training-scaling.svg)
+[![Complete MoE training latency](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-training-latency.svg)](https://github.com/roycho96/lightmoe/blob/main/assets/moe-training-latency.svg)
+
+[![Complete MoE training speedup](https://raw.githubusercontent.com/roycho96/lightmoe/main/assets/moe-training-speedup.svg)](https://github.com/roycho96/lightmoe/blob/main/assets/moe-training-speedup.svg)
 
 The complete forward-and-backward curve uses the same model-derived local EP
-shards and deterministic balanced routes as the inference curve. The lower
-panel includes Transformer Engine only for standard SwiGLU models with an
+shards and deterministic balanced routes as the inference curve. The speedup
+chart includes Transformer Engine only for standard SwiGLU models with an
 exact activation contract. Bounded SwiGLU, SwiGLU-OAI, and ReLU² remain in the
-absolute LightMoE panel and are not compared with a different TE activation.
+LightMoE latency chart and are not compared with a different TE activation.
 
 | Model | `M=32` ms `[IQR]` | `M=512` ms `[IQR]` | `M=8,192` ms `[IQR]` | TE / LightMoE at `M=8,192` |
 |---|---:|---:|---:|---:|
