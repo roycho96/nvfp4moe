@@ -1,29 +1,49 @@
 # LightMoE
 
-LightMoE is a CuTe DSL kernel library for NVFP4 GEMM and Mixture-of-Experts
-workloads on NVIDIA B200 (`sm100`). It provides standalone dense and grouped
-GEMM, a reusable-workspace inference layer, and deterministic training kernels
-for dispatch, combine, input gradients, weight gradients, and router gradients.
+> Fast NVFP4 GEMM and Mixture-of-Experts kernels for NVIDIA B200, written in
+> CuTe DSL.
 
-The public API has four entry points:
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://www.python.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-13-76B900.svg)](https://developer.nvidia.com/cuda-toolkit)
+![GPU](https://img.shields.io/badge/GPU-B200%20(sm100)-76B900.svg)
+[![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-- `lightmoe.gemm`: standalone dense and grouped GEMM
-- `lightmoe.InferenceMoE`: allocation-free inference with reusable workspaces
-- `lightmoe.MoEDispatch`: deterministic expert-major token permutation
-- `lightmoe.MoEExpertLayer`: single-GPU expert training layer
+LightMoE provides standalone dense and grouped GEMM, a reusable-workspace MoE
+inference layer, and deterministic training kernels for dispatch, combine,
+input gradients, weight gradients, and router gradients.
 
-Measured results and exact timing boundaries are in
+| API | Purpose |
+|---|---|
+| `lightmoe.gemm` | Standalone dense and grouped NVFP4 GEMM |
+| `lightmoe.InferenceMoE` | Prefill and decode with reusable workspaces |
+| `lightmoe.MoEDispatch` | Deterministic expert-major token dispatch |
+| `lightmoe.MoEExpertLayer` | Single-GPU expert training layer |
+
+Exact timing boundaries, model shapes, and measured results are documented in
 [BENCHMARKS.md](BENCHMARKS.md).
 
-## Requirements
+## ⚡ Highlights
 
-- NVIDIA B200 (`sm100`)
-- Python 3.12
-- CUDA 13
-- PyTorch 2.11 or newer
-- NVIDIA CUTLASS DSL 4.6 or 4.7
+- NVFP4 × NVFP4 GEMM with BF16 or FP32 output
+- Dynamic per-expert row counts, imbalanced routing, and zero-assignment experts
+- Fused SwiGLU, GeGLU, and ReGLU gate/up epilogues
+- Decode-specific and persistent prefill launch paths
+- Reusable inference storage with CUDA Graph support
+- Deterministic dispatch, combine, input-gradient, weight-gradient, and
+  router-gradient kernels
+- Direct kernel runtime API without a dispatcher or `torch.library` launch hop
 
-The reference container is `nvcr.io/nvidia/pytorch:26.07-py3`.
+## 🚀 Installation
+
+| Requirement | Version |
+|---|---|
+| GPU | NVIDIA B200 (`sm100`) |
+| Python | 3.12 |
+| CUDA | 13 |
+| PyTorch | 2.11 or newer |
+| NVIDIA CUTLASS DSL | 4.6 or 4.7 |
+
+The reference environment is `nvcr.io/nvidia/pytorch:26.07-py3`.
 
 ```bash
 python -m pip install .
@@ -33,13 +53,16 @@ python -m pip install '.[test,benchmark]'
 The first call compiles the selected kernel geometry. Keep construction,
 packing, and compilation outside latency measurements.
 
-## Dense GEMM
+## 🧮 Standalone GEMM
 
-`DenseGemm` computes `out = A @ B.T` from packed NVFP4 operands. The caller owns
-the output, so a warmed call does not allocate.
+### Dense GEMM
+
+`DenseGemm` computes `out = A @ B.T` from packed NVFP4 operands. The caller
+owns the output, so a warmed call does not allocate.
 
 ```python
 import torch
+
 from lightmoe.gemm import DenseGemm, quantize
 
 # a: [M, K] BF16, b: [N, K] BF16
@@ -54,13 +77,14 @@ gemm.run(qa, qb, out, sfa, sfb, scale_a * scale_b)
 `quantize` returns packed E2M1 values, blocked E4M3 scale factors, and a
 per-tensor dequantization scale. Packing is a separate operation.
 
-## Grouped GEMM
+### Grouped GEMM
 
 Grouped inputs use contiguous expert-major rows. `m_indptr` is an `int32` CUDA
 tensor of length `num_experts + 1`; zero-assignment experts are valid.
 
 ```python
 import torch
+
 from lightmoe.gemm import GroupedGemm, quantize_grouped
 
 # a: [sum(M_e), K], b: [num_experts, N, K]
@@ -77,12 +101,11 @@ gemm = GroupedGemm(
 gemm.run(qa, qb, out, m_indptr, sfa, sfb, alpha)
 ```
 
-`DenseGemm` and `GroupedGemm` expose the launch runtime directly. `run` and the
-call operator execute the same path, without a public dispatcher or output
-allocation. Tile choices remain explicit because the fastest geometry depends
-on matrix shape and the per-expert assignment distribution.
+`run` and the call operator execute the same launch path. Tile choices remain
+explicit because the fastest geometry depends on the matrix shape and expert
+assignment distribution.
 
-## MoE inference
+## 🔀 MoE inference
 
 `InferenceMoE` owns packed weights and fixed workspaces. One call includes
 dispatch, BF16 input quantization, gate/up projection, gated activation, NVFP4
@@ -103,29 +126,22 @@ moe.load_weights(gate_weight, up_weight, down_weight)
 moe.calibrate(calibration_input, top_k_ids, top_k_weights)
 moe.warmup(calibration_input, top_k_ids, top_k_weights)
 
-y = moe(input, top_k_ids, top_k_weights)
+y = moe(x, top_k_ids, top_k_weights)
 ```
 
-`top_k_ids` is contiguous CUDA `int32` with distinct expert indices per token;
-`top_k_weights` is contiguous CUDA `float32`. The returned workspace is reused
-by the next call. Pass `out=` for a caller-owned BF16 output. Frameworks with
-expert-major input can call
+`top_k_ids` must be contiguous CUDA `int32` with distinct expert indices per
+token. `top_k_weights` must be contiguous CUDA `float32`. Pass `out=` for a
+caller-owned BF16 output. Frameworks with expert-major input can call
 `run_routed(x, m_indptr, padded_offsets, out=...)`.
 
-Checkpoint activation scales can replace calibration through
-`set_activation_scales(input_scale, hidden_scale)`. A checkpoint with bounded
-SwiGLU can pass its bound as `activation_clamp=`. Use one plan per concurrent
-CUDA stream because workspaces are reused. A warmed plan can be captured in a
-CUDA Graph.
+Checkpoint scales can replace calibration through
+`set_activation_scales(input_scale, hidden_scale)`. Use one plan per concurrent
+CUDA stream because its workspaces are reused.
 
-Batch size 1 and small-batch decode use decode-specific dispatch and launch
-geometry. Larger decode batches and prefill use the persistent path.
+## 🧠 MoE training
 
-## MoE training
-
-The training layer keeps routing outputs in BF16 and provides deterministic
-dispatch, combine, router gradients, input gradients, and expert weight
-gradients.
+The training layer keeps routing outputs in BF16 and supports deterministic
+expert and router gradients.
 
 ```python
 from lightmoe import MoEDispatch, MoEExpertLayer
@@ -164,37 +180,36 @@ y = experts(
 Call `experts.refresh_weights()` after each optimizer step. Expert-parallel
 communication and routing policy remain the host framework's responsibility.
 
-## Kernel surface
+## 🗂️ Package layout
 
-- Dense and grouped NVFP4 × NVFP4 GEMM with BF16 or FP32 output
-- Grouped GEMM with dynamic per-expert assignment counts
-- Fused SwiGLU, GeGLU, and ReGLU gate/up epilogues
-- Static-scale inference with reusable storage and CUDA Graph replay
-- Grouped input-gradient and weight-gradient kernels
-- Deterministic dispatch, combine, and router gradients
-- Imbalanced routing, alignment-stress cases, and zero-assignment experts
+```text
+lightmoe/
+├── gemm.py          # Standalone GEMM API
+├── inference.py     # Reusable-workspace inference layer
+├── training.py      # Routed training layer
+└── kernels/
+    ├── dense/       # Dense GEMM
+    ├── grouped/     # Grouped GEMM and gradients
+    ├── quantize/    # NVFP4 packing and scaling
+    └── routing/     # Dispatch and combine
+```
 
-Low-level code is grouped under `lightmoe.kernels.dense`, `grouped`,
-`quantize`, and `routing`. These modules are available for profiling and kernel
-development but are not exported from the package root.
+Low-level modules are available for profiling and kernel development but are
+not exported from the package root.
 
-## Limits
+## 📐 Limits
 
 - B200 (`sm100`) only
 - `K` aligned to 64
 - At most 256 local experts
 - At most 131,072 token–expert assignments in the complete layer
-- The public package contains single-GPU kernels; the benchmark suite contains
-  a reference NCCL expert-parallel pipeline
+- Single-GPU public kernels; the benchmark suite includes a reference NCCL
+  expert-parallel pipeline
 - Precision tables are operator and layer checks, not convergence results
 
-## Development
+## 📊 Benchmarks
 
 ```bash
-ruff check lightmoe benchmarks tests
-ruff format --check lightmoe benchmarks tests
-python -m pytest -q
-
 python benchmarks/nvfp4_gemm.py --list --suite full
 python benchmarks/moe.py --list --suite full
 modal run benchmarks/modal_ci.py --grouped api
@@ -203,7 +218,17 @@ modal run benchmarks/modal_ci.py::benchmark_distributed --preset inference
 modal run benchmarks/modal_ci.py::benchmark_distributed --preset training
 ```
 
-## License
+See [BENCHMARKS.md](BENCHMARKS.md) for measurement rules and results.
+
+## 🧪 Development
+
+```bash
+ruff check lightmoe benchmarks tests
+ruff format --check lightmoe benchmarks tests
+python -m pytest -q
+```
+
+## 📄 License
 
 LightMoE is Apache-2.0 licensed. A small set of kernel source files retains
 upstream BSD-3-Clause or Apache-2.0 notices; see [NOTICE](NOTICE).
