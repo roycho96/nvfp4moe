@@ -14,6 +14,7 @@ from .kernels.quantize.runtime import (
     nvfp4_rht_amax,
 )
 from .kernels.routing.combine import moe_finalize, moe_finalize_bwd
+from .kernels.unary import UnaryBackwardEpilogue, UnaryEpilogue
 
 _GKW = {"tile_M": 128, "tile_N": 256, "cluster_M": 1, "cluster_N": 1, "max_swizzle_size": 1}
 # Tuned configs for the down projection and input-gradient GEMMs.
@@ -69,9 +70,9 @@ class _MoEFn(torch.autograd.Function):
         layer,
         routed,
     ):
-        del w_gate, w_up, w2
         L = layer
-        ctx.interleaved_w1 = L._owns_weights
+        ctx.interleaved_w1 = w_gate.shape[1] == L.fc1_n
+        del w_gate, w_up, w2
         T, d = x.shape
         M = T if routed else gather_idx.numel()
         I = L.I
@@ -98,11 +99,11 @@ class _MoEFn(torch.autograd.Function):
         ascale = (L.s_x.pts * L.p_w1).reshape(1)
         q_h = L._buf("q_h", (M, I // 2), torch.float4_e2m1fn_x2)
         sf_h = L._buf("sf_h", (L.rm_max, I // 64, 32, 4, 4), torch.float8_e4m3fn, batch1=True)
-        preact = torch.empty(M, 2 * I, dtype=torch.bfloat16, device=x.device)
+        preact = torch.empty(M, L.fc1_n, dtype=torch.bfloat16, device=x.device)
         sf_h.zero_()
         gate_up_gemm = L._grouped_gemm(
             "fc1",
-            2 * I,
+            L.fc1_n,
             d,
             _gate_up_config(L, M),
             output_dtype=torch.float4_e2m1fn_x2,
@@ -270,7 +271,7 @@ class _MoEFn(torch.autograd.Function):
                 te_math=True,
             )
         # dgrad2 fuses the gated-activation derivative and saved activation.
-        dH = L._buf("dH", (M, 2 * I), torch.bfloat16)
+        dH = L._buf("dH", (M, L.fc1_n), torch.bfloat16)
         hh = L._buf("hh", (M, I), torch.bfloat16)
         a2 = L.s_dy.pts * L.p_w2d  # (1,) device
         _, gkw_dg2, gkw_dg1 = _gkws(L, M)
@@ -279,12 +280,12 @@ class _MoEFn(torch.autograd.Function):
             I,
             d,
             gkw_dg2,
-            output_dtype=torch.int32,
+            output_dtype=torch.bfloat16 if L.unary else torch.int32,
             dactivation=L.activation,
         )(
             q_dy.view(torch.float4_e2m1fn_x2),
             L.qW2d,
-            dH.view(torch.int32),
+            dH if L.unary else dH.view(torch.int32),
             cu,
             sf_dy[:, :sf_rows],
             L.sW2d,
@@ -306,14 +307,19 @@ class _MoEFn(torch.autograd.Function):
                 L._amax2(dH, cu, L.s_dh, L.s_dh_c, padded_offsets=off_pad)
         else:
             L.s_dh.update(dH)
-        q_dh = L._buf("q_dh", (M, I), torch.uint8)  # 2I/2 bytes
-        sf_dh = L._buf("sf_dh", (L.rm_max, 2 * I // 64, 32, 4, 4), torch.float8_e4m3fn, batch1=True)
+        q_dh = L._buf("q_dh", (M, L.fc1_n // 2), torch.uint8)
+        sf_dh = L._buf(
+            "sf_dh",
+            (L.rm_max, L.fc1_n // 64, 32, 4, 4),
+            torch.float8_e4m3fn,
+            batch1=True,
+        )
         if L.rht and L.fused_row_col:
-            qb = L._buf("cw_dh_q", (2 * I, mp_max // 2), torch.uint8)
-            sb = L._buf("cw_dh_sf", (2 * I * mp_max // 16,), torch.float8_e4m3fn)
+            qb = L._buf("cw_dh_q", (L.fc1_n, mp_max // 2), torch.uint8)
+            sb = L._buf("cw_dh_sf", (L.fc1_n * mp_max // 16,), torch.float8_e4m3fn)
             aout = None
             if dca:
-                aout = L._buf("dca_dh_part", (n_ct * (2 * I // 128),), torch.float32)
+                aout = L._buf("dca_dh_part", (n_ct * (L.fc1_n // 128),), torch.float32)
                 pend.append((L.s_dh_c, aout))
             nvfp4_quantize_row_colwise(
                 dH,
@@ -345,7 +351,7 @@ class _MoEFn(torch.autograd.Function):
         dX_M = L._buf("dX_M", (M, d), torch.bfloat16)
         q_dh_fp4 = q_dh.view(torch.float4_e2m1fn_x2)
         dgrad1_scale = (L.s_dh.pts * L.p_w1t).reshape(1)
-        L._grouped_gemm("dgrad1", d, 2 * I, gkw_dg1)(
+        L._grouped_gemm("dgrad1", d, L.fc1_n, gkw_dg1)(
             q_dh_fp4,
             L.qW1T,
             dX_M,
@@ -383,14 +389,14 @@ class _MoEFn(torch.autograd.Function):
             wg1_ = L.wg1 if L._acc_fresh else L.wg1_acc
             wg2_ = L.wg2 if L._acc_fresh else L.wg2_acc
         else:
-            dW1 = torch.empty(L.E, 2 * I, d, device=x.device, dtype=torch.bfloat16)
+            dW1 = torch.empty(L.E, L.fc1_n, d, device=x.device, dtype=torch.bfloat16)
             dW2 = torch.empty(L.E, d, I, device=x.device, dtype=torch.bfloat16)
             wg1_, wg2_ = L.wg1, L.wg2
         for name, z, F_, sc, gidx, crd, csd in (
             # Apply stochastic rounding only to gradient casts.
             ("dy", dY_M, d, L.s_dy_c if L.rht else L.s_dy, None, rd, sv + 2),
             ("hh", hh, I, s_hh, None, "rn", 0),
-            ("dh", dH, 2 * I, L.s_dh_c if L.rht else L.s_dh, None, rd, sv + 3),
+            ("dh", dH, L.fc1_n, L.s_dh_c if L.rht else L.s_dh, None, rd, sv + 3),
             ("x", x, d, s_cx, None if routed else gi, "rn", 0),
         ):
             if name in cw:
@@ -473,6 +479,9 @@ class MoEExpertLayer(nn.Module):
         wgrad_accumulate=False,
         gemm_cfg="auto",
         activation="swiglu",
+        activation_clamp=None,
+        activation_sigmoid_alpha=None,
+        activation_up_bias=None,
         allocate_weights=True,
         use_dynamic_sched=True,
     ):
@@ -481,18 +490,46 @@ class MoEExpertLayer(nn.Module):
         I = int(intermediate_size)
         E = int(num_experts)
         topk = int(top_k)
-        assert d % 256 == 0 and I % 128 == 0, "tile/SF alignment (see README)"
+        assert d % 128 == 0 and I % 128 == 0, "hidden and intermediate sizes must align to 128"
         assert not delayed_col_amax or rht, (
             "delayed_col_amax targets the rht pre-passes (rht=True only)"
         )
         assert gemm_cfg in ("auto", "legacy")
-        assert activation in ("swiglu", "geglu"), (
-            "activation must be 'swiglu' (Qwen) or 'geglu' (Gemma 4)"
+        assert activation in ("swiglu", "swiglu_oai", "geglu", "relu2"), (
+            "activation must be swiglu, swiglu_oai, geglu, or relu2"
         )
+        if activation == "swiglu_oai":
+            activation_clamp = 7.0 if activation_clamp is None else activation_clamp
+            activation_sigmoid_alpha = (
+                1.702 if activation_sigmoid_alpha is None else activation_sigmoid_alpha
+            )
+            activation_up_bias = 1.0 if activation_up_bias is None else activation_up_bias
+        else:
+            activation_sigmoid_alpha = (
+                1.0 if activation_sigmoid_alpha is None else activation_sigmoid_alpha
+            )
+            activation_up_bias = 0.0 if activation_up_bias is None else activation_up_bias
+        unary = activation == "relu2"
+        if unary:
+            if activation_clamp is not None:
+                raise ValueError("ReLU squared does not use activation_clamp")
+            policy = None
+        else:
+            policy = GatedEpilogue(
+                activation,
+                clamp_limit=activation_clamp,
+                sigmoid_alpha=activation_sigmoid_alpha,
+                up_bias=activation_up_bias,
+            )
         # "auto" selects tuned tiles; "legacy" pins the baseline config.
         self.gemm_cfg = gemm_cfg
         self._grouped_gemms = {}
         self.activation = activation
+        self.unary = unary
+        self.fc1_n = I if unary else 2 * I
+        self.activation_clamp = None if unary else policy.clamp_limit
+        self.activation_sigmoid_alpha = 1.0 if unary else policy.sigmoid_alpha
+        self.activation_up_bias = 0.0 if unary else policy.up_bias
         self.d, self.I, self.E, self.topk = d, I, E, topk
         # Delayed column amax removes pre-passes at the cost of one-step scale lag.
         self.delayed_col_amax = delayed_col_amax
@@ -504,7 +541,7 @@ class MoEExpertLayer(nn.Module):
         self.rht = rht
         self._owns_weights = bool(allocate_weights)
         if self._owns_weights:
-            self.w1 = nn.Parameter(torch.randn(E, 2 * I, d, dtype=torch.bfloat16) * d**-0.5)
+            self.w1 = nn.Parameter(torch.randn(E, self.fc1_n, d, dtype=torch.bfloat16) * d**-0.5)
             self.w2 = nn.Parameter(torch.randn(E, d, I, dtype=torch.bfloat16) * I**-0.5)
         else:
             self.register_parameter("w1", None)
@@ -516,7 +553,7 @@ class MoEExpertLayer(nn.Module):
         self.s_hh_c, self.s_x_c = (TensorScale(te_rht=rht), TensorScale(te_rht=rht))
         # Grouped wgrad computes dW2 = dy @ hh^T and dW1 = dh @ x^T.
         self.wg2 = GroupedWgrad(d, I, E)
-        self.wg1 = GroupedWgrad(2 * I, d, E)
+        self.wg1 = GroupedWgrad(self.fc1_n, d, E)
         # Optional microbatch accumulation happens inside grouped wgrad stores.
         # commit_wgrad() exposes the layer-owned buffers to the optimizer.
         if wgrad_accumulate and not self._owns_weights:
@@ -525,8 +562,8 @@ class MoEExpertLayer(nn.Module):
         self._acc_fresh = True
         if wgrad_accumulate:
             self.wg2_acc = GroupedWgrad(d, I, E, accumulate=True)
-            self.wg1_acc = GroupedWgrad(2 * I, d, E, accumulate=True)
-            self.acc_dw1 = torch.zeros(E, 2 * I, d, dtype=torch.bfloat16, device="cuda")
+            self.wg1_acc = GroupedWgrad(self.fc1_n, d, E, accumulate=True)
+            self.acc_dw1 = torch.zeros(E, self.fc1_n, d, dtype=torch.bfloat16, device="cuda")
             self.acc_dw2 = torch.zeros(E, d, I, dtype=torch.bfloat16, device="cuda")
         self._gs1 = torch.empty(E, dtype=torch.float32, device="cuda")
         self._gs2 = torch.empty(E, dtype=torch.float32, device="cuda")
@@ -601,15 +638,37 @@ class MoEExpertLayer(nn.Module):
             activation,
             dactivation,
             save_preact,
+            self.activation_clamp,
+            self.activation_sigmoid_alpha,
+            self.activation_up_bias,
             self.use_dynamic_sched,
         )
         runtime = self._grouped_gemms.get(key)
         if runtime is None:
             epilogue = None
             if activation is not None:
-                epilogue = GatedEpilogue(activation, save_preact)
+                epilogue = (
+                    UnaryEpilogue(activation, save_preact)
+                    if activation == "relu2"
+                    else GatedEpilogue(
+                        activation,
+                        save_preact,
+                        clamp_limit=self.activation_clamp,
+                        sigmoid_alpha=self.activation_sigmoid_alpha,
+                        up_bias=self.activation_up_bias,
+                    )
+                )
             elif dactivation is not None:
-                epilogue = GatedBackwardEpilogue(dactivation)
+                epilogue = (
+                    UnaryBackwardEpilogue(dactivation)
+                    if dactivation == "relu2"
+                    else GatedBackwardEpilogue(
+                        dactivation,
+                        clamp_limit=self.activation_clamp,
+                        sigmoid_alpha=self.activation_sigmoid_alpha,
+                        up_bias=self.activation_up_bias,
+                    )
+                )
             runtime = GroupedNvfp4Gemm(
                 self.E,
                 n,
@@ -637,6 +696,8 @@ class MoEExpertLayer(nn.Module):
     @torch.no_grad()
     def refresh_weights_from(self, w_gate, w_up, w2):
         """Quantize external gate, up, and down master weights."""
+        if self.unary:
+            raise ValueError("ReLU squared experts use refresh_unary_weights_from(up, down)")
         expected_gate = (self.E, self.I, self.d)
         expected_w2 = (self.E, self.d, self.I)
         if tuple(w_gate.shape) != expected_gate or tuple(w_up.shape) != expected_gate:
@@ -652,16 +713,36 @@ class MoEExpertLayer(nn.Module):
         if w_gate.device != w_up.device or w_gate.device != w2.device:
             raise ValueError("NVFP4 expert master weights must share a device")
 
-        dev = w_gate.device
         gate_up = [
             torch.stack((w_gate[e], w_up[e]), dim=1).reshape(2 * self.I, self.d)
             for e in range(self.E)
         ]
+        self._refresh_weight_matrices(gate_up, w2)
+
+    @torch.no_grad()
+    def refresh_unary_weights_from(self, up, down):
+        """Quantize external up and down weights for ReLU squared experts."""
+        if not self.unary:
+            raise ValueError("refresh_unary_weights_from requires activation='relu2'")
+        expected_up = (self.E, self.I, self.d)
+        expected_down = (self.E, self.d, self.I)
+        if tuple(up.shape) != expected_up or tuple(down.shape) != expected_down:
+            raise ValueError(
+                f"up and down weights must have shapes {expected_up} and {expected_down}"
+            )
+        if up.dtype != torch.bfloat16 or down.dtype != torch.bfloat16:
+            raise ValueError("NVFP4 expert master weights must use bfloat16")
+        if up.device != down.device:
+            raise ValueError("NVFP4 expert master weights must share a device")
+        self._refresh_weight_matrices([up[e] for e in range(self.E)], down)
+
+    def _refresh_weight_matrices(self, first_projection, down):
+        dev = down.device
         for nm, mats in (
-            ("w1", gate_up),
-            ("w2", [w2[e] for e in range(self.E)]),
-            ("w2d", [w2[e].t() for e in range(self.E)]),
-            ("w1t", [weight.t() for weight in gate_up]),
+            ("w1", first_projection),
+            ("w2", [down[e] for e in range(self.E)]),
+            ("w2d", [down[e].t() for e in range(self.E)]),
+            ("w1t", [weight.t() for weight in first_projection]),
         ):
             amax = torch.stack([m.abs().amax() for m in mats]).amax()
             pts = (amax.float() / _DEN).clamp(min=1e-30).reshape(1).to(dev)
@@ -675,7 +756,10 @@ class MoEExpertLayer(nn.Module):
         """Rebuild resident NVFP4 weights from layer-owned BF16 parameters."""
         if not self._owns_weights:
             raise RuntimeError("external-weight cores must call refresh_weights_from")
-        self.refresh_weights_from(self.w1[:, 0::2], self.w1[:, 1::2], self.w2)
+        if self.unary:
+            self.refresh_unary_weights_from(self.w1, self.w2)
+        else:
+            self.refresh_weights_from(self.w1[:, 0::2], self.w1[:, 1::2], self.w2)
 
     @torch.no_grad()
     def _calibrate(self, x, cu, gather_idx=None, off_pad=None):
@@ -683,7 +767,7 @@ class MoEExpertLayer(nn.Module):
         _, d = x.shape
         M = x.shape[0] if gather_idx is None else gather_idx.numel()
         self.rm_max = -(-M // 128) + self.E
-        preact = torch.empty(M, 2 * self.I, device=x.device, dtype=torch.bfloat16)
+        preact = torch.empty(M, self.fc1_n, device=x.device, dtype=torch.bfloat16)
         qx_u8 = torch.empty(M, d // 2, dtype=torch.uint8, device=x.device)
         sfx = torch.empty(
             1,
@@ -708,7 +792,7 @@ class MoEExpertLayer(nn.Module):
             padded_offsets=off_pad,
             te_math=True,
         )
-        self._grouped_gemm("calibrate", 2 * self.I, d, _GKW)(
+        self._grouped_gemm("calibrate", self.fc1_n, d, _GKW)(
             qx_u8.view(torch.float4_e2m1fn_x2),
             self.qb1,
             preact,
@@ -717,9 +801,19 @@ class MoEExpertLayer(nn.Module):
             self.sfb1,
             (self.s_x.pts * self.p_w1).reshape(1),
         )
+        if self.unary:
+            self.s_h.update(torch.relu(preact.float()).square_())
+            return
         g, u = preact.float()[:, 0::2], preact.float()[:, 1::2]
         if self.activation == "swiglu":
+            if self.activation_clamp is not None:
+                g.clamp_(max=self.activation_clamp)
+                u.clamp_(min=-self.activation_clamp, max=self.activation_clamp)
             h = torch.nn.functional.silu(g) * u
+        elif self.activation == "swiglu_oai":
+            g.clamp_(max=self.activation_clamp)
+            u.clamp_(min=-self.activation_clamp, max=self.activation_clamp)
+            h = g * torch.sigmoid(self.activation_sigmoid_alpha * g) * (u + self.activation_up_bias)
         else:
             h = torch.nn.functional.gelu(g, approximate="tanh") * u
         self.s_h.update(h)
@@ -756,6 +850,12 @@ class MoEExpertLayer(nn.Module):
             self,
             True,
         )
+
+    def forward_unary_routed(self, x, up, down, cu, off_pad):
+        """Run expert-major rows for a ReLU squared expert layer."""
+        if not self.unary:
+            raise ValueError("forward_unary_routed requires activation='relu2'")
+        return self.forward_routed(x, up, None, down, cu, off_pad)
 
     def forward(self, x, gather_idx, cu, probs_sorted, slots, off_pad):
         """Run the routed expert layer with dispatch-provided padded offsets."""

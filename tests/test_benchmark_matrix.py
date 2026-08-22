@@ -44,7 +44,10 @@ def test_model_registry_contains_release_matrix():
 @pytest.mark.parametrize("key", MODEL_SHAPES)
 def test_projection_shapes_and_ep_math(key):
     spec = MODEL_SHAPES[key]
-    assert spec.gemm_shape("gate_up") == (2 * spec.padded_intermediate, spec.hidden)
+    first_width = (
+        spec.padded_intermediate if spec.activation == "relu2" else 2 * spec.padded_intermediate
+    )
+    assert spec.gemm_shape("gate_up") == (first_width, spec.hidden)
     assert spec.gemm_shape("down") == (spec.hidden, spec.padded_intermediate)
     for ep in spec.ep_sizes:
         assert spec.local_experts(ep) * ep == spec.experts
@@ -100,8 +103,18 @@ def test_quick_synthetic_moe_has_more_experts_than_topk(key):
 
 
 def test_layer_registry_explains_model_specific_exclusion():
-    with pytest.raises(ValueError, match="bounded SwiGLU backward"):
-        parse_models("deepseek_v4_flash", layer_only=True)
+    with pytest.raises(ValueError, match="latent projections"):
+        parse_models("kimi_k3", layer_only=True)
+
+
+def test_external_backends_do_not_time_different_activation_math():
+    for model in ("minimax_m3", "nemotron_3_5_30b_a3b", "deepseek_v4_flash"):
+        spec = MODEL_SHAPES[model]
+        case = generate_moe_cases((model,), (1,), "quick", ("balanced",), "synthetic")[0]
+        assert moe._backend_matches_activation("lightmoe", case)
+        assert moe._backend_matches_activation("pytorch_bf16", case)
+        assert not moe._backend_matches_activation("transformer_engine_nvfp4", case)
+        assert case.activation == spec.activation
 
 
 def test_gemm_list_is_cpu_safe(monkeypatch, capsys):

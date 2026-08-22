@@ -11,9 +11,9 @@ from cutlass.cute.runtime import from_dlpack
 
 from .._common import fake_tensor, torch2cute_dtype_map
 from ..gated import GatedBackwardEpilogue, GatedEpilogue, resolve_gemm_epilogue
+from ..unary import UnaryBackwardEpilogue, UnaryEpilogue
 from .kernel import (
     DECODE_GRID_DOUBLE,
-    DECODE_GRID_FULL,
     DECODE_GRID_PERSISTENT,
     GroupedGemmKernel,
 )
@@ -23,6 +23,16 @@ def _resolve_dynamic_schedule(use_dynamic_sched: bool | None, k: int) -> bool:
     if use_dynamic_sched is None:
         return k > 2048
     return bool(use_dynamic_sched)
+
+
+def _decode_grid_mode(gather_b: bool, k: int, n: int, rows: int, experts: int) -> int:
+    if not gather_b or rows <= 1:
+        return DECODE_GRID_PERSISTENT
+    if k >= 4096 and n >= 4096 and rows <= (64 if experts >= 48 else 16):
+        return DECODE_GRID_DOUBLE
+    if k >= 3072 and n == 3072 and rows <= 32:
+        return DECODE_GRID_DOUBLE
+    return DECODE_GRID_PERSISTENT
 
 
 def _seed_tensor(dtype, mode0: int, mode1: int, mode0_major: bool = False):
@@ -47,6 +57,8 @@ def _compile_grouped(
     dactivation: str | None,
     save_preact: bool,
     gated_clamp_limit: float,
+    activation_sigmoid_alpha: float,
+    activation_up_bias: float,
     use_dynamic_sched: bool,
     per_expert_alpha: bool,
     use_pdl: bool,
@@ -62,7 +74,7 @@ def _compile_grouped(
     with torch.cuda.device(device):
         c_dtype = torch2cute_dtype_map[output_dtype]
         output_n = n
-        if activation is not None:
+        if activation is not None and activation != "relu2":
             output_n = n // 2
         seed_a = _seed_tensor(cutlass.Float4E2M1FN, 32, 32)
         seed_b = _seed_tensor(cutlass.Float4E2M1FN, 32, 32)
@@ -84,7 +96,11 @@ def _compile_grouped(
             fake_tensor(cutlass.Float4E2M1FN, (rows, k), 32),
             fake_tensor(cutlass.Float4E2M1FN, (experts, n, k), 32),
             fake_tensor(c_dtype, (c_rows, output_n), 128 // c_dtype.width),
-            fake_tensor(cutlass.BFloat16, (preact_rows, n * 2), 8),
+            fake_tensor(
+                cutlass.BFloat16,
+                (preact_rows, n if dactivation == "relu2" else n * 2),
+                8,
+            ),
             fake_tensor(cutlass.BFloat16, (aux_rows, n), 8),
             fake_tensor(
                 cutlass.Float8E4M3FN,
@@ -122,6 +138,8 @@ def _compile_grouped(
             dactivation=dactivation,
             save_preact=save_preact,
             gated_clamp_limit=gated_clamp_limit,
+            activation_sigmoid_alpha=activation_sigmoid_alpha,
+            activation_up_bias=activation_up_bias,
             mma_inst_tile_k=2 if dactivation is not None and k >= 4096 else 4,
             use_dynamic_sched=use_dynamic_sched,
             use_pdl=use_pdl,
@@ -170,7 +188,11 @@ class GroupedNvfp4Gemm:
         output_dtype: torch.dtype = torch.bfloat16,
         activation: str | None = None,
         dactivation: str | None = None,
-        epilogue: GatedEpilogue | GatedBackwardEpilogue | None = None,
+        epilogue: GatedEpilogue
+        | GatedBackwardEpilogue
+        | UnaryEpilogue
+        | UnaryBackwardEpilogue
+        | None = None,
         use_dynamic_sched: bool | None = None,
         use_pdl: bool = False,
         swap_ab: bool = False,
@@ -180,17 +202,36 @@ class GroupedNvfp4Gemm:
         gather_b: bool = False,
     ):
         activation, dactivation = resolve_gemm_epilogue(epilogue, activation, dactivation)
-        save_preact = isinstance(epilogue, GatedEpilogue) and epilogue.save_preact
+        save_preact = isinstance(epilogue, (GatedEpilogue, UnaryEpilogue)) and epilogue.save_preact
         gated_clamp_limit = (
             float(epilogue.clamp_limit)
-            if isinstance(epilogue, GatedEpilogue) and epilogue.clamp_limit is not None
+            if isinstance(epilogue, (GatedEpilogue, GatedBackwardEpilogue))
+            and epilogue.clamp_limit is not None
+            else 0.0
+        )
+        activation_sigmoid_alpha = (
+            epilogue.sigmoid_alpha
+            if isinstance(epilogue, (GatedEpilogue, GatedBackwardEpilogue))
+            else 1.0
+        )
+        activation_up_bias = (
+            epilogue.up_bias
+            if isinstance(epilogue, (GatedEpilogue, GatedBackwardEpilogue))
             else 0.0
         )
         if epilogue is None:
             if activation is not None:
-                epilogue = GatedEpilogue(activation)
+                epilogue = (
+                    UnaryEpilogue(activation)
+                    if activation == "relu2"
+                    else GatedEpilogue(activation)
+                )
             elif dactivation is not None:
-                epilogue = GatedBackwardEpilogue(dactivation)
+                epilogue = (
+                    UnaryBackwardEpilogue(dactivation)
+                    if dactivation == "relu2"
+                    else GatedBackwardEpilogue(dactivation)
+                )
         if experts <= 0 or n <= 0 or k <= 0:
             raise ValueError("experts, N, and K must be positive")
         if experts > 256:
@@ -206,22 +247,26 @@ class GroupedNvfp4Gemm:
             torch.float4_e2m1fn_x2,
         ):
             raise ValueError("grouped GEMM output must be BF16, FP32, Int32, or NVFP4")
-        if activation not in (None, "swiglu", "geglu", "reglu"):
-            raise ValueError("activation must be swiglu, geglu, reglu, or None")
-        if dactivation not in (None, "swiglu", "geglu", "reglu"):
-            raise ValueError("dactivation must be swiglu, geglu, reglu, or None")
+        activations = (None, "swiglu", "swiglu_oai", "geglu", "reglu", "relu2")
+        if activation not in activations:
+            raise ValueError("unsupported grouped GEMM activation")
+        if dactivation not in activations:
+            raise ValueError("unsupported grouped GEMM derivative")
         if activation is not None and dactivation is not None:
             raise ValueError("activation and dactivation are mutually exclusive")
         if output_dtype == torch.float4_e2m1fn_x2 and activation is None:
-            raise ValueError("NVFP4 output requires a gated activation")
+            raise ValueError("NVFP4 output requires an activation epilogue")
         if output_dtype == torch.float4_e2m1fn_x2 and n % 128:
             raise ValueError("gated NVFP4 output requires N aligned to 128")
+        gated = activation is not None and activation != "relu2"
         gated_tile = tile_m if swap_ab else tile_n
-        if activation is not None and (n % 2 or gated_tile % 128):
+        if gated and (n % 2 or gated_tile % 128):
             axis = "tile_M" if swap_ab else "tile_N"
             raise ValueError(f"gated GEMM requires even N and {axis} aligned to 128")
-        if dactivation is not None and output_dtype != torch.int32:
+        if dactivation is not None and dactivation != "relu2" and output_dtype != torch.int32:
             raise ValueError("dgrad2 uses packed BF16 pairs in an Int32 view")
+        if dactivation == "relu2" and output_dtype != torch.bfloat16:
+            raise ValueError("ReLU squared backward writes BF16 gradients")
         if dactivation is not None and n % 128:
             raise ValueError("dgrad2 requires N aligned to 128")
         if save_preact and output_dtype != torch.float4_e2m1fn_x2:
@@ -229,7 +274,7 @@ class GroupedNvfp4Gemm:
         if swap_ab and dactivation is not None:
             raise ValueError("operand-swapped grouped GEMM does not support gated backward")
         if swap_ab and activation is not None and tile_n > 64:
-            raise ValueError("operand-swapped gated GEMM requires tile_N at most 64")
+            raise ValueError("operand-swapped activation GEMM requires tile_N at most 64")
         self.experts = experts
         self.n = n
         self.k = k
@@ -240,6 +285,8 @@ class GroupedNvfp4Gemm:
         self.dactivation = dactivation
         self.save_preact = save_preact
         self.gated_clamp_limit = gated_clamp_limit
+        self.activation_sigmoid_alpha = activation_sigmoid_alpha
+        self.activation_up_bias = activation_up_bias
         self.epilogue = epilogue
         self.use_dynamic_sched = _resolve_dynamic_schedule(use_dynamic_sched, k)
         self.use_pdl = bool(use_pdl)
@@ -264,7 +311,7 @@ class GroupedNvfp4Gemm:
         if self.gather_b and not (self.swap_ab and self.fast_decode_sched):
             raise ValueError("gather B requires swapped fast decode")
         self.output_n = n
-        if activation is not None:
+        if activation is not None and activation != "relu2":
             self.output_n = n // 2
         self.device = torch.cuda.current_device()
         self._compiled = None
@@ -388,8 +435,9 @@ class GroupedNvfp4Gemm:
             )
 
         if self.dactivation is not None:
+            preact_cols = self.n if self.dactivation == "relu2" else self.n * 2
             for name, tensor, shape in (
-                ("preact", preact, (assignment_count, self.n * 2)),
+                ("preact", preact, (assignment_count, preact_cols)),
                 ("aux", aux, (assignment_count, self.n)),
             ):
                 if (
@@ -478,14 +526,13 @@ class GroupedNvfp4Gemm:
             ab_stages = 6
         if getattr(self, "_ab_stages", ab_stages) != ab_stages:
             self._compiled = None
-        decode_grid_mode = DECODE_GRID_PERSISTENT
-        if self.gather_b and self.k >= 4096 and self.n >= 4096:
-            if a.shape[0] == 1:
-                decode_grid_mode = DECODE_GRID_FULL
-            elif a.shape[0] <= (64 if self.experts >= 48 else 16):
-                decode_grid_mode = DECODE_GRID_DOUBLE
-        elif self.gather_b and self.k >= 3072 and self.n == 3072 and 1 < a.shape[0] <= 32:
-            decode_grid_mode = DECODE_GRID_DOUBLE
+        decode_grid_mode = _decode_grid_mode(
+            self.gather_b,
+            self.k,
+            self.n,
+            a.shape[0],
+            self.experts,
+        )
         if getattr(self, "_decode_grid_mode", decode_grid_mode) != decode_grid_mode:
             self._compiled = None
         self._per_expert_alpha = per_expert_alpha
@@ -512,6 +559,8 @@ class GroupedNvfp4Gemm:
                 self.dactivation,
                 self.save_preact,
                 self.gated_clamp_limit,
+                self.activation_sigmoid_alpha,
+                self.activation_up_bias,
                 self.use_dynamic_sched,
                 self._per_expert_alpha,
                 self.use_pdl,

@@ -22,6 +22,97 @@ def _reference(x, topk_ids, topk_weights, gate, up, down):
     return result
 
 
+def _model_reference(
+    x,
+    topk_ids,
+    topk_weights,
+    first,
+    second,
+    down,
+    activation,
+):
+    result = torch.zeros_like(x, dtype=torch.float32)
+    for token in range(x.shape[0]):
+        source = x[token].float()
+        for route in range(topk_ids.shape[1]):
+            expert = int(topk_ids[token, route])
+            gate = source @ first[expert].float().T
+            if activation == "relu2":
+                hidden = torch.relu(gate).square()
+            else:
+                up = source @ second[expert].float().T
+                if activation == "swiglu_oai":
+                    gate = gate.clamp(max=7)
+                    up = up.clamp(min=-7, max=7)
+                    hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1)
+                else:
+                    gate = gate.clamp(max=10)
+                    up = up.clamp(min=-10, max=10)
+                    hidden = torch.nn.functional.silu(gate) * up
+            result[token] += topk_weights[token, route] * (hidden @ down[expert].float().T)
+    return result
+
+
+@pytest.mark.parametrize(
+    ("activation", "clamp"),
+    (("swiglu_oai", None), ("relu2", None), ("swiglu", 10.0)),
+)
+def test_model_activation_matches_bf16_reference(activation, clamp):
+    from lightmoe import InferenceMoE
+
+    torch.manual_seed(20260825)
+    tokens, hidden, intermediate, experts, topk = 4, 256, 128, 2, 1
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda")
+    first = torch.randn(experts, intermediate, hidden, dtype=torch.bfloat16, device="cuda").mul_(
+        hidden**-0.5
+    )
+    second = None
+    if activation != "relu2":
+        second = torch.randn_like(first).mul_(hidden**-0.5)
+    down = torch.randn(experts, hidden, intermediate, dtype=torch.bfloat16, device="cuda").mul_(
+        intermediate**-0.5
+    )
+    topk_ids = torch.tensor([[0], [1], [0], [1]], dtype=torch.int32, device="cuda")
+    topk_weights = torch.ones(tokens, topk, dtype=torch.float32, device="cuda")
+    plan = InferenceMoE(
+        hidden,
+        intermediate,
+        experts,
+        topk,
+        tokens,
+        activation=activation,
+        activation_clamp=clamp,
+    )
+    if activation == "relu2":
+        plan.load_weights(first, down)
+    else:
+        plan.load_weights(first, second, down)
+    plan.calibrate(x, topk_ids, topk_weights)
+    actual = plan.run_prefill(x, topk_ids, topk_weights).clone()
+    reference = _model_reference(
+        x,
+        topk_ids,
+        topk_weights,
+        first,
+        second,
+        down,
+        activation,
+    )
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.float().flatten(), reference.flatten(), dim=0
+    )
+    assert cosine > 0.9
+
+
+def test_wide_gathered_decode_keeps_batch_one_persistent():
+    from lightmoe.kernels.grouped.kernel import DECODE_GRID_DOUBLE, DECODE_GRID_PERSISTENT
+    from lightmoe.kernels.grouped.runtime import _decode_grid_mode
+
+    assert _decode_grid_mode(True, 6144, 6144, 1, 128) == DECODE_GRID_PERSISTENT
+    assert _decode_grid_mode(True, 4096, 4096, 1, 256) == DECODE_GRID_PERSISTENT
+    assert _decode_grid_mode(True, 6144, 6144, 8, 128) == DECODE_GRID_DOUBLE
+
+
 def test_inference_plan_is_repeatable_and_allocation_free():
     from lightmoe import InferenceMoE
 

@@ -25,10 +25,31 @@ def test_clamped_swiglu_policy():
     assert policy.clamp_limit == 10.0
     with pytest.raises(ValueError, match="finite and positive"):
         GatedEpilogue("swiglu", clamp_limit=0)
-    with pytest.raises(ValueError, match="only for swiglu"):
+    with pytest.raises(ValueError, match="only for SwiGLU"):
         GatedEpilogue("geglu", clamp_limit=10)
-    with pytest.raises(ValueError, match="saved preactivation"):
-        GatedEpilogue("swiglu", save_preact=True, clamp_limit=10)
+    assert GatedEpilogue("swiglu", save_preact=True, clamp_limit=10).save_preact
+
+
+def test_swiglu_oai_policy():
+    defaults = GatedEpilogue("swiglu_oai")
+    assert (defaults.clamp_limit, defaults.sigmoid_alpha, defaults.up_bias) == (7.0, 1.702, 1.0)
+    forward = GatedEpilogue(
+        "swiglu_oai",
+        save_preact=True,
+        clamp_limit=7,
+        sigmoid_alpha=1.702,
+        up_bias=1,
+    )
+    backward = GatedBackwardEpilogue(
+        "swiglu_oai",
+        clamp_limit=7,
+        sigmoid_alpha=1.702,
+        up_bias=1,
+    )
+    assert forward.sigmoid_alpha == backward.sigmoid_alpha == 1.702
+    assert forward.up_bias == backward.up_bias == 1.0
+    with pytest.raises(ValueError, match="require swiglu_oai"):
+        GatedEpilogue("swiglu", sigmoid_alpha=1.702)
 
 
 def test_epilogue_policy_resolves_compile_mode():
@@ -60,7 +81,7 @@ def test_gated_tile_n_rejects_partial_sf_atoms(tile_n):
         validate_gated_tile_n(tile_n)
 
 
-@pytest.mark.parametrize("activation", ["swiglu", "geglu", "reglu"])
+@pytest.mark.parametrize("activation", ["swiglu", "swiglu_oai", "geglu", "reglu"])
 def test_gated_activation_names(activation):
     assert validate_gated_activation(activation) == activation
 

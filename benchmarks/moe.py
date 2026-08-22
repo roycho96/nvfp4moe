@@ -325,10 +325,11 @@ def _synthetic_inputs(case: MoeCase) -> dict[str, object]:
     topv = torch.rand(case.tokens, case.topk, dtype=torch.float32, device="cuda")
     topv /= topv.sum(-1, keepdim=True)
     x = torch.randn(case.tokens, case.hidden, dtype=torch.bfloat16, device="cuda")
+    first_projection = case.intermediate if case.activation == "relu2" else 2 * case.intermediate
     gate_up = (
         torch.randn(
             case.local_experts,
-            2 * case.intermediate,
+            first_projection,
             case.hidden,
             dtype=torch.bfloat16,
             device="cuda",
@@ -413,6 +414,7 @@ class _TorchGroupedExperts:
         self.experts = spec.experts
         self.topk = spec.topk
         self.activation = spec.activation
+        self.activation_clamp = spec.activation_clamp
 
     def zero_grad(self):
         self.w1.grad = None
@@ -432,8 +434,20 @@ class _TorchGroupedExperts:
     def expert_core(self, x, offsets):
         torch = self.torch
         h = torch._grouped_mm(x, self.w1, offs=offsets)
+        if self.activation == "relu2":
+            hh = torch.relu(h).square()
+            return torch._grouped_mm(hh, self.w2, offs=offsets)
         gate, up = h.chunk(2, dim=-1)
-        hh = torch.nn.functional.silu(gate) * up
+        if self.activation == "swiglu_oai":
+            gate = gate.clamp(max=7)
+            up = up.clamp(min=-7, max=7)
+            hh = gate * torch.sigmoid(1.702 * gate) * (up + 1)
+        elif self.activation_clamp is not None:
+            gate = gate.clamp(max=self.activation_clamp)
+            up = up.clamp(min=-self.activation_clamp, max=self.activation_clamp)
+            hh = torch.nn.functional.silu(gate) * up
+        else:
+            hh = torch.nn.functional.silu(gate) * up
         return torch._grouped_mm(hh, self.w2, offs=offsets)
 
     def full_layer(self, x, topi, topv):
@@ -463,12 +477,22 @@ def _te_backend(spec: ModelShape, inputs: dict[str, object]):
     return TEExpert(spec, inputs, nvfp4=True)
 
 
-def _crop_training_grads(grads, intermediate):
+def _backend_matches_activation(backend_name: str, case: MoeCase) -> bool:
+    if backend_name in ("lightmoe", "pytorch_bf16"):
+        return True
+    spec = MODEL_SHAPES[case.model]
+    return spec.activation == "swiglu" and spec.activation_clamp is None
+
+
+def _crop_training_grads(grads, intermediate, unary=False):
     gate_up = grads["gate_up"]
-    half = gate_up.shape[1] // 2
-    gate_up = __import__("torch").cat(
-        (gate_up[:, :intermediate], gate_up[:, half : half + intermediate]), dim=1
-    )
+    if unary:
+        gate_up = gate_up[:, :intermediate]
+    else:
+        half = gate_up.shape[1] // 2
+        gate_up = __import__("torch").cat(
+            (gate_up[:, :intermediate], gate_up[:, half : half + intermediate]), dim=1
+        )
     return {
         "gate_up": gate_up.contiguous(),
         "down": grads["down"][:, :, :intermediate].contiguous(),
@@ -547,7 +571,9 @@ def _make_training_arm(backend_name, case, inputs, dout):
         return y
 
     def weight_grads():
-        return _crop_training_grads(raw_weight_grads(), case.intermediate)
+        return _crop_training_grads(
+            raw_weight_grads(), case.intermediate, unary=case.activation == "relu2"
+        )
 
     return _TrainingArm(backend_name, call, x, topv, output, weight_grads)
 
@@ -641,6 +667,12 @@ def _run_interleaved_training(backends, case, inputs, warmup, iterations, profil
     arms = {}
     results = {}
     for backend_name in backends:
+        if not _backend_matches_activation(backend_name, case):
+            results[backend_name] = {
+                "status": "skipped",
+                "reason": "backend does not implement the model activation contract",
+            }
+            continue
         try:
             arms[backend_name] = _make_training_arm(backend_name, case, inputs, dout)
         except Exception as exc:  # noqa: BLE001
@@ -769,6 +801,11 @@ def _run_case(
 ) -> dict[str, object]:
     import torch
 
+    if not _backend_matches_activation(backend_name, case):
+        return {
+            "status": "skipped",
+            "reason": "backend does not implement the model activation contract",
+        }
     global_spec = MODEL_SHAPES[case.model]
     spec = replace(global_spec, experts=case.local_experts, ep_sizes=(1,), quick_ep=1)
     if backend_name == "transformer_engine_nvfp4_fused" and case.activation != "swiglu":

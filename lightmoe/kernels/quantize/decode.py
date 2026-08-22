@@ -22,10 +22,18 @@ from .kernel import (
     _max_u32,
 )
 
-FEATURE_ALIGNMENT = 256
+FEATURE_ALIGNMENT = 128
 NUM_THREADS = 32
 DISPATCH_THREADS = 256
 DISPATCH_CHUNK = 1024
+
+
+def _feature_tile_size(features: int) -> int:
+    if features % 512 == 0:
+        return 512
+    if features % 256 == 0:
+        return 256
+    return FEATURE_ALIGNMENT
 
 
 class NVFP4DecodeQuantKernel:
@@ -44,7 +52,7 @@ class NVFP4DecodeQuantKernel:
         self.use_pdl = use_pdl
         self.sf_tile_rows = sf_tile_rows
         self.token_major_q = token_major_q
-        self.features_per_cta = 512 if features % 512 == 0 else FEATURE_ALIGNMENT
+        self.features_per_cta = _feature_tile_size(features)
 
     @cute.jit
     def __call__(
@@ -253,7 +261,7 @@ class NVFP4DecodeDispatchQuantKernel:
         self.plan_tile_rows = plan_tile_rows
         self.use_pdl = use_pdl
         self.threads = DISPATCH_THREADS
-        self.features_per_cta = 512 if features % 512 == 0 else FEATURE_ALIGNMENT
+        self.features_per_cta = _feature_tile_size(features)
 
     @cute.jit
     def __call__(
@@ -551,7 +559,7 @@ class NVFP4BatchOneDispatchQuantKernel:
         self.topk = topk
         self.use_pdl = use_pdl
         self.direct = direct
-        self.features_per_cta = 512 if features % 512 == 0 else FEATURE_ALIGNMENT
+        self.features_per_cta = _feature_tile_size(features)
 
     @cute.jit
     def __call__(
@@ -1117,7 +1125,7 @@ def nvfp4_quantize_decode(
     experts = cu.numel() - 1
     rows = tokens * topk
     if x.dtype != torch.bfloat16 or features % FEATURE_ALIGNMENT:
-        raise ValueError("decode input must be BF16 with features aligned to 256")
+        raise ValueError("decode input must be BF16 with features aligned to 128")
     if sf_tile_rows <= 0 or 128 % sf_tile_rows:
         raise ValueError("scale-factor tile rows must divide 128")
     expected = (

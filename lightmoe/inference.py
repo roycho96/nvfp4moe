@@ -17,6 +17,7 @@ from .kernels.quantize.decode import (
 from .kernels.quantize.runtime import nvfp4_quantize_rowwise
 from .kernels.routing.combine import moe_finalize
 from .kernels.routing.dispatch import B_MAX, CHUNK, moe_dispatch
+from .kernels.unary import UnaryEpilogue
 
 DECODE_ROWS_PER_EXPERT = 16
 FAST_DECODE_ROWS = 64
@@ -225,6 +226,8 @@ class InferenceMoE:
         *,
         activation: str = "swiglu",
         activation_clamp: float | None = None,
+        activation_sigmoid_alpha: float | None = None,
+        activation_up_bias: float | None = None,
         use_dynamic_sched: bool | None = None,
         device: torch.device | str = "cuda",
         workspace: InferenceWorkspace | None = None,
@@ -234,25 +237,49 @@ class InferenceMoE:
         self.experts = _check_positive("num_experts", num_experts)
         self.topk = _check_positive("top_k", top_k)
         self.max_tokens = _check_positive("max_tokens", max_tokens)
-        if self.hidden_size % 256 or self.intermediate_size % 128:
-            raise ValueError("hidden_size must align to 256 and intermediate_size to 128")
+        if self.hidden_size % 128 or self.intermediate_size % 128:
+            raise ValueError("hidden_size and intermediate_size must align to 128")
         if self.experts > 256:
             raise ValueError("at most 256 local experts are supported")
         if self.topk > self.experts:
             raise ValueError("top_k cannot exceed the local expert count")
         if self.max_tokens * self.topk > B_MAX * CHUNK:
             raise ValueError(f"max_tokens * top_k cannot exceed {B_MAX * CHUNK}")
-        if activation not in ("swiglu", "geglu", "reglu"):
-            raise ValueError("activation must be swiglu, geglu, or reglu")
+        if activation not in ("swiglu", "swiglu_oai", "geglu", "reglu", "relu2"):
+            raise ValueError("unsupported expert activation")
+        if activation == "swiglu_oai":
+            activation_clamp = 7.0 if activation_clamp is None else activation_clamp
+            activation_sigmoid_alpha = (
+                1.702 if activation_sigmoid_alpha is None else activation_sigmoid_alpha
+            )
+            activation_up_bias = 1.0 if activation_up_bias is None else activation_up_bias
+        else:
+            activation_sigmoid_alpha = (
+                1.0 if activation_sigmoid_alpha is None else activation_sigmoid_alpha
+            )
+            activation_up_bias = 0.0 if activation_up_bias is None else activation_up_bias
         if activation_clamp is not None:
             activation_clamp = float(activation_clamp)
             if not math.isfinite(activation_clamp) or activation_clamp <= 0:
                 raise ValueError("activation_clamp must be finite and positive")
-            if activation != "swiglu":
-                raise ValueError("activation_clamp is supported only for swiglu")
+            if activation not in ("swiglu", "swiglu_oai"):
+                raise ValueError("activation_clamp is supported only for SwiGLU activations")
+
+        activation_sigmoid_alpha = float(activation_sigmoid_alpha)
+        activation_up_bias = float(activation_up_bias)
+        if not math.isfinite(activation_sigmoid_alpha) or activation_sigmoid_alpha <= 0:
+            raise ValueError("activation_sigmoid_alpha must be finite and positive")
+        if not math.isfinite(activation_up_bias):
+            raise ValueError("activation_up_bias must be finite")
+        if activation != "swiglu_oai" and (
+            activation_sigmoid_alpha != 1.0 or activation_up_bias != 0.0
+        ):
+            raise ValueError("activation sigmoid alpha and up bias require swiglu_oai")
 
         self.activation = activation
         self.activation_clamp = activation_clamp
+        self.activation_sigmoid_alpha = activation_sigmoid_alpha
+        self.activation_up_bias = activation_up_bias
         self.use_dynamic_sched = use_dynamic_sched
         self.device = torch.device(device)
         if self.device.type != "cuda":
@@ -336,9 +363,25 @@ class InferenceMoE:
         self,
         gate: torch.Tensor,
         up: torch.Tensor,
-        down: torch.Tensor,
+        down: torch.Tensor | None = None,
     ) -> InferenceMoE:
         e, d, i = self.experts, self.hidden_size, self.intermediate_size
+        if self.activation == "relu2":
+            if down is not None:
+                raise ValueError("ReLU squared experts use load_weights(up, down)")
+            down = up
+            up = gate
+            self._check_tensor(up, "up", (e, i, d), torch.bfloat16)
+            self._check_tensor(down, "down", (e, d, i), torch.bfloat16)
+            amax1 = up.abs().amax()
+            amax2 = down.abs().amax()
+            p1 = (amax1.float() / _DEN).clamp_min(1e-30).reshape(1)
+            p2 = (amax2.float() / _DEN).clamp_min(1e-30).reshape(1)
+            q1, sf1 = quantize_expert_stack([up[x] for x in range(e)], p1)
+            q2, sf2 = quantize_expert_stack([down[x] for x in range(e)], p2)
+            return self.load_packed_weights(q1, sf1, p1, q2, sf2, p2)
+        if down is None:
+            raise ValueError("gated experts use load_weights(gate, up, down)")
         self._check_tensor(gate, "gate", (e, i, d), torch.bfloat16)
         self._check_tensor(up, "up", (e, i, d), torch.bfloat16)
         self._check_tensor(down, "down", (e, d, i), torch.bfloat16)
@@ -363,16 +406,17 @@ class InferenceMoE:
         down_scale: torch.Tensor,
     ) -> InferenceMoE:
         e, d, i = self.experts, self.hidden_size, self.intermediate_size
+        first_projection = i if self.activation == "relu2" else 2 * i
         self._check_tensor(
             gate_up,
-            "gate_up",
-            (e, 2 * i, d // 2),
+            "up" if self.activation == "relu2" else "gate_up",
+            (e, first_projection, d // 2),
             torch.float4_e2m1fn_x2,
         )
         self._check_tensor(
             gate_up_sf,
             "gate_up_sf",
-            (e, -(-2 * i // 128), d // 64, 32, 4, 4),
+            (e, -(-first_projection // 128), d // 64, 32, 4, 4),
             torch.float8_e4m3fn,
         )
         self._check_tensor(down, "down", (e, d, i // 2), torch.float4_e2m1fn_x2)
@@ -473,18 +517,25 @@ class InferenceMoE:
             self.intermediate_size,
         )
         if projection == "fc1":
+            unary = self.activation == "relu2"
             return GroupedNvfp4Gemm(
                 self.experts,
-                2 * self.intermediate_size,
+                self.intermediate_size if unary else 2 * self.intermediate_size,
                 self.hidden_size,
                 fc1_m,
                 128,
                 output_dtype=output_dtype,
                 epilogue=(
-                    GatedEpilogue(
-                        self.activation,
-                        save_preact=False,
-                        clamp_limit=self.activation_clamp,
+                    (
+                        UnaryEpilogue(self.activation)
+                        if unary
+                        else GatedEpilogue(
+                            self.activation,
+                            save_preact=False,
+                            clamp_limit=self.activation_clamp,
+                            sigmoid_alpha=self.activation_sigmoid_alpha,
+                            up_bias=self.activation_up_bias,
+                        )
                     )
                     if output_dtype == torch.float4_e2m1fn_x2
                     else None
@@ -525,17 +576,24 @@ class InferenceMoE:
         routed_out = self._routed_out[:rows]
         with torch.cuda.device(self.device):
             if fused_decode:
+                unary = self.activation == "relu2"
                 fc1 = GroupedNvfp4Gemm(
                     self.experts,
-                    2 * self.intermediate_size,
+                    self.intermediate_size if unary else 2 * self.intermediate_size,
                     self.hidden_size,
                     128,
                     fused_tile_n,
                     output_dtype=torch.float4_e2m1fn_x2,
-                    epilogue=GatedEpilogue(
-                        self.activation,
-                        save_preact=False,
-                        clamp_limit=self.activation_clamp,
+                    epilogue=(
+                        UnaryEpilogue(self.activation)
+                        if unary
+                        else GatedEpilogue(
+                            self.activation,
+                            save_preact=False,
+                            clamp_limit=self.activation_clamp,
+                            sigmoid_alpha=self.activation_sigmoid_alpha,
+                            up_bias=self.activation_up_bias,
+                        )
                     ),
                     use_dynamic_sched=False,
                     use_pdl=True,
@@ -604,17 +662,24 @@ class InferenceMoE:
         routed_out = self._routed_out[:rows]
         route_ids = self._m_indptr[: self.topk]
         with torch.cuda.device(self.device):
+            unary = self.activation == "relu2"
             fc1 = GroupedNvfp4Gemm(
                 self.experts,
-                2 * self.intermediate_size,
+                self.intermediate_size if unary else 2 * self.intermediate_size,
                 self.hidden_size,
                 128,
                 128,
                 output_dtype=torch.float4_e2m1fn_x2,
-                epilogue=GatedEpilogue(
-                    self.activation,
-                    save_preact=False,
-                    clamp_limit=self.activation_clamp,
+                epilogue=(
+                    UnaryEpilogue(self.activation)
+                    if unary
+                    else GatedEpilogue(
+                        self.activation,
+                        save_preact=False,
+                        clamp_limit=self.activation_clamp,
+                        sigmoid_alpha=self.activation_sigmoid_alpha,
+                        up_bias=self.activation_up_bias,
+                    )
                 ),
                 use_dynamic_sched=False,
                 use_pdl=True,
@@ -677,9 +742,10 @@ class InferenceMoE:
             padded_offsets=padded_offsets,
             te_math=True,
         )
-        preact = torch.empty(
-            rows, 2 * self.intermediate_size, dtype=torch.bfloat16, device=self.device
+        preact_cols = (
+            self.intermediate_size if self.activation == "relu2" else 2 * self.intermediate_size
         )
+        preact = torch.empty(rows, preact_cols, dtype=torch.bfloat16, device=self.device)
         fc1 = self._calibration_gemms.get(rows)
         if fc1 is None:
             with torch.cuda.device(self.device):
@@ -687,6 +753,13 @@ class InferenceMoE:
             self._calibration_gemms[rows] = fc1
         torch.mul(self._x_scale[:1], self.p_w1, out=self._alpha1)
         fc1(qx, self.qb1, preact, m_indptr, sfx, self.sfb1, self._alpha1)
+        if self.activation == "relu2":
+            hidden = torch.relu(preact.float()).square_()
+            hidden_scale = (hidden.abs().amax().float() / _DEN).clamp_min(1e-30).reshape(1)
+            self._set_scale(self._h_scale, hidden_scale, "hidden_scale")
+            self._scales_ready = True
+            self._refresh_alphas()
+            return self
         gate = preact[:, 0::2].float()
         up = preact[:, 1::2].float()
         if self.activation_clamp is not None:
@@ -694,6 +767,10 @@ class InferenceMoE:
             up.clamp_(min=-self.activation_clamp, max=self.activation_clamp)
         if self.activation == "swiglu":
             hidden = torch.nn.functional.silu(gate).mul_(up)
+        elif self.activation == "swiglu_oai":
+            hidden = gate.mul(torch.sigmoid(self.activation_sigmoid_alpha * gate)).mul_(
+                up.add(self.activation_up_bias)
+            )
         elif self.activation == "geglu":
             hidden = torch.nn.functional.gelu(gate, approximate="tanh").mul_(up)
         else:

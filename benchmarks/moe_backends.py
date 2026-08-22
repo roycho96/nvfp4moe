@@ -29,6 +29,16 @@ def _pad_weights(gate_up: torch.Tensor, down: torch.Tensor, padded_i: int):
     return gate_up_pad.contiguous(), down_pad.contiguous()
 
 
+def _pad_unary_weights(up: torch.Tensor, down: torch.Tensor, padded_i: int):
+    i = up.shape[1]
+    if i == padded_i:
+        return up.contiguous(), down.contiguous()
+    return (
+        F.pad(up, (0, 0, 0, padded_i - i)).contiguous(),
+        F.pad(down, (0, padded_i - i)).contiguous(),
+    )
+
+
 def _interleave_gate_up(gate_up: torch.Tensor) -> torch.Tensor:
     """[gate block; up block] -> [g0,u0,g1,u1,...] used by LightMoE."""
     gate, up = gate_up.chunk(2, dim=1)
@@ -110,7 +120,11 @@ class LightMoEExpert(nn.Module):
         from lightmoe import MoEDispatch, MoEExpertLayer
 
         i_pad = spec.padded_intermediate
-        gate_up, down = _pad_weights(trace["gate_up_weight"], trace["down_weight"], i_pad)
+        unary = spec.activation == "relu2"
+        if unary:
+            gate_up, down = _pad_unary_weights(trace["gate_up_weight"], trace["down_weight"], i_pad)
+        else:
+            gate_up, down = _pad_weights(trace["gate_up_weight"], trace["down_weight"], i_pad)
         self.layer = MoEExpertLayer(
             spec.hidden,
             i_pad,
@@ -120,10 +134,11 @@ class LightMoEExpert(nn.Module):
             delayed_col_amax=True,
             fused_row_col=fused_row_col,
             activation=spec.activation,
+            activation_clamp=spec.activation_clamp,
             use_dynamic_sched=use_dynamic_sched,
         ).cuda()
         with torch.no_grad():
-            self.layer.w1.copy_(_interleave_gate_up(gate_up))
+            self.layer.w1.copy_(gate_up if unary else _interleave_gate_up(gate_up))
             self.layer.w2.copy_(down)
         self.layer.refresh_weights()
         self.dispatch = MoEDispatch(trace["expert_input"].shape[0], spec.experts, spec.topk)
@@ -140,7 +155,11 @@ class LightMoEExpert(nn.Module):
 
     def training_gradients(self):
         return {
-            "gate_up": _deinterleave_gate_up(self.layer.w1.grad),
+            "gate_up": (
+                self.layer.w1.grad.contiguous()
+                if self.layer.unary
+                else _deinterleave_gate_up(self.layer.w1.grad)
+            ),
             "down": self.layer.w2.grad.contiguous(),
         }
 

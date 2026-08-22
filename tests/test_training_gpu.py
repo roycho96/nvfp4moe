@@ -94,6 +94,80 @@ def padded_offsets(cu):
     return (((counts + 127) // 128) * 128).cumsum(0).to(torch.int32)
 
 
+def check_model_activations():
+    """Compare model-specific activation gradients with autograd."""
+    from lightmoe import MoEExpertLayer
+
+    print("model activations:", flush=True)
+    torch.manual_seed(20260826)
+    T, d, I, E = 64, 256, 128, 2
+    cu = torch.tensor([0, T // 2, T], dtype=torch.int32, device="cuda")
+    off_pad = torch.tensor([128, 256], dtype=torch.int32, device="cuda")
+    cases = (("swiglu_oai", None), ("relu2", None), ("swiglu", 10.0))
+    for activation, clamp in cases:
+        layer = MoEExpertLayer(
+            d,
+            I,
+            E,
+            1,
+            rht=False,
+            fused_row_col=False,
+            activation=activation,
+            activation_clamp=clamp,
+        ).cuda()
+        layer.refresh_weights()
+        x = (torch.randn(T, d, dtype=torch.bfloat16, device="cuda") * 6).requires_grad_(True)
+        dy = torch.randn(T, d, dtype=torch.bfloat16, device="cuda")
+        layer.calibrate_routed(x.detach(), cu, off_pad)
+        if activation == "relu2":
+            y = layer.forward_unary_routed(x, layer.w1, layer.w2, cu, off_pad)
+        else:
+            y = layer.forward_routed(
+                x,
+                layer.w1[:, 0::2],
+                layer.w1[:, 1::2],
+                layer.w2,
+                cu,
+                off_pad,
+            )
+        y.backward(dy)
+
+        xr = x.detach().float().requires_grad_(True)
+        w1r = layer.w1.detach().float().requires_grad_(True)
+        w2r = layer.w2.detach().float().requires_grad_(True)
+        outputs = []
+        for expert, (lo, hi) in enumerate(((0, T // 2), (T // 2, T))):
+            preact = xr[lo:hi] @ w1r[expert].T
+            if activation == "relu2":
+                hidden = torch.relu(preact).square()
+            else:
+                gate, up = preact[:, 0::2], preact[:, 1::2]
+                if activation == "swiglu_oai":
+                    gate = gate.clamp(max=7)
+                    up = up.clamp(min=-7, max=7)
+                    hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1)
+                else:
+                    gate = gate.clamp(max=10)
+                    up = up.clamp(min=-10, max=10)
+                    hidden = torch.nn.functional.silu(gate) * up
+            outputs.append(hidden @ w2r[expert].T)
+        yr = torch.cat(outputs)
+        yr.backward(dy.float())
+        values = (
+            ("output", y, yr, 0.90),
+            ("dX", x.grad, xr.grad, 0.85),
+            ("dW1", layer.w1.grad, w1r.grad, 0.85),
+            ("dW2", layer.w2.grad, w2r.grad, 0.85),
+        )
+        for name, actual, reference, threshold in values:
+            cosine, relative = cosrel(actual, reference)
+            check(
+                f"{activation} {name} closure",
+                cosine > threshold,
+                f"cos {cosine:.5f} rel {relative:.4f}",
+            )
+
+
 def check_grouped_wgrad():
     """Compare grouped wgrad with the per-expert GEMM reference."""
     from lightmoe._quantization import TensorScale
@@ -554,6 +628,7 @@ def main():
     from lightmoe.kernels.routing.combine import moe_finalize, moe_finalize_bwd
 
     check_dispatch()
+    check_model_activations()
     check_grouped_wgrad()
     check_stochastic_rounding()
     check_rht()

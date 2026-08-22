@@ -12,7 +12,7 @@ from cutlass._mlir.dialects import arith
 
 from .quantize.kernel import F4_MAX, _cvt_e4m3_rn
 
-_ACTIVATIONS = ("swiglu", "geglu", "reglu")
+_ACTIVATIONS = ("swiglu", "swiglu_oai", "geglu", "reglu")
 FLT_MAX = 3.4028234663852886e38
 
 
@@ -44,18 +44,40 @@ class GatedEpilogue:
     activation: str = "swiglu"
     save_preact: bool = False
     clamp_limit: float | None = None
+    sigmoid_alpha: float | None = None
+    up_bias: float | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "activation", validate_gated_activation(self.activation))
+        if self.activation == "swiglu_oai":
+            if self.clamp_limit is None:
+                object.__setattr__(self, "clamp_limit", 7.0)
+            if self.sigmoid_alpha is None:
+                object.__setattr__(self, "sigmoid_alpha", 1.702)
+            if self.up_bias is None:
+                object.__setattr__(self, "up_bias", 1.0)
+        else:
+            if self.sigmoid_alpha is None:
+                object.__setattr__(self, "sigmoid_alpha", 1.0)
+            if self.up_bias is None:
+                object.__setattr__(self, "up_bias", 0.0)
         if self.clamp_limit is not None:
             limit = float(self.clamp_limit)
             if not math.isfinite(limit) or limit <= 0:
                 raise ValueError("clamp_limit must be finite and positive")
-            if self.activation != "swiglu":
-                raise ValueError("clamp_limit is supported only for swiglu")
-            if self.save_preact:
-                raise ValueError("clamped swiglu does not support saved preactivation")
+            if self.activation not in ("swiglu", "swiglu_oai"):
+                raise ValueError("clamp_limit is supported only for SwiGLU activations")
             object.__setattr__(self, "clamp_limit", limit)
+        sigmoid_alpha = float(self.sigmoid_alpha)
+        up_bias = float(self.up_bias)
+        if not math.isfinite(sigmoid_alpha) or sigmoid_alpha <= 0:
+            raise ValueError("sigmoid_alpha must be finite and positive")
+        if not math.isfinite(up_bias):
+            raise ValueError("up_bias must be finite")
+        if self.activation != "swiglu_oai" and (sigmoid_alpha != 1.0 or up_bias != 0.0):
+            raise ValueError("sigmoid_alpha and up_bias require swiglu_oai")
+        object.__setattr__(self, "sigmoid_alpha", sigmoid_alpha)
+        object.__setattr__(self, "up_bias", up_bias)
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,24 +85,42 @@ class GatedBackwardEpilogue:
     """Fused gated derivative selected at GEMM compile time."""
 
     activation: str = "swiglu"
+    clamp_limit: float | None = None
+    sigmoid_alpha: float | None = None
+    up_bias: float | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "activation", validate_gated_activation(self.activation))
+        forward = GatedEpilogue(
+            self.activation,
+            clamp_limit=self.clamp_limit,
+            sigmoid_alpha=self.sigmoid_alpha,
+            up_bias=self.up_bias,
+        )
+        object.__setattr__(self, "clamp_limit", forward.clamp_limit)
+        object.__setattr__(self, "sigmoid_alpha", forward.sigmoid_alpha)
+        object.__setattr__(self, "up_bias", forward.up_bias)
 
 
 def resolve_gemm_epilogue(
-    epilogue: GatedEpilogue | GatedBackwardEpilogue | None,
+    epilogue,
     activation: str | None,
     dactivation: str | None,
 ) -> tuple[str | None, str | None]:
+    from .unary import UnaryBackwardEpilogue, UnaryEpilogue
+
     if epilogue is not None and (activation is not None or dactivation is not None):
         raise ValueError("epilogue cannot be combined with activation or dactivation")
     if isinstance(epilogue, GatedEpilogue):
         return epilogue.activation, None
     if isinstance(epilogue, GatedBackwardEpilogue):
         return None, epilogue.activation
+    if isinstance(epilogue, UnaryEpilogue):
+        return epilogue.activation, None
+    if isinstance(epilogue, UnaryBackwardEpilogue):
+        return None, epilogue.activation
     if epilogue is not None:
-        raise TypeError("epilogue must be GatedEpilogue or GatedBackwardEpilogue")
+        raise TypeError("unsupported grouped GEMM epilogue")
     return activation, dactivation
 
 
@@ -111,15 +151,19 @@ def gated_postact_value(
     up: Float32,
     activation: cutlass.Constexpr[str],
     clamp_limit: cutlass.Constexpr[float] = 0.0,
+    sigmoid_alpha: cutlass.Constexpr[float] = 1.0,
+    up_bias: cutlass.Constexpr[float] = 0.0,
 ) -> Float32:
     validate_gated_activation(activation)
     if const_expr(clamp_limit > 0.0):
         limit = Float32(clamp_limit)
         gate = cute.arch.fmin(gate, limit)
         up = cute.arch.fmax(cute.arch.fmin(up, limit), -limit)
-    if const_expr(activation == "swiglu"):
-        sigmoid = cute.arch.rcp_approx(Float32(1.0) + cute.math.exp(-gate, fastmath=True))
-        return gate * sigmoid * up
+    if const_expr(activation in ("swiglu", "swiglu_oai")):
+        sigmoid = cute.arch.rcp_approx(
+            Float32(1.0) + cute.math.exp(-Float32(sigmoid_alpha) * gate, fastmath=True)
+        )
+        return gate * sigmoid * (up + Float32(up_bias))
     if const_expr(activation == "geglu"):
         root = math.sqrt(2.0 / math.pi)
         argument = root * (gate + Float32(0.044715) * gate * gate * gate)
@@ -134,6 +178,8 @@ def gated_postact_fragment(
     alpha: Float32,
     activation: cutlass.Constexpr[str],
     clamp_limit: cutlass.Constexpr[float] = 0.0,
+    sigmoid_alpha: cutlass.Constexpr[float] = 1.0,
+    up_bias: cutlass.Constexpr[float] = 0.0,
 ) -> cute.Tensor:
     """Apply a gated activation to adjacent FP32 accumulator values.
 
@@ -150,7 +196,14 @@ def gated_postact_fragment(
     for index in cutlass.range_constexpr(count):
         gate = values[index * 2] * alpha
         up = values[index * 2 + 1] * alpha
-        output[index] = gated_postact_value(gate, up, activation, clamp_limit)
+        output[index] = gated_postact_value(
+            gate,
+            up,
+            activation,
+            clamp_limit,
+            sigmoid_alpha,
+            up_bias,
+        )
     return output
 
 
@@ -160,14 +213,38 @@ def gated_backward_values(
     up: Float32,
     dout: Float32,
     activation: cutlass.Constexpr[str],
+    clamp_limit: cutlass.Constexpr[float] = 0.0,
+    sigmoid_alpha: cutlass.Constexpr[float] = 1.0,
+    up_bias: cutlass.Constexpr[float] = 0.0,
 ) -> tuple[Float32, Float32, Float32]:
     """Return gate gradient, up gradient, and the recomputed activation."""
     validate_gated_activation(activation)
-    if const_expr(activation == "swiglu"):
-        sigmoid = cute.arch.rcp_approx(Float32(1.0) + cute.math.exp(-gate, fastmath=True))
+    raw_gate = gate
+    raw_up = up
+    if const_expr(clamp_limit > 0.0):
+        limit = Float32(clamp_limit)
+        gate = cute.arch.fmin(gate, limit)
+        up = cute.arch.fmax(cute.arch.fmin(up, limit), -limit)
+    if const_expr(activation in ("swiglu", "swiglu_oai")):
+        alpha = Float32(sigmoid_alpha)
+        biased_up = up + Float32(up_bias)
+        sigmoid = cute.arch.rcp_approx(Float32(1.0) + cute.math.exp(-alpha * gate, fastmath=True))
         activated = gate * sigmoid
-        derivative = sigmoid + gate * sigmoid * (Float32(1.0) - sigmoid)
-        return dout * up * derivative, dout * activated, activated * up
+        derivative = sigmoid + alpha * gate * sigmoid * (Float32(1.0) - sigmoid)
+        dgate = dout * biased_up * derivative
+        dup = dout * activated
+        if const_expr(clamp_limit > 0.0):
+            gate_in_range = Boolean(raw_gate <= Float32(clamp_limit))
+            up_in_range = Boolean(
+                (raw_up >= -Float32(clamp_limit)) & (raw_up <= Float32(clamp_limit))
+            )
+            dgate = Float32(
+                arith.select(gate_in_range.ir_value(), dgate.ir_value(), Float32(0.0).ir_value())
+            )
+            dup = Float32(
+                arith.select(up_in_range.ir_value(), dup.ir_value(), Float32(0.0).ir_value())
+            )
+        return dgate, dup, activated * biased_up
     if const_expr(activation == "geglu"):
         root = math.sqrt(2.0 / math.pi)
         cubic = Float32(0.044715) * gate * gate * gate

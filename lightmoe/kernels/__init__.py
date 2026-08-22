@@ -10,6 +10,8 @@ __all__ = [
     "GroupedNvfp4Gemm",
     "GroupedWgrad",
     "MoEDispatch",
+    "UnaryBackwardEpilogue",
+    "UnaryEpilogue",
     "gated_backward_values",
     "gated_postact_fragment",
     "grouped_nvfp4_gemm",
@@ -24,6 +26,8 @@ __all__ = [
     "quantize_postact_fragment",
     "rht_matrix",
     "swiglu_backward_pair",
+    "unary_backward_values",
+    "unary_postact_fragment",
 ]
 
 _EXPORTS = {
@@ -34,6 +38,8 @@ _EXPORTS = {
     "GroupedNvfp4Gemm": (".grouped.runtime", "GroupedNvfp4Gemm"),
     "GroupedWgrad": (".grouped.wgrad", "GroupedWgrad"),
     "MoEDispatch": (".routing.dispatch", "MoEDispatch"),
+    "UnaryBackwardEpilogue": (".unary", "UnaryBackwardEpilogue"),
+    "UnaryEpilogue": (".unary", "UnaryEpilogue"),
     "gated_backward_values": (".gated", "gated_backward_values"),
     "gated_postact_fragment": (".gated", "gated_postact_fragment"),
     "grouped_nvfp4_gemm": (".grouped.runtime", "grouped_nvfp4_gemm"),
@@ -48,6 +54,8 @@ _EXPORTS = {
     "quantize_postact_fragment": (".gated", "quantize_postact_fragment"),
     "rht_matrix": (".quantize.runtime", "rht_matrix"),
     "swiglu_backward_pair": (".gated", "swiglu_backward_pair"),
+    "unary_backward_values": (".unary", "unary_backward_values"),
+    "unary_postact_fragment": (".unary", "unary_postact_fragment"),
 }
 
 

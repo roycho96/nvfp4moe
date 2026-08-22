@@ -52,6 +52,12 @@ from ..gated import (
     validate_gated_activation,
 )
 from ..quantize.kernel import _cvt_e2m1_pair_rn
+from ..unary import (
+    unary_backward_values,
+    unary_postact_fragment,
+    unary_postact_value,
+    validate_unary_activation,
+)
 from .pipeline import CpAsyncUmmaPipeline
 from .scheduler import (
     MoEPersistentTileScheduler,
@@ -141,6 +147,8 @@ class Sm100GroupedBlockScaledGemmKernel:
         dactivation: str | None = None,
         save_preact: bool = False,
         gated_clamp_limit: float = 0.0,
+        activation_sigmoid_alpha: float = 1.0,
+        activation_up_bias: float = 0.0,
         mma_inst_tile_k: int = 4,
         use_dynamic_sched: bool = True,
         use_pdl: bool = False,
@@ -169,12 +177,26 @@ class Sm100GroupedBlockScaledGemmKernel:
         if mma_inst_tile_k not in (2, 4):
             raise ValueError("mma_inst_tile_k must be 2 or 4")
         self.acc_dtype = cutlass.Float32
-        self.activation = None if activation is None else validate_gated_activation(activation)
-        self.dactivation = None if dactivation is None else validate_gated_activation(dactivation)
-        self.gated = self.activation is not None
+        self.unary = activation == "relu2"
+        self.dunary = dactivation == "relu2"
+        if self.unary:
+            self.activation = validate_unary_activation(activation)
+        else:
+            self.activation = None if activation is None else validate_gated_activation(activation)
+        if self.dunary:
+            self.dactivation = validate_unary_activation(dactivation)
+        else:
+            self.dactivation = (
+                None if dactivation is None else validate_gated_activation(dactivation)
+            )
+        self.gated = self.activation is not None and not self.unary
+        self.postact = self.activation is not None
+        self.postact_divisor = 2 if self.gated else 1
         self.dgrad = self.dactivation is not None
         self.save_preact = bool(save_preact)
         self.gated_clamp_limit = float(gated_clamp_limit)
+        self.activation_sigmoid_alpha = float(activation_sigmoid_alpha)
+        self.activation_up_bias = float(activation_up_bias)
         self.use_dynamic_sched = bool(use_dynamic_sched)
         self.use_pdl = bool(use_pdl)
         self.swap_ab = bool(swap_ab)
@@ -197,10 +219,17 @@ class Sm100GroupedBlockScaledGemmKernel:
             raise ValueError("decode grid specialization requires gathered fast decode")
         if self.gather_b and not (self.swap_ab and self.fast_decode_sched and mma_inst_tile_k == 4):
             raise ValueError("gather B requires swapped K256 fast decode")
-        if self.save_preact and not self.gated:
-            raise ValueError("saved preactivation requires a gated epilogue")
-        if self.gated_clamp_limit < 0 or (self.gated_clamp_limit and self.activation != "swiglu"):
-            raise ValueError("gated clamp requires swiglu and a nonnegative limit")
+        if self.save_preact and not self.postact:
+            raise ValueError("saved preactivation requires an activation epilogue")
+        gated_activation = self.activation or self.dactivation
+        if self.gated_clamp_limit < 0 or (
+            self.gated_clamp_limit and gated_activation not in ("swiglu", "swiglu_oai")
+        ):
+            raise ValueError("gated clamp requires a SwiGLU activation and a nonnegative limit")
+        if gated_activation != "swiglu_oai" and (
+            self.activation_sigmoid_alpha != 1.0 or self.activation_up_bias != 0.0
+        ):
+            raise ValueError("sigmoid alpha and up bias require swiglu_oai")
         self.mma_inst_tile_k = mma_inst_tile_k
         self.sf_vec_size = sf_vec_size
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -361,7 +390,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             self.smem_capacity,
             self.occupancy,
         )
-        if self.gated and self.swap_ab:
+        if self.postact and self.swap_ab:
             self.num_ab_stage = max(2, self.num_ab_stage - 1)
         if self.swap_ab:
             self.num_c_stage = min(self.num_c_stage, 8)
@@ -609,13 +638,22 @@ class Sm100GroupedBlockScaledGemmKernel:
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
-        preact = cute.make_tensor(
-            cute.recast_ptr(runtime_preact_ptr, dtype=cutlass.Int32),
-            cute.make_layout(
-                (total_rows, problem_n, c1),
-                stride=(problem_n, c1, c0),
-            ),
-        )
+        if cutlass.const_expr(self.dunary):
+            preact = cute.make_tensor(
+                runtime_preact_ptr,
+                cute.make_layout(
+                    (total_rows, problem_n, c1),
+                    stride=(problem_n, c1, c0),
+                ),
+            )
+        else:
+            preact = cute.make_tensor(
+                cute.recast_ptr(runtime_preact_ptr, dtype=cutlass.Int32),
+                cute.make_layout(
+                    (total_rows, problem_n, c1),
+                    stride=(problem_n, c1, c0),
+                ),
+            )
         runtime_aux_ptr = cute.make_ptr(
             data_aux.element_type,
             data_aux.iterator.toint(),
@@ -672,7 +710,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         initial_sfa = cute.make_tensor(runtime_sfa_ptr, sfa_layout)
         initial_sfb = cute.make_tensor(runtime_sfb_ptr, sfb_layout)
 
-        if cutlass.const_expr(self.gated and self.is_nvfp4_output):
+        if cutlass.const_expr(self.postact and self.is_nvfp4_output):
             padded_output_rows = output_sf.shape[1] * 128
             output_sf_ptr = cute.make_ptr(
                 output_sf.element_type,
@@ -682,7 +720,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             )
             output_sf_layout = blockscaled_utils.tile_atom_to_shape_SF(
                 (padded_output_rows, problem_n, c1),
-                self.sf_vec_size * 2,
+                self.sf_vec_size * (2 if self.gated else 1),
             )
             output_sf = cute.make_tensor(output_sf_ptr, output_sf_layout)
 
@@ -837,7 +875,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         AuxStorage = cute.struct.MemRange[cutlass.Int32, 0]
         SwappedGatedStorage = cute.struct.MemRange[cutlass.Int32, 0]
         CStorage = cute.struct.MemRange[cutlass.Int32, 0]
-        if cutlass.const_expr(not (self.gated and self.swap_ab) and not self.direct_c_store):
+        if cutlass.const_expr(not (self.postact and self.swap_ab) and not self.direct_c_store):
             CStorage = cute.struct.Align[
                 cute.struct.MemRange[
                     self.c_dtype,
@@ -865,7 +903,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                 ],
                 self.buffer_align_bytes,
             ]
-        if cutlass.const_expr(self.gated and self.swap_ab):
+        if cutlass.const_expr(self.postact and self.swap_ab):
             SwappedGatedStorage = cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Float32,
@@ -1339,7 +1377,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         # Setup smem tensor A/B/SFA/SFB/C
         #
         sC = None
-        if cutlass.const_expr(not (self.gated and self.swap_ab) and not self.direct_c_store):
+        if cutlass.const_expr(not (self.postact and self.swap_ab) and not self.direct_c_store):
             sC = storage.sC.get_tensor(
                 c_smem_layout_staged.outer,
                 swizzle=c_smem_layout_staged.inner,
@@ -1357,7 +1395,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                 aux_smem_layout_staged.outer,
                 swizzle=aux_smem_layout_staged.inner,
             )
-        if cutlass.const_expr(self.gated and self.swap_ab):
+        if cutlass.const_expr(self.postact and self.swap_ab):
             sGated = cute.make_tensor(
                 storage.sGated.data_ptr(),
                 cute.make_layout(
@@ -2200,7 +2238,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             tiled_copy_s2r = None
             tSR_rP = None
             tSR_sP = None
-            if cutlass.const_expr(self.gated and not self.swap_ab):
+            if cutlass.const_expr(self.postact and not self.swap_ab):
                 copy_atom_r2s = sm100_utils.get_smem_store_op(
                     self.c_layout,
                     self.c_dtype,
@@ -2230,7 +2268,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                     tTR_rAux = cute.make_rmem_tensor(tTR_rAcc.shape, cutlass.BFloat16)
                     tRS_rAux = aux_tiled_copy_r2s.retile(tTR_rAux)
                     tRS_sAux = aux_tiled_copy_r2s.get_slice(epi_tidx).partition_D(sAux)
-            elif cutlass.const_expr(not self.gated):
+            elif cutlass.const_expr(not self.postact):
                 tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
                 if cutlass.const_expr(self.direct_c_store):
                     copy_atom_r2s = sm100_utils.get_smem_store_op(
@@ -2271,7 +2309,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                     tRS_rAux = aux_tiled_copy_r2s.retile(tTR_rAux)
                     tRS_sAux = aux_tiled_copy_r2s.get_slice(epi_tidx).partition_D(sAux)
             c_tma_smem = None
-            if cutlass.const_expr(not (self.gated and self.swap_ab) and not self.direct_c_store):
+            if cutlass.const_expr(not (self.postact and self.swap_ab) and not self.direct_c_store):
                 c_tma_smem = cute.group_modes(sC, 0, cute.rank(sC) - 1)
             aux_tma_smem = None
             if cutlass.const_expr(self.dgrad or self.save_preact):
@@ -2515,10 +2553,10 @@ class Sm100GroupedBlockScaledGemmKernel:
                                 with cute.arch.elect_one():
                                     acc_pipeline.consumer_release(acc_consumer_state)
 
-                    elif cutlass.const_expr(self.gated or self.dgrad):
+                    elif cutlass.const_expr(self.postact or self.dgrad):
                         tTR_rAcc.fill(0)
 
-                    if cutlass.const_expr(self.gated and self.swap_ab):
+                    if cutlass.const_expr(self.postact and self.swap_ab):
                         assert subtile_cnt == 1
                         coords = tTR_cAcc_subtiles[(None, None, None, subtile_idx)]
                         flat_coords = cute.group_modes(coords, 0, cute.rank(coords))
@@ -2535,7 +2573,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                                 sGated[coord[0], coord[1]] = flat_acc[value_idx] * alpha_value
                         self.epilog_sync_barrier.arrive_and_wait()
 
-                        groups_per_row = self.cta_tile_shape_mnk[0] // 32
+                        groups_per_row = self.cta_tile_shape_mnk[0] // (16 * self.postact_divisor)
                         groups_per_pass = 128
                         group_passes = cute.ceil_div(
                             groups_per_row * tile_rows,
@@ -2554,13 +2592,23 @@ class Sm100GroupedBlockScaledGemmKernel:
                                     )
                                     first_output = group_in_row * postact_count
                                     for value_idx in cutlass.range_constexpr(postact_count):
-                                        accumulator_col = (first_output + value_idx) * 2
-                                        postact[value_idx] = gated_postact_value(
-                                            sGated[accumulator_col, row_in_cta],
-                                            sGated[accumulator_col + 1, row_in_cta],
-                                            self.activation,
-                                            self.gated_clamp_limit,
-                                        )
+                                        accumulator_col = (
+                                            first_output + value_idx
+                                        ) * self.postact_divisor
+                                        if cutlass.const_expr(self.unary):
+                                            postact[value_idx] = unary_postact_value(
+                                                sGated[accumulator_col, row_in_cta],
+                                                self.activation,
+                                            )
+                                        else:
+                                            postact[value_idx] = gated_postact_value(
+                                                sGated[accumulator_col, row_in_cta],
+                                                sGated[accumulator_col + 1, row_in_cta],
+                                                self.activation,
+                                                self.gated_clamp_limit,
+                                                self.activation_sigmoid_alpha,
+                                                self.activation_up_bias,
+                                            )
                                     scaled_postact, output_sf_values = quantize_postact_fragment(
                                         postact,
                                         output_inv_pts,
@@ -2579,7 +2627,8 @@ class Sm100GroupedBlockScaledGemmKernel:
                                             & 0xFF
                                         )
                                     output_col = (
-                                        work_tile.tile_n_idx * (self.cta_tile_shape_mnk[0] // 2)
+                                        work_tile.tile_n_idx
+                                        * (self.cta_tile_shape_mnk[0] // self.postact_divisor)
                                         + first_output
                                     )
                                     output_row = cutlass.Int64(expert_row) + local_row
@@ -2627,7 +2676,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                                     )
                                     output_sf_bytes[0] = output_sf_values[0]
                         self.epilog_sync_barrier.arrive_and_wait()
-                    elif cutlass.const_expr(self.gated):
+                    elif cutlass.const_expr(self.postact):
                         if cutlass.const_expr(self.save_preact):
                             acc_values = cute.make_tensor(
                                 tTR_rAcc.iterator,
@@ -2641,12 +2690,21 @@ class Sm100GroupedBlockScaledGemmKernel:
                                 preact_values[value_idx] = (acc_values[value_idx] * alpha_value).to(
                                     cutlass.BFloat16
                                 )
-                        postact = gated_postact_fragment(
-                            tTR_rAcc,
-                            alpha_value,
-                            self.activation,
-                            self.gated_clamp_limit,
-                        )
+                        if cutlass.const_expr(self.unary):
+                            postact = unary_postact_fragment(
+                                tTR_rAcc,
+                                alpha_value,
+                                self.activation,
+                            )
+                        else:
+                            postact = gated_postact_fragment(
+                                tTR_rAcc,
+                                alpha_value,
+                                self.activation,
+                                self.gated_clamp_limit,
+                                self.activation_sigmoid_alpha,
+                                self.activation_up_bias,
+                            )
                         if cutlass.const_expr(self.is_nvfp4_output):
                             scaled_postact, output_sf_values = quantize_postact_fragment(
                                 postact,
@@ -2672,13 +2730,16 @@ class Sm100GroupedBlockScaledGemmKernel:
                                 scaled_postact.layout,
                             )
                             coords = tTR_cAcc_subtiles[(None, None, None, subtile_idx)]
-                            output_pairs = cute.flat_divide(
-                                coords,
-                                cute.make_layout(2),
-                            )
-                            output_coords = output_pairs[
-                                (0,) + (None,) * (cute.rank(output_pairs) - 1)
-                            ]
+                            if cutlass.const_expr(self.gated):
+                                output_pairs = cute.flat_divide(
+                                    coords,
+                                    cute.make_layout(2),
+                                )
+                                output_coords = output_pairs[
+                                    (0,) + (None,) * (cute.rank(output_pairs) - 1)
+                                ]
+                            else:
+                                output_coords = coords
                             sf_group_count = cute.size(output_sf_values)
                             if cutlass.const_expr(sf_group_count == 2):
                                 sf_values_i16 = cute.recast_tensor(
@@ -2699,8 +2760,9 @@ class Sm100GroupedBlockScaledGemmKernel:
                                         )
                                         sf_store_row = local_row
                                     output_col = (
-                                        work_tile.tile_n_idx * (self.cta_tile_shape_mnk[1] // 2)
-                                        + coord[1] // 2
+                                        work_tile.tile_n_idx
+                                        * (self.cta_tile_shape_mnk[1] // self.postact_divisor)
+                                        + coord[1] // self.postact_divisor
                                     )
                                     if (
                                         local_row < expert_rows
@@ -2708,10 +2770,10 @@ class Sm100GroupedBlockScaledGemmKernel:
                                     ):
                                         sf_offset = (
                                             sf_tile_base
-                                            + (coord[1] // 128) * 512
+                                            + (coord[1] // (64 * self.postact_divisor)) * 512
                                             + (sf_store_row % 32) * 16
                                             + ((sf_store_row // 32) % 4) * 4
-                                            + (coord[1] // 32) % 4
+                                            + (coord[1] // (16 * self.postact_divisor)) % 4
                                         )
                                         sf_ptr = cute.make_tensor(
                                             cute.recast_ptr(
@@ -2734,8 +2796,9 @@ class Sm100GroupedBlockScaledGemmKernel:
                                         )
                                         sf_store_row = local_row
                                     output_col = (
-                                        work_tile.tile_n_idx * (self.cta_tile_shape_mnk[1] // 2)
-                                        + coord[1] // 2
+                                        work_tile.tile_n_idx
+                                        * (self.cta_tile_shape_mnk[1] // self.postact_divisor)
+                                        + coord[1] // self.postact_divisor
                                     )
                                     if local_row < expert_rows and output_col < mC_mnl.shape[1]:
                                         if cutlass.const_expr(self.direct_routes > 0):
@@ -2813,12 +2876,19 @@ class Sm100GroupedBlockScaledGemmKernel:
                         self.epilog_sync_barrier.arrive_and_wait()
                         preact_pipeline.consumer_release(preact_consumer_state)
                         preact_consumer_state.advance()
-                        preact_pair = cute.make_rmem_tensor(
-                            cute.make_layout(1),
-                            cutlass.Int32,
-                        )
-                        if cutlass.const_expr(
-                            self.dactivation == "swiglu" and self.mma_inst_tile_k == 4
+                        if cutlass.const_expr(self.dunary):
+                            for value_idx in cutlass.range_constexpr(cute.size(flat_acc)):
+                                grad, postact = unary_backward_values(
+                                    flat_preact[value_idx].to(cutlass.Float32),
+                                    flat_acc[value_idx] * alpha_value,
+                                    self.dactivation,
+                                )
+                                flat_out[value_idx] = grad.to(cutlass.BFloat16)
+                                flat_aux[value_idx] = postact.to(cutlass.BFloat16)
+                        elif cutlass.const_expr(
+                            self.dactivation == "swiglu"
+                            and self.gated_clamp_limit == 0.0
+                            and self.mma_inst_tile_k == 4
                         ):
                             preact_pairs = cute.make_rmem_tensor(
                                 cute.make_layout(2),
@@ -2863,6 +2933,10 @@ class Sm100GroupedBlockScaledGemmKernel:
                                 flat_aux[value_idx] = postact[0].to(cutlass.BFloat16)
                                 flat_aux[value_idx + 1] = postact[1].to(cutlass.BFloat16)
                         else:
+                            preact_pair = cute.make_rmem_tensor(
+                                cute.make_layout(1),
+                                cutlass.Int32,
+                            )
                             grad_pair = cute.make_rmem_tensor(
                                 cute.make_layout(2),
                                 cutlass.BFloat16,
@@ -2881,6 +2955,9 @@ class Sm100GroupedBlockScaledGemmKernel:
                                     bf16_pair[1].to(cutlass.Float32),
                                     flat_acc[value_idx] * alpha_value,
                                     self.dactivation,
+                                    self.gated_clamp_limit,
+                                    self.activation_sigmoid_alpha,
+                                    self.activation_up_bias,
                                 )
                                 grad_pair[0] = dgate.to(cutlass.BFloat16)
                                 grad_pair[1] = dup.to(cutlass.BFloat16)
@@ -3058,7 +3135,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             #
             # Wait for C store complete
             #
-            if cutlass.const_expr(not (self.gated and self.swap_ab) and not self.direct_c_store):
+            if cutlass.const_expr(not (self.postact and self.swap_ab) and not self.direct_c_store):
                 c_pipeline.producer_tail()
 
     def mainloop_s2t_copy_and_partition(

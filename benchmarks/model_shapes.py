@@ -26,6 +26,7 @@ class ModelShape:
     activation: str = "swiglu"
     layer_supported: bool = True
     layer_exclusion: str = ""
+    activation_clamp: float | None = None
 
     def __post_init__(self):
         if self.experts % self.quick_ep:
@@ -45,7 +46,12 @@ class ModelShape:
     def gemm_shape(self, projection: str) -> tuple[int, int]:
         """Return (N, K) for B[E, N, K] in the grouped GEMM convention."""
         if projection == "gate_up":
-            return 2 * self.padded_intermediate, self.hidden
+            width = (
+                self.padded_intermediate
+                if self.activation == "relu2"
+                else 2 * self.padded_intermediate
+            )
+            return width, self.hidden
         if projection == "down":
             return self.hidden, self.padded_intermediate
         raise ValueError(f"unknown projection {projection!r}")
@@ -90,8 +96,9 @@ MODEL_SHAPES = {
             (4, 8, 32, 64),
             32,
             "swiglu",
-            False,
-            "bounded SwiGLU backward is not implemented",
+            True,
+            "",
+            10.0,
         ),
         ModelShape(
             "kimi_k3",
@@ -132,8 +139,8 @@ MODEL_SHAPES = {
             (1, 8, 16, 32),
             16,
             "swiglu_oai",
-            False,
-            "SwiGLU-OAI is not implemented",
+            True,
+            "",
         ),
         ModelShape(
             "nemotron_3_5_30b_a3b",
@@ -147,8 +154,8 @@ MODEL_SHAPES = {
             (1, 8, 16, 32),
             16,
             "relu2",
-            False,
-            "ReLU-squared is not implemented",
+            True,
+            "",
         ),
     )
 }
