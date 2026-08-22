@@ -56,7 +56,7 @@ The baseline column selects the faster runnable baseline for each row.
 | GLM-5.2 down | 256 / 8 / 16 | 6,144 × 2,048 | **406.7 [3.9]** | PyTorch 437.4 | 1.075× | 4,055 | 45.1% |
 | MiniMax-M3 gate/up | 128 / 4 / 16 | 6,144 × 6,144 | **486.6 [2.2]** | PyTorch 530.5 | 1.090× | 5,084 | 56.5% |
 | MiniMax-M3 down | 128 / 4 / 16 | 6,144 × 3,072 | **275.6 [2.0]** | PyTorch 304.2 | 1.104× | 4,489 | 49.9% |
-| Nemotron-3.5-Lightning-30B-A3B gate/up | 128 / 6 / 16 | 3,840 × 2,688 | **242.9 [0.9]** | PyTorch 279.9 | 1.152× | 4,178 | 46.4% |
+| Nemotron-3.5-Lightning-30B-A3B up | 128 / 6 / 16 | 1,920 × 2,688 | **156.1 [3.4]** | PyTorch 158.3 | 1.014× | 3,250 | 36.1% |
 | Nemotron-3.5-Lightning-30B-A3B down | 128 / 6 / 16 | 2,688 × 1,920 | **167.2 [0.3]** | PyTorch 168.5 | 1.008× | 3,035 | 33.7% |
 
 All 14 balanced rows pass the two validity gates. The maximum LightMoE repeat
@@ -66,21 +66,19 @@ against FP32 GEMM from the same BF16 operands is at least 0.99086. Nemotron's
 Kimi-K3 uses its 3,584-wide routed latent expert input; its 7,168-wide outer
 projections are outside this grouped-GEMM boundary.
 
-The additional ragged matrix contains 42 cases: the same seven models and two
-projections under imbalanced, single-expert-skew, and alignment-stress routing.
-After one rejected row was repeated in a warmed fresh session, all 42 pass the
-validity gates. LightMoE is faster than FlashInfer in 41 cases and 1.4% slower
-in the remaining Qwen3.5-35B down-projection skew case. Speedup ranges from
-0.986× to 1.474×, with a 1.301× geometric mean. PyTorch is unavailable here
+The ragged matrix covers imbalanced, single-expert-skew, and alignment-stress
+routing, including a zero-row expert. PyTorch is unavailable for these rows
 because its NVFP4 grouped GEMM requires every group to have a 128-row-aligned
 size.
 
 ## Routed-expert training
 
-This is a single-GPU routed-expert layer with 8,192 input tokens. The exact
-standard SwiGLU contract is available for Qwen3.5 and GLM-5.2; models using
-bounded SwiGLU, SiTU-GLU, SwiGLU-OAI, ReLU-squared, or model-specific outer
-projections are not relabeled as equivalent layer results.
+This is a routed-expert layer with 8,192 input tokens. The table retains the
+standard SwiGLU rows because the measured Transformer Engine baseline does not
+implement bounded SwiGLU, SwiGLU-OAI, or ReLU² with the same math. LightMoE
+supports those contracts, but does not relabel a different activation as an
+equivalent baseline. SiTU-GLU and model-specific outer projections remain
+outside this layer boundary.
 
 | Model / routing | Shape `H × I`, experts / top-k / EP size | LightMoE ms `[IQR]` | Transformer Engine ms `[IQR]` | Latency reduction | Output / input-gradient cosine vs BF16 |
 |---|---:|---:|---:|---:|---:|
@@ -108,10 +106,10 @@ fixed SWE-bench Verified samples from revision
 | Workload | Fixed batch | LightMoE initial median `[IQR]` | FlashInfer TensorRT-LLM median `[IQR]` | LightMoE repeat median `[IQR]` | Baseline / LightMoE |
 |---|---:|---:|---:|---:|---:|
 | Prefill | 8 × 1,024 input → 1 output | 221.670 [2.869] ms | 250.464 [4.300] ms | 226.927 [1.803] ms | 1.10–1.13× |
-| Decode | 32 × 256 input → 256 output | 2.5014 [0.0053] s | 2.6079 [0.1274] s | 2.4960 [0.0029] s | 1.043–1.045× |
+| Decode | 32 × 256 input → 256 output | 2.4488 [0.0125] s | 2.5395 [0.0667] s | 2.4587 [0.0653] s | 1.033–1.037× |
 
 Each backend has 21 warmed runs. Initial-to-repeat drift is 2.37% for prefill
-and 0.22% for decode. Inputs, outputs, and generated token sequences match
+and 0.40% for decode. Inputs, outputs, and generated token sequences match
 across backends. This is the only full-model backend swap claimed here; an
 operator result is never presented as end-to-end performance.
 

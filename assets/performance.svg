@@ -114,11 +114,11 @@
 
   <text class="label" x="64" y="469">Nemotron-3.5 30B-A3B</text>
   <rect class="track" x="350" y="457" width="260" height="14" rx="7"/>
-  <rect class="gemm-bar" x="350" y="457" width="79" height="14" rx="7"/>
-  <line class="range" x1="354" y1="464" x2="429" y2="464"/>
+  <rect class="gemm-bar" x="350" y="457" width="7" height="14" rx="7"/>
+  <line class="range" x1="354" y1="464" x2="357" y2="464"/>
   <circle class="range-dot" cx="354" cy="464" r="3"/>
-  <circle class="range-dot" cx="429" cy="464" r="3"/>
-  <text class="value" x="674" y="469" text-anchor="end">1.01–1.15×</text>
+  <circle class="range-dot" cx="357" cy="464" r="3"/>
+  <text class="value" x="674" y="469" text-anchor="end">1.008–1.014×</text>
 
   <text class="tick" x="350" y="508" text-anchor="middle">1.0×</text>
   <text class="tick" x="402" y="508" text-anchor="middle">1.1×</text>
@@ -173,7 +173,7 @@
   <text class="band-label" x="720" y="622">Prefill</text>
   <text class="band-value" x="720" y="647">1.10–1.13×</text>
   <text class="band-label" x="930" y="622">Decode</text>
-  <text class="band-value" x="930" y="647">1.043–1.045×</text>
+  <text class="band-value" x="930" y="647">1.033–1.037×</text>
 
   <text class="footer" x="56" y="696">Median ranges; exact hardware, boundaries, IQRs, and validity gates are in BENCHMARKS.md.</text>
 </svg>

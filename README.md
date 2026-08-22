@@ -33,7 +33,7 @@ GLM-5.2, MiniMax-M3, and Nemotron 3.5 expert shapes.
 
 - NVFP4 × NVFP4 GEMM with BF16 or FP32 output
 - Dynamic per-expert row counts, imbalanced routing, and zero-assignment experts
-- Fused SwiGLU, GeGLU, and ReGLU gate/up epilogues
+- Compile-time SwiGLU-OAI, bounded SwiGLU, ReLU², GeGLU, and ReGLU epilogues
 - Decode-specific and persistent prefill launch paths
 - Reusable inference storage with CUDA Graph support
 - Deterministic dispatch, combine, input-gradient, weight-gradient, and
@@ -144,6 +144,11 @@ Checkpoint scales can replace calibration through
 `set_activation_scales(input_scale, hidden_scale)`. Use one plan per concurrent
 CUDA stream because its workspaces are reused.
 
+Set `activation="swiglu_oai"` for MiniMax-M3, `activation="relu2"` for
+Nemotron 3.5, or `activation="swiglu", activation_clamp=10` for DeepSeek-V4.
+ReLU² experts load two weights with `load_weights(up_weight, down_weight)`;
+gated experts retain the three-weight form shown above.
+
 ## 🧠 MoE training
 
 The training layer keeps routing outputs in BF16 and supports deterministic
@@ -185,6 +190,8 @@ y = experts(
 
 Call `experts.refresh_weights()` after each optimizer step. Expert-parallel
 communication and routing policy remain the host framework's responsibility.
+The inference activation values above select the same compile-time forward and
+backward specializations in `MoEExpertLayer`.
 
 ## 🗂️ Package layout
 
