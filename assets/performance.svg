@@ -1,0 +1,145 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">LightMoE performance on NVIDIA B200</title>
+  <desc id="desc">Complete MoE inference layer speedup over FlashInfer and complete training forward-backward latency reduction versus Transformer Engine.</desc>
+  <defs>
+    <style>
+      text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .background { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #e2e8f0; }
+      .band { fill: #eef2ff; }
+      .title { fill: #0f172a; font-size: 32px; font-weight: 600; }
+      .subtitle { fill: #64748b; font-size: 15px; font-weight: 400; }
+      .panel-title { fill: #0f172a; font-size: 20px; font-weight: 600; }
+      .panel-subtitle { fill: #64748b; font-size: 13px; font-weight: 400; }
+      .label { fill: #334155; font-size: 13px; font-weight: 500; }
+      .tick { fill: #64748b; font-size: 12px; font-weight: 400; }
+      .value { fill: #0f172a; font-size: 14px; font-weight: 600; }
+      .grid { stroke: #e2e8f0; stroke-width: 1; }
+      .baseline { stroke: #94a3b8; stroke-width: 1.5; }
+      .track { fill: #e2e8f0; }
+      .inference-bar { fill: #10b981; }
+      .training-bar { fill: #6366f1; }
+      .range { stroke: #312e81; stroke-width: 2; }
+      .range-dot { fill: #312e81; }
+      .band-title { fill: #312e81; font-size: 14px; font-weight: 600; }
+      .band-label { fill: #64748b; font-size: 12px; font-weight: 400; }
+      .band-value { fill: #312e81; font-size: 16px; font-weight: 600; }
+      .footer { fill: #64748b; font-size: 12px; font-weight: 400; }
+      @media (prefers-color-scheme: dark) {
+        .background { fill: #0b1220; }
+        .panel { fill: #111827; stroke: #273449; }
+        .band { fill: #18213b; }
+        .title, .panel-title, .value { fill: #f1f5f9; }
+        .subtitle, .panel-subtitle, .tick, .footer, .band-label { fill: #94a3b8; }
+        .label { fill: #cbd5e1; }
+        .grid { stroke: #273449; }
+        .baseline { stroke: #64748b; }
+        .track { fill: #273449; }
+        .inference-bar { fill: #34d399; }
+        .training-bar { fill: #818cf8; }
+        .range { stroke: #a5b4fc; }
+        .range-dot { fill: #a5b4fc; }
+        .band-title, .band-value { fill: #c7d2fe; }
+      }
+    </style>
+  </defs>
+
+  <rect class="background" width="1200" height="720" rx="24"/>
+
+  <text class="title" x="56" y="61">LightMoE performance on NVIDIA B200</text>
+  <text class="subtitle" x="56" y="88">Complete MoE layer measurements · same-session medians</text>
+
+  <rect class="panel" x="40" y="116" width="552" height="458" rx="18"/>
+  <text class="panel-title" x="64" y="154">Inference</text>
+  <text class="panel-subtitle" x="64" y="178">Speedup over FlashInfer CuTe DSL · higher is better</text>
+
+  <line class="baseline" x1="285" y1="207" x2="285" y2="500"/>
+  <line class="grid" x1="375" y1="207" x2="375" y2="500"/>
+  <line class="grid" x1="465" y1="207" x2="465" y2="500"/>
+  <line class="grid" x1="555" y1="207" x2="555" y2="500"/>
+
+  <text class="label" x="64" y="250">DeepSeek-V3.2 · decode T=1</text>
+  <rect class="track" x="285" y="235" width="270" height="18" rx="9"/>
+  <rect class="inference-bar" x="285" y="235" width="236" height="18" rx="9"/>
+  <text class="value" x="530" y="250">2.31×</text>
+
+  <text class="label" x="64" y="306">Kimi-K2.7 · decode T=1</text>
+  <rect class="track" x="285" y="291" width="270" height="18" rx="9"/>
+  <rect class="inference-bar" x="285" y="291" width="205" height="18" rx="9"/>
+  <text class="value" x="499" y="306">2.14×</text>
+
+  <text class="label" x="64" y="362">DeepSeek-V3.2 · prefill T=2,048</text>
+  <rect class="track" x="285" y="347" width="270" height="18" rx="9"/>
+  <rect class="inference-bar" x="285" y="347" width="167" height="18" rx="9"/>
+  <text class="value" x="461" y="362">1.93×</text>
+
+  <text class="label" x="64" y="418">DeepSeek-V3.2 · decode T=32</text>
+  <rect class="track" x="285" y="403" width="270" height="18" rx="9"/>
+  <rect class="inference-bar" x="285" y="403" width="90" height="18" rx="9"/>
+  <text class="value" x="384" y="418">1.50×</text>
+
+  <text class="label" x="64" y="474">Kimi-K2.7 · prefill T=2,048</text>
+  <rect class="track" x="285" y="459" width="270" height="18" rx="9"/>
+  <rect class="inference-bar" x="285" y="459" width="67" height="18" rx="9"/>
+  <text class="value" x="361" y="474">1.37×</text>
+
+  <text class="tick" x="285" y="526" text-anchor="middle">1.0×</text>
+  <text class="tick" x="375" y="526" text-anchor="middle">1.5×</text>
+  <text class="tick" x="465" y="526" text-anchor="middle">2.0×</text>
+  <text class="tick" x="555" y="526" text-anchor="middle">2.5×</text>
+  <text class="panel-subtitle" x="285" y="551">FlashInfer baseline</text>
+
+  <rect class="panel" x="608" y="116" width="552" height="458" rx="18"/>
+  <text class="panel-title" x="632" y="154">Training</text>
+  <text class="panel-subtitle" x="632" y="178">Fwd+bwd latency reduction vs Transformer Engine NVFP4</text>
+
+  <line class="baseline" x1="770" y1="207" x2="770" y2="500"/>
+  <line class="grid" x1="845" y1="207" x2="845" y2="500"/>
+  <line class="grid" x1="920" y1="207" x2="920" y2="500"/>
+  <line class="grid" x1="995" y1="207" x2="995" y2="500"/>
+  <line class="grid" x1="1070" y1="207" x2="1070" y2="500"/>
+
+  <text class="label" x="632" y="250">Qwen3-30B</text>
+  <rect class="track" x="770" y="235" width="300" height="18" rx="9"/>
+  <rect class="training-bar" x="770" y="235" width="270" height="18" rx="9"/>
+  <line class="range" x1="1034" y1="244" x2="1045" y2="244"/>
+  <circle class="range-dot" cx="1034" cy="244" r="3"/>
+  <circle class="range-dot" cx="1045" cy="244" r="3"/>
+  <text class="value" x="1052" y="250">35–37%</text>
+
+  <text class="label" x="632" y="320">MiniMax-M2</text>
+  <rect class="track" x="770" y="305" width="300" height="18" rx="9"/>
+  <rect class="training-bar" x="770" y="305" width="265" height="18" rx="9"/>
+  <text class="value" x="1043" y="320">35.3%</text>
+
+  <text class="label" x="632" y="390">DeepSeek-V3.2</text>
+  <rect class="track" x="770" y="375" width="300" height="18" rx="9"/>
+  <rect class="training-bar" x="770" y="375" width="185" height="18" rx="9"/>
+  <line class="range" x1="954" y1="384" x2="955" y2="384"/>
+  <text class="value" x="963" y="390">24.5–24.7%</text>
+
+  <text class="label" x="632" y="460">Kimi-K2.7</text>
+  <rect class="track" x="770" y="445" width="300" height="18" rx="9"/>
+  <rect class="training-bar" x="770" y="445" width="161" height="18" rx="9"/>
+  <line class="range" x1="928" y1="454" x2="933" y2="454"/>
+  <circle class="range-dot" cx="928" cy="454" r="3"/>
+  <circle class="range-dot" cx="933" cy="454" r="3"/>
+  <text class="value" x="941" y="460">21.1–21.7%</text>
+
+  <text class="tick" x="770" y="526" text-anchor="middle">0%</text>
+  <text class="tick" x="845" y="526" text-anchor="middle">10%</text>
+  <text class="tick" x="920" y="526" text-anchor="middle">20%</text>
+  <text class="tick" x="995" y="526" text-anchor="middle">30%</text>
+  <text class="tick" x="1070" y="526" text-anchor="middle">40%</text>
+  <text class="panel-subtitle" x="770" y="551">8,192 input tokens · balanced and imbalanced routing</text>
+
+  <rect class="band" x="40" y="594" width="1120" height="72" rx="14"/>
+  <text class="band-title" x="64" y="622">DeepSeek V4 full-model serving · 8×B200 · vLLM</text>
+  <text class="band-label" x="64" y="646">Only the NVFP4 MoE backend changes</text>
+  <text class="band-label" x="720" y="622">Prefill</text>
+  <text class="band-value" x="720" y="647">1.10–1.13×</text>
+  <text class="band-label" x="930" y="622">Decode</text>
+  <text class="band-value" x="930" y="647">1.043–1.045×</text>
+
+  <text class="footer" x="56" y="696">Operator charts use 1×B200. BF16 input; router logits and top-k selection excluded. Full methodology in BENCHMARKS.md.</text>
+</svg>

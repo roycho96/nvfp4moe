@@ -22,6 +22,10 @@ input gradients, weight gradients, and router gradients.
 Exact timing boundaries, model shapes, and measured results are documented in
 [BENCHMARKS.md](BENCHMARKS.md).
 
+## 📈 Performance
+
+[![LightMoE performance on NVIDIA B200](assets/performance.svg)](BENCHMARKS.md)
+
 ## ⚡ Highlights
 
 - NVFP4 × NVFP4 GEMM with BF16 or FP32 output
