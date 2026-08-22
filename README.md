@@ -17,7 +17,7 @@ input gradients, weight gradients, and router gradients.
 | `lightmoe.gemm` | Standalone dense and grouped NVFP4 GEMM |
 | `lightmoe.InferenceMoE` | Prefill and decode with reusable workspaces |
 | `lightmoe.MoEDispatch` | Deterministic expert-major token dispatch |
-| `lightmoe.MoEExpertLayer` | Single-GPU expert training layer |
+| `lightmoe.MoEExpertLayer` | Expert training layer |
 
 Exact timing boundaries, model shapes, and measured results are documented in
 [BENCHMARKS.md](BENCHMARKS.md).
@@ -207,7 +207,6 @@ not exported from the package root.
 - `K` aligned to 64
 - At most 256 local experts
 - At most 131,072 token–expert assignments in the complete layer
-- Public kernels and benchmark runners are single-GPU
 - Precision tables are operator and layer checks, not convergence results
 
 ## 📊 Benchmarks
